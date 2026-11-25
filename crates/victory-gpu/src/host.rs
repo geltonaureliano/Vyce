@@ -45,7 +45,38 @@ struct InFlight {
         std::sync::Arc<crate::resource::HostTexture>,
     )>,
     _plans: Vec<std::sync::Arc<crate::descriptor::host::BindlessPlan>>,
+    /// What is done once it has run ([`Host::finish_submission`]): its
+    /// lists, kept alive for that, and the ranges its shaders wrote.
+    finish: Option<Finish>,
 }
+
+/// See [`InFlight::finish`].
+struct Finish {
+    lists: Vec<std::sync::Arc<HostList>>,
+    back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+}
+// SAFETY: host lists are free-threaded objects, run by one thread once
+// closed; the rest is ours and locked.
+unsafe impl Send for Finish {}
+
+/// Whether the title's submissions may return before the host GPU is done
+/// (`VICTORY_ASYNC_SUBMIT=0` turns it off). At the stilt house with 8,400
+/// draws a frame it is 150-186 ms a frame against 200-238 (run as5 against
+/// rw1, 2026-11-25): the wait for the host GPU goes from 78-95 to 4-17 ms.
+/// It gained nothing while the title's recording threads took turns on the
+/// views table's mutex.
+fn async_submit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_SUBMIT").is_none_or(|v| v != "0"))
+}
+
+/// Microseconds spent bringing buffer copies up to date while the
+/// submission before ran ([`Host::prewarm`]), since the last frame line.
+static PREWARM_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The newest unwaited submission (its fence value) that is finished:
+/// waited for and its results put back.
+static FINISHED_FENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
@@ -104,12 +135,23 @@ static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// the host runs at 1-2 fps).
 const KEEP_FRAMES: u64 = 32;
 
+/// And the time a retired object is kept for at least: in the menus 32
+/// frames are a third of a second, and lists recorded ahead, or descriptors
+/// the title left in a heap, named copies freed by then (with
+/// `VICTORY_RAYS=1`: page faults inside destroyed 4 and 10.78 MiB buffers,
+/// Radeon GPU Detective, runs rt2 and rt6; with nothing freed the run went
+/// on into the world, rt3).
+/// shortcut: a time, not a count of what still names the object.
+const KEEP_TIME: std::time::Duration = std::time::Duration::from_secs(8);
+
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired {
     /// The submission count it waits for.
     submission: u64,
     /// The presented frame it was retired in.
     frame: u64,
+    /// When.
+    at: std::time::Instant,
     #[allow(dead_code)]
     object: Box<dyn std::any::Any>,
 }
@@ -125,6 +167,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back(Retired {
         submission,
         frame,
+        at: std::time::Instant::now(),
         object: Box::new(object),
     });
 }
@@ -144,7 +187,9 @@ fn bury(finished: u64) {
         let n = retired
             .iter()
             .take_while(|r| {
-                r.submission <= finished && now.saturating_sub(r.frame) >= KEEP_FRAMES
+                r.submission <= finished
+                    && now.saturating_sub(r.frame) >= KEEP_FRAMES
+                    && r.at.elapsed() >= KEEP_TIME
             })
             .count();
         retired.drain(..n).collect()
@@ -260,6 +305,11 @@ pub(crate) fn host() -> Option<&'static Host> {
 
 /// Waits for any in-flight async host GPU submissions without creating the
 /// host device if it has not been initialised yet.
+/// Whether a submission is still to be waited for and finished.
+pub(crate) fn has_in_flight() -> bool {
+    matches!(HOST.get(), Some(Some(h)) if h.has_in_flight())
+}
+
 pub(crate) fn wait_in_flight_if_ready() {
     if let Some(Some(h)) = HOST.get() {
         h.wait_in_flight();
@@ -694,13 +744,15 @@ pub(crate) fn warn_depth_bounds() {
 
 /// A list's buffers for hoisted clamped indirect arguments with their
 /// states, how many are in use since the reset, the bytes taken of the last
-/// of those, and whether the list has the barrier that precedes the clamps.
+/// of those, whether the list has the barrier that precedes the clamps, and
+/// whether it has the clamps' root signature, pipeline and budget bound.
 #[derive(Default)]
 struct ClampChunks {
     all: Vec<(ID3D12Resource, D3D12_RESOURCE_STATES)>,
     used: usize,
     at: u64,
     barrier: bool,
+    bound: bool,
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -954,9 +1006,19 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// The host pipelines `bind_pipeline` kept (by address), so a pipeline
+    /// the list binds again is not kept again.
+    bound: std::collections::HashSet<usize>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Buffer ranges declared written by shaders since the last title copy
+    /// (host copy, address, bytes): declaring them again would change nothing.
+    gpu_written: std::collections::HashSet<(usize, usize, usize)>,
+    /// Upload memory filled from title memory since the last title write
+    /// (source, bytes): its host address, which a second fill would find
+    /// holding the same bytes.
+    filled: std::collections::HashMap<(usize, usize), u64>,
     /// View heaps the list's draws index directly (`ResourceDescriptorHeap[]`),
     /// and whether any of their shaders may write memory: their slots are
     /// brought up to date once per submission, after every other step.
@@ -1103,20 +1165,34 @@ impl Host {
         }
     }
 
-    /// Drops completed async submissions and buries objects retired before them.
+    /// Finishes the unwaited submissions that have run, oldest first, and
+    /// buries objects retired before them. The caller holds `submitted`:
+    /// finishing puts back what shaders wrote, as a submission does.
     fn reap_completed(&self) {
         // SAFETY: a plain fence query.
         let completed = unsafe { self.fence.GetCompletedValue() };
         let mut last_sub = 0u64;
-        {
-            let mut q = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-            while let Some(front) = q.front() {
-                if front.fence <= completed {
-                    last_sub = last_sub.max(front.submission);
-                    q.pop_front();
-                } else {
-                    break;
+        loop {
+            let done = {
+                let mut q = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+                match q.front() {
+                    Some(front) if front.fence <= completed => q.pop_front(),
+                    _ => None,
                 }
+            };
+            let Some(mut done) = done else { break };
+            last_sub = last_sub.max(done.submission);
+            if let Some(Finish { lists, back }) = done.finish.take() {
+                {
+                    let runs: Vec<&HostList> = lists.iter().map(|l| &**l).collect();
+                    self.finish_submission(&runs, back);
+                }
+                // Before its lists go: a list that goes with it waits for
+                // this fence, with `submitted` held here.
+                FINISHED_FENCE.fetch_max(done.fence, Ordering::AcqRel);
+                drop(lists);
+            } else {
+                FINISHED_FENCE.fetch_max(done.fence, Ordering::AcqRel);
             }
         }
         if last_sub != 0 {
@@ -1125,14 +1201,14 @@ impl Host {
         }
     }
 
+    /// Whether a submission is still to be waited for and finished.
+    fn has_in_flight(&self) -> bool {
+        !self.in_flight.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    }
+
     /// Waits until the host GPU fence reaches at least `target`.
     pub(crate) fn wait_fence(&self, target: u64) {
-        if target == 0 {
-            return;
-        }
-        // SAFETY: a plain fence query.
-        if unsafe { self.fence.GetCompletedValue() } >= target {
-            self.reap_completed();
+        if target == 0 || FINISHED_FENCE.load(Ordering::Acquire) >= target {
             return;
         }
         let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -1194,6 +1270,50 @@ impl Host {
     /// bottom-of-pipe writes require GPU completion, or returns asynchronously
     /// so CPU recording overlaps GPU execution.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        self.execute_inner(runs, None);
+    }
+
+    /// As [`Host::execute`] for the title's own submissions, the only ones
+    /// that may return before the host GPU is done
+    /// (`VICTORY_ASYNC_SUBMIT=1`): the title waits for its fences, which are
+    /// signalled after the wait (`crate::timeline`). Our own submissions
+    /// (present, captures, read-backs, texture uploads) read or free what
+    /// they made as soon as the call returns: unwaited, the present's
+    /// capture buffer was freed with its copy still pending, which the
+    /// debug layer names (#921, object deleted while still in use) and the
+    /// AMD driver answered by removing the device at the first frame.
+    ///
+    /// Such a submission is finished (its shaders' writes put back, its
+    /// read-backs and bottom-of-pipe writes done) when it is waited for:
+    /// before the next submission's own preparation, a title fence's
+    /// signal, a present, or a reset of one of its lists. Meanwhile the
+    /// next submission's buffer copies are brought up to date, so the
+    /// processor and the card work at the same time for that long.
+    pub(crate) fn execute_title(&self, runs: &[std::sync::Arc<HostList>]) {
+        let lists: Vec<&HostList> = runs.iter().map(|l| &**l).collect();
+        self.execute_inner(&lists, Some(runs));
+    }
+
+    /// Brings the buffer copies `runs` will ask for up to date while the
+    /// submission before still runs: the same refreshes as the lists'
+    /// steps make, early. The ranges that submission's shaders write are
+    /// left alone (`Shadow::update` goes around them), and the steps in
+    /// their order do it all again after the wait, finding little left.
+    fn prewarm(&self, runs: &[&HostList]) {
+        let started = std::time::Instant::now();
+        let mut batch = Batch::default();
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::Refresh(shadow, address, len) = step {
+                    batch.add(shadow, *address, *len);
+                }
+            }
+        }
+        batch.flush();
+        PREWARM_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+
+    fn execute_inner(&self, runs: &[&HostList], keep: Option<&[std::sync::Arc<HostList>]>) {
         #[cfg(feature = "diagnostics")]
         let _inside = crate::profile::here();
         // One submission at a time from preparation to copy-back: snapshots
@@ -1201,7 +1321,11 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         // Wait for any previous async submission before mutating shared Shadow
         // buffers in `prepare`. During the gap between submissions, the GPU
-        // ran in parallel with the title's CPU command-list recording.
+        // ran in parallel with the title's CPU command-list recording, and
+        // runs on while this submission's buffer copies are refreshed.
+        if keep.is_some() && self.has_in_flight() {
+            self.prewarm(runs);
+        }
         self.drain_in_flight_locked();
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         let started = std::time::Instant::now();
@@ -1234,20 +1358,29 @@ impl Host {
         let mut card_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> =
             Vec::new();
         let mut cpu_back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-        let mut write_ranges = std::collections::HashSet::new();
+        // A copy is either a card's or not, so one set of ranges serves both.
+        let mut declared = std::collections::HashSet::new();
         for list in runs {
             for step in &list.deferred().copies {
                 if let Step::GpuWrite(shadow, address, len) = step
-                    && write_ranges.insert((std::sync::Arc::as_ptr(shadow), *address, *len))
+                    && declared.insert((std::sync::Arc::as_ptr(shadow) as usize, *address, *len))
                 {
-                    let target = if shadow.is_card() { &mut card_writes } else { &mut cpu_back };
+                    let target = if shadow.is_card() {
+                        &mut card_writes
+                    } else {
+                        &mut cpu_back
+                    };
                     target.push((shadow.clone(), *address, *len));
                 }
             }
         }
         for (shadow, address, len) in batch.bindless_writes.drain(..) {
-            if write_ranges.insert((std::sync::Arc::as_ptr(&shadow), address, len)) {
-                let target = if shadow.is_card() { &mut card_writes } else { &mut cpu_back };
+            if declared.insert((std::sync::Arc::as_ptr(&shadow) as usize, address, len)) {
+                let target = if shadow.is_card() {
+                    &mut card_writes
+                } else {
+                    &mut cpu_back
+                };
                 target.push((shadow, address, len));
             }
         }
@@ -1285,14 +1418,10 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let each = false;
         let can_async = !cfg!(test)
+            && keep.is_some()
             && !each
-            && std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1")
-            && card_writes.is_empty()
-            && cpu_back.is_empty()
-            && runs.iter().all(|list| {
-                let d = list.deferred();
-                d.readbacks.is_empty() && d.writes[d.early..].is_empty()
-            });
+            && async_submit()
+            && card_writes.is_empty();
         if let Some(first) = first {
             // SAFETY: a closed list.
             unsafe { self.queue.ExecuteCommandLists(&[Some(first)]) };
@@ -1385,9 +1514,6 @@ impl Host {
                 plan.clear_pending();
             }
             SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
-            for list in runs {
-                list.deferred().early = 0;
-            }
             self.in_flight
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1396,6 +1522,10 @@ impl Host {
                     submission: this_submission,
                     _early_copies: early.copies,
                     _plans: batch.plans,
+                    finish: Some(Finish {
+                        lists: keep.map(<[_]>::to_vec).unwrap_or_default(),
+                        back: cpu_back,
+                    }),
                 });
             return;
         }
@@ -1450,7 +1580,20 @@ impl Host {
                 plan.clear_pending();
             }
         }
-        let back = cpu_back;
+        COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        self.finish_submission(runs, cpu_back);
+        self.log_messages();
+    }
+
+    /// After a submission ran: what its shaders wrote goes back into title
+    /// memory, then its read-backs, then the bottom-of-pipe writes that
+    /// tell the title the GPU is done.
+    fn finish_submission(
+        &self,
+        runs: &[&HostList],
+        back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    ) {
+        let copying = std::time::Instant::now();
         if back.len() <= 1 {
             for (shadow, address, len) in &back {
                 let written = shadow.copy_back(*address, *len);
@@ -1527,7 +1670,6 @@ impl Host {
             }
             deferred.early = 0;
         }
-        self.log_messages();
     }
 
     /// How host GPU timestamps map onto the title's GPU clock
@@ -1914,6 +2056,7 @@ impl HostList {
             chunks.used = 0;
             chunks.at = 0;
             chunks.barrier = false;
+            chunks.bound = false;
         }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2136,12 +2279,21 @@ impl HostList {
         }
     }
 
-    /// Notes a pipeline the list binds.
-    pub(crate) fn used_pipeline(&self, name: &str) {
-        let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
-        if !pipelines.contains(name) {
-            pipelines.insert(name.to_owned());
+    /// Notes a pipeline the list binds and keeps it and its root signature
+    /// until the list is reset, the first time only: the list keeps the
+    /// first, so its address names the same pipeline from then on.
+    pub(crate) fn bind_pipeline(&self, p: &crate::pipeline::host::HostPipeline) {
+        let mut deferred = self.deferred();
+        if !deferred.bound.insert(p.pso.as_raw() as usize) {
+            return;
         }
+        deferred.kept.push(p.pso.clone().into());
+        deferred.kept.push(p.root.clone().into());
+        drop(deferred);
+        self.pipelines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(p.name.clone());
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
@@ -2155,6 +2307,8 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.gpu_written.clear();
+        deferred.filled.clear();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -2163,6 +2317,21 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len));
+    }
+
+    /// The host GPU address of `len` bytes of upload memory holding the title
+    /// memory at `src` as of the list's submission: one copy for every ask
+    /// until a title copy intervenes.
+    pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
+        let key = (src as usize, len as usize);
+        let known = self.deferred().filled.get(&key).copied();
+        if known.is_some() {
+            return known;
+        }
+        let (gpu, to) = self.scratch(len)?;
+        self.defer_fill(to, src, len as usize);
+        self.deferred().filled.insert(key, gpu);
+        Some(gpu)
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -2191,9 +2360,13 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if deferred.gpu_written.insert(key) {
+            deferred
+                .copies
+                .push(Step::GpuWrite(shadow.clone(), address, len));
+        }
     }
 
     /// A wait for a memory value.
@@ -2299,6 +2472,14 @@ impl HostList {
         Some((buffer, 0))
     }
 
+    /// Whether the list's clamps still have to bind their root signature,
+    /// pipeline and budget: the first after the reset does, and the rest
+    /// find them bound (nothing else records compute state in the list).
+    pub(crate) fn clamp_unbound(&self) -> bool {
+        let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+        !std::mem::replace(&mut chunks.bound, true)
+    }
+
     /// The clamped arguments written so far become readable as indirect
     /// arguments by the lists after this one.
     pub(crate) fn clamp_end(&self) {
@@ -2390,15 +2571,11 @@ impl HostList {
         });
     }
 
-    /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
-    pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let (buffer, data) = host.upload_buffer(size)?;
-        name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().uploads.push(buffer.clone());
-        Some((buffer, data))
+    /// `size` bytes of mapped upload memory, 512-byte aligned for a placed
+    /// footprint, alive until the list is reset: the buffer, the offset in
+    /// it and the CPU pointer.
+    pub(crate) fn upload(&self, size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        self.scratch_in(size, 512, |buffer, at, _, data| (buffer.clone(), at, data))
     }
 
     /// A mapped readback buffer of `size` bytes, alive until the list is
@@ -2413,6 +2590,18 @@ impl HostList {
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
+        self.scratch_in(len, 256, |_, _, gpu, data| (gpu, data))
+    }
+
+    /// `len` bytes of upload memory at a multiple of `align` until the list
+    /// is reset, handed to `f` with the buffer, the offset in it, the host GPU
+    /// address and the CPU pointer.
+    fn scratch_in<R>(
+        &self,
+        len: u64,
+        align: u64,
+        f: impl FnOnce(&ID3D12Resource, u64, u64, *mut u8) -> R,
+    ) -> Option<R> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
@@ -2421,10 +2610,11 @@ impl HostList {
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let made = f(&buffer, 0, gpu, data);
             self.deferred().uploads.push(buffer);
-            return Some((gpu, data));
+            return Some(made);
         }
-        if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
+        if s.used.next_multiple_of(align) + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
@@ -2442,10 +2632,11 @@ impl HostList {
             s.chunks.push(chunk);
             s.used = 0;
         }
-        let (_, data, gpu) = s.chunks[s.current];
-        let at = s.used;
-        s.used += len;
-        Some((gpu + at, (data + at as usize) as *mut u8))
+        let (buffer, data, gpu) = &s.chunks[s.current];
+        let at = s.used.next_multiple_of(align);
+        let made = f(buffer, at, gpu + at, (data + at as usize) as *mut u8);
+        s.used = at + len;
+        Some(made)
     }
 
     /// The list's indirect-work budget, zeroed each time the list executes.
@@ -2531,6 +2722,8 @@ impl HostList {
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
         deferred.refreshed.clear();
+        deferred.gpu_written.clear();
+        deferred.filled.clear();
     }
 
     /// Queues submission-time materialization and refresh of the bindless
@@ -3409,6 +3602,8 @@ struct Presenter {
     hwnd: HWND,
     meter: Meter,
     observed_path: Option<PresentPath>,
+    /// One render target view, for the back buffer the readout is drawn on.
+    rtv: ID3D12DescriptorHeap,
 }
 
 #[derive(PartialEq, Eq)]
@@ -3444,6 +3639,40 @@ impl Presenter {
             tracing::info!(path = kind, scene, overlay, output, "presentation formats");
         }
     }
+
+    /// Writes the frame rate and frame time in the top left corner of
+    /// `back`, which is a render target on `list`.
+    ///
+    /// # Safety
+    /// `back` is this swap chain's buffer, in the render target state.
+    unsafe fn readout(&self, device: &ID3D12Device, list: &ID3D12GraphicsCommandList, back: &ID3D12Resource) {
+        let Some((fps, ms)) = self.meter.shown else { return };
+        if !crate::readout::on() {
+            return;
+        }
+        let text = format!("{fps:.1} FPS  {ms:.0} MS");
+        // Dots that keep their share of the picture at any size.
+        let dot = (self.height as i32 / 216).max(2);
+        let at = (dot * 3, dot * 3);
+        let (w, h) = crate::readout::size(&text);
+        let behind = RECT {
+            left: at.0,
+            top: at.1,
+            right: at.0 + w * dot,
+            bottom: at.1 + h * dot,
+        };
+        let marks = crate::readout::rects(&text, at, dot);
+        // SAFETY: our heap of one view, and rectangles inside the picture
+        // (a text of a few characters at this size).
+        unsafe {
+            let view = self.rtv.GetCPUDescriptorHandleForHeapStart();
+            device.CreateRenderTargetView(back, None, view);
+            if behind.right <= self.width as i32 && behind.bottom <= self.height as i32 {
+                list.ClearRenderTargetView(view, &[0.0, 0.0, 0.0, 1.0], Some(&[behind]));
+                list.ClearRenderTargetView(view, &[1.0, 0.9, 0.1, 1.0], Some(&marks));
+            }
+        }
+    }
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -3457,6 +3686,8 @@ struct Meter {
     telemetry: bool,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    /// The frames a second and milliseconds a frame of the last second.
+    shown: Option<(f64, f64)>,
 }
 
 impl Meter {
@@ -3470,6 +3701,7 @@ impl Meter {
             logged: now,
             telemetry: std::env::var_os("VYCE_TELEMETRY").is_some_and(|v| v == "1"),
             caption: None,
+            shown: None,
         }
     }
 
@@ -3491,6 +3723,7 @@ impl Meter {
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+        self.shown = Some((fps, ms));
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
@@ -3676,14 +3909,13 @@ impl Host {
             let probe = crate::capture::probe(&self.device, list, texture);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
+            let target = D3D12_RESOURCE_STATE_RENDER_TARGET;
             list.ResourceBarrier(&[
                 transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
+                transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, target),
             ]);
+            p.readout(&self.device, list, &back);
+            list.ResourceBarrier(&[transition(&back, target, D3D12_RESOURCE_STATE_PRESENT)]);
             p.copy.close();
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]
@@ -3768,6 +4000,7 @@ impl Host {
                 p.copy.close();
                 return None;
             }
+            p.readout(&self.device, list, &back);
             #[cfg(feature = "diagnostics")]
             let capture = {
                 list.ResourceBarrier(&[transition(&back, target, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
@@ -3825,6 +4058,12 @@ impl Host {
                 .cast::<IDXGISwapChain3>()?;
             let copy = self.new_list()?;
             copy.close();
+            let rtv: ID3D12DescriptorHeap =
+                self.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })?;
             tracing::info!(width, height, format = format.0, "presenting to a window");
             Ok(Presenter {
                 swap_chain,
@@ -3835,6 +4074,7 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 observed_path: None,
+                rtv,
             })
         }
     }

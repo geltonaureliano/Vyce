@@ -137,7 +137,7 @@ impl crate::timeline::Lists for Submission {
     }
     fn take(&mut self, n: usize) -> Box<dyn FnOnce()> {
         let (host, runs) = (self.host, self.runs.drain(..n).collect::<Vec<_>>());
-        Box::new(move || host.execute(&runs.iter().map(|l| &**l).collect::<Vec<_>>()))
+        Box::new(move || host.execute_title(&runs.iter().map(|l| l.shared()).collect::<Vec<_>>()))
     }
     fn waits(&self) -> String {
         self.runs.iter().map(|l| l.script()).collect::<Vec<_>>().join(" || ")

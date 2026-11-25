@@ -444,15 +444,19 @@ pub(crate) fn bound_before(
     let constants = [kind, stride, records, args_offset, has_count, count_offset];
     let l = &clamps.list;
     // SAFETY: an open list; our root signature and pipeline; live source,
-    // count, destination (writable: `clamp_room`) and budget buffers.
+    // count, destination (writable: `clamp_room`) and budget buffers. Only
+    // clamps record compute state in `clamps`, and they all bind the same
+    // signature, pipeline and budget.
     unsafe {
-        l.SetComputeRootSignature(&c.root);
-        l.SetPipelineState(&c.pso);
+        if clamps.clamp_unbound() {
+            l.SetComputeRootSignature(&c.root);
+            l.SetPipelineState(&c.pso);
+            l.SetComputeRootUnorderedAccessView(4, budget_gpu);
+        }
         l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
         l.SetComputeRootShaderResourceView(1, src_gpu);
         l.SetComputeRootShaderResourceView(2, count_gpu);
         l.SetComputeRootUnorderedAccessView(3, dst_gpu);
-        l.SetComputeRootUnorderedAccessView(4, budget_gpu);
         l.Dispatch(records.div_ceil(64), 1, 1);
         // Clamps write disjoint argument ranges. Only the budget needs
         // ordering here in mode 7; clamp_end transitions the argument buffers.

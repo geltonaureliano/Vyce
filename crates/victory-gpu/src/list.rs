@@ -161,6 +161,14 @@ pub(crate) struct Submitted(Arc<crate::host::HostList>);
 unsafe impl Send for Submitted {}
 
 #[cfg(windows)]
+impl Submitted {
+    /// The host list itself, to keep past the submission's return.
+    pub(crate) fn shared(&self) -> Arc<crate::host::HostList> {
+        self.0.clone()
+    }
+}
+
+#[cfg(windows)]
 impl std::ops::Deref for Submitted {
     type Target = crate::host::HostList;
     fn deref(&self) -> &crate::host::HostList {
@@ -918,24 +926,24 @@ extern "system" fn copy_texture_region(
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
-            let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
+            let Some(bytes) = src.footprint.bytes() else {
                 return;
             };
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
+            let Some((buffer, at, staging)) = list.upload(bytes) else {
                 return;
             };
-            // The list owns this mapped D3D12 upload buffer. Wine can report
+            // The list owns this mapped D3D12 upload memory. Wine can report
             // its address as MEM_FREE, so use the host-upload path.
             list.defer_fill(staging, data, bytes as usize);
             from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
+            from.footprint.offset = at;
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+                read = Some((unsafe { buffer.GetGPUVirtualAddress() } + at, bytes));
             }
             _upload = buffer;
         } else {

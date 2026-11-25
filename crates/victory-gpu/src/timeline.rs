@@ -65,6 +65,20 @@ static HELD: AtomicU64 = AtomicU64::new(0);
 /// dropped, is never met: past this its list runs all the same.
 const LIMIT: Duration = Duration::from_secs(2);
 
+/// Whether an unwaited host submission is still to be finished.
+fn finishing() -> bool {
+    #[cfg(windows)]
+    return crate::host::has_in_flight();
+    #[cfg(not(windows))]
+    false
+}
+
+/// Waits for the unwaited host submissions and finishes them.
+fn finish() {
+    #[cfg(windows)]
+    crate::host::wait_in_flight_if_ready();
+}
+
 /// Whether any queue is held back.
 pub(crate) fn held() -> bool {
     HELD.load(Ordering::Acquire) > 0
@@ -114,11 +128,20 @@ impl Timeline {
                 }
                 Some(Op::Wait(fence, value)) => {
                     if !fence.reached(*value) && !force {
-                        s.hold(true);
-                        return moved;
+                        // What it waits for may be what an unwaited
+                        // submission still owes (its bottom-of-pipe writes):
+                        // that one is finished first, then this is looked
+                        // at again. Without this the queue stood until the
+                        // wait was forced, two seconds a frame.
+                        if !finishing() {
+                            s.hold(true);
+                            return moved;
+                        }
+                        Box::new(finish)
+                    } else {
+                        let op = s.ops.pop_front();
+                        Box::new(move || drop(op))
                     }
-                    let op = s.ops.pop_front();
-                    Box::new(move || drop(op))
                 }
                 Some(Op::Lists(lists)) => {
                     let (ready, len) = (lists.ready(), lists.len());
@@ -129,14 +152,19 @@ impl Timeline {
                             moved = true;
                             continue;
                         }
-                        s.hold(true);
-                        return moved;
+                        // As for a fence above.
+                        if !finishing() {
+                            s.hold(true);
+                            return moved;
+                        }
+                        Box::new(finish)
+                    } else {
+                        let work = lists.take(n);
+                        if n == len {
+                            s.ops.pop_front();
+                        }
+                        work
                     }
-                    let work = lists.take(n);
-                    if n == len {
-                        s.ops.pop_front();
-                    }
-                    work
                 }
                 Some(Op::Signal(..) | Op::Work(_)) => match s.ops.pop_front() {
                     Some(Op::Signal(fence, value)) => Box::new(move || {
