@@ -112,6 +112,11 @@ void main(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
 /// tables (`[1]`).
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Bytes of video memory the card buffers and their hash tables take.
+pub(crate) fn bytes() -> u64 {
+    CARD_BYTES.iter().map(|b| b.load(Ordering::Relaxed)).sum()
+}
+
 /// Card buffers with pending CPU→VRAM uploads (`dirty_up`).
 static DIRTY_CARDS: Mutex<Vec<Weak<CardState>>> = Mutex::new(Vec::new());
 

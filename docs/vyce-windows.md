@@ -89,5 +89,26 @@ o arquivo de erros também recebe uma linha VYCE_TELEMETRY por amostra para
 permitir comparações posteriores. O painel omite essas linhas brutas da
 visualização de logs.
 
+A telemetria separa o trabalho da GPU da espera por ela. Estes campos de
+VYCE_TELEMETRY são por quadro, exceto os de memória:
+
+| Campo | Significado |
+| --- | --- |
+| gpu_busy_ms, gpu_timed_per_frame | Tempo medido na própria GPU, do início ao fim de cada submissão, e quantas foram medidas |
+| submissions_per_frame, unwaited_per_frame | Submissões, e as do jogo que voltaram antes de a GPU terminar |
+| held_by_card_per_frame | Submissões do jogo que esperaram só porque shaders escrevem em buffers da VRAM |
+| snapshot_ms, steps_ms, card_record_ms | Partes do preparo: cópias de referência, trabalho adiado pelas listas, buffers da VRAM |
+| submit_ms | Entrega das listas à fila (parte da espera pela GPU nas submissões esperadas) |
+| prewarm_ms | Cópias adiantadas enquanto a submissão anterior roda (fora do preparo) |
+| vram_mb, vram_budget_mb, shared_mb, card_mb | Memória de vídeo usada e o limite do Windows, memória compartilhada, buffers na VRAM |
+
+O relógio da GPU acrescenta duas listas curtas a cada submissão. Ele só
+existe quando a telemetria está ligada.
+
+Para comparar sem mudar de binário, defina no processo que chama o launcher
+VICTORY_ASYNC_SUBMIT=0 (submissões esperadas, como antes),
+VICTORY_STRETCH=0 (sem a memória do jogo usada no lugar por uma segunda
+vista) ou VICTORY_PLAN_REUSE=0 (plano de descritores anterior).
+
 Para abrir o painel de uma sessão já em execução sem reiniciar o jogo,
 execute scripts\vyce-monitor.ps1 e passe -GamePid, -StdoutLog e -StderrLog.

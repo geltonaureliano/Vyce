@@ -127,6 +127,9 @@ $root.Controls.Add($header, 0, 0)
 
 $mainMetrics = (New-MetricRow @('FPS', 'Tempo por quadro', 'Draw calls / quadro', 'Quadros apresentados') 1 21 @{}).Values
 $work = New-MetricRow @('Preparo na CPU', 'Espera pela GPU', 'Cópia de volta', 'Descartes / quadro', 'Pipelines em criação') 2 15 @{
+    'Preparo na CPU' = 'Snapshots —'
+    'Espera pela GPU' = 'GPU ocupada —'
+    'Cópia de volta' = 'Assíncronas —'
     'Pipelines em criação' = 'Espera CPU —'
 }
 $workMetrics = $work.Values
@@ -424,6 +427,11 @@ function Update-Monitor {
     $workMetrics['Pipelines em criação'].Text = Format-Metric $frame.pipelines_building 'N0'
     $pipelineWait = Format-Metric $frame.pipeline_wait_ms '0.0' ' ms/quadro'
     $work.Details['Pipelines em criação'].Text = "Espera CPU $pipelineWait"
+    # Absent in the telemetry of older builds, where these show a dash.
+    $work.Details['Preparo na CPU'].Text = 'Snapshots ' + (Format-Metric $frame.snapshot_ms '0.0' ' ms')
+    $work.Details['Espera pela GPU'].Text = 'GPU ocupada ' + (Format-Metric $frame.gpu_busy_ms '0.0' ' ms')
+    $work.Details['Cópia de volta'].Text = 'Assíncronas ' + (Format-Metric $frame.unwaited_per_frame '0.0') +
+        ' de ' + (Format-Metric $frame.submissions_per_frame '0.0')
 
     if (!$alive) {
         $activityLabel.Text = 'Sessão encerrada'
@@ -445,6 +453,9 @@ function Update-Monitor {
     $counts = "Avisos $($monitor.Warnings)  ·  Erros $($monitor.Errors)"
     if ($monitor.LastLog) {
         $counts += "  ·  Última linha lida às $($monitor.LastLog.ToString('HH:mm:ss'))"
+    }
+    if ($null -ne $frame.vram_mb) {
+        $counts += "  ·  VRAM $(Format-Metric $frame.vram_mb 'N0') de $(Format-Metric $frame.vram_budget_mb 'N0' ' MB')"
     }
     $footer.Text = $counts
 }

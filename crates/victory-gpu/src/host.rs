@@ -17,6 +17,8 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
+use crate::telemetry::Count;
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -45,6 +47,8 @@ struct InFlight {
         std::sync::Arc<crate::resource::HostTexture>,
     )>,
     _plans: Vec<std::sync::Arc<crate::descriptor::host::BindlessPlan>>,
+    /// The host GPU's time was taken around it ([`crate::telemetry`]).
+    timed: bool,
     /// What is done once it has run ([`Host::finish_submission`]): its
     /// lists, kept alive for that, and the ranges its shaders wrote.
     finish: Option<Finish>,
@@ -106,6 +110,8 @@ pub(crate) struct Host {
     card: OnceLock<Option<Mutex<crate::card::CardEngine>>>,
     /// Immutable source for resetting each device-local indirect budget.
     indirect_zero: OnceLock<Option<ID3D12Resource>>,
+    /// The host GPU's time around submissions, when asked for.
+    clock: OnceLock<Option<crate::telemetry::Clock>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -462,6 +468,7 @@ impl Host {
                 presenter: Mutex::new(None),
                 card: OnceLock::new(),
                 indirect_zero: OnceLock::new(),
+                clock: OnceLock::new(),
             })
         }
     }
@@ -1182,6 +1189,9 @@ impl Host {
             };
             let Some(mut done) = done else { break };
             last_sub = last_sub.max(done.submission);
+            if done.timed && let Some(clock) = self.telemetry_clock() {
+                clock.ran();
+            }
             if let Some(Finish { lists, back }) = done.finish.take() {
                 {
                     let runs: Vec<&HostList> = lists.iter().map(|l| &**l).collect();
@@ -1201,6 +1211,14 @@ impl Host {
         }
     }
 
+    /// The host GPU's clock, if measurements are on.
+    fn telemetry_clock(&self) -> Option<&crate::telemetry::Clock> {
+        if !crate::telemetry::on() {
+            return None;
+        }
+        self.clock.get_or_init(|| crate::telemetry::Clock::new(self)).as_ref()
+    }
+
     /// Whether a submission is still to be waited for and finished.
     fn has_in_flight(&self) -> bool {
         !self.in_flight.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
@@ -1215,11 +1233,13 @@ impl Host {
         // SAFETY: the fence and event are ours; guarded by `submitted`.
         unsafe {
             if self.fence.GetCompletedValue() < target {
+                let waited = std::time::Instant::now();
                 if let Err(e) = self.fence.SetEventOnCompletion(target, self.event) {
                     tracing::warn!(error = %e, "host fence wait failed");
                 } else {
                     WaitForSingleObject(self.event, INFINITE);
                 }
+                SUBMISSION_US[1].fetch_add(waited.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
         }
         self.reap_completed();
@@ -1384,6 +1404,7 @@ impl Host {
                 target.push((shadow, address, len));
             }
         }
+        let recording = crate::telemetry::start();
         let (card_before, card_plan, mut card_after) =
             if self.card.get().and_then(|o| o.as_ref()).is_some() || !card_writes.is_empty() {
                 if let Some(engine_lock) = self.card_engine() {
@@ -1401,6 +1422,7 @@ impl Host {
             } else {
                 (None, None, None)
             };
+        crate::telemetry::stop(Count::Card, recording);
         let prepared = std::time::Instant::now();
         // Each run (prelude and list) is a submission of its own: the host
         // resets the device when one submission runs for about 2 s, and
@@ -1422,6 +1444,24 @@ impl Host {
             && !each
             && async_submit()
             && card_writes.is_empty();
+        #[cfg(feature = "diagnostics")]
+        let works = !no_work();
+        #[cfg(not(feature = "diagnostics"))]
+        let works = true;
+        // Not around runs that are waited for one by one.
+        let clock = if works && !each && !groups.is_empty() { self.telemetry_clock() } else { None };
+        if crate::telemetry::on() {
+            crate::telemetry::add(Count::Submissions, 1);
+            if keep.is_some() && async_submit() && !card_writes.is_empty() {
+                crate::telemetry::add(Count::HeldByCard, 1);
+            }
+        }
+        let submitting = crate::telemetry::start();
+        if let Some(clock) = clock {
+            // SAFETY: a closed list, not running: the submission before this
+            // one was waited for.
+            unsafe { self.queue.ExecuteCommandLists(&[Some(clock.begin())]) };
+        }
         if let Some(first) = first {
             // SAFETY: a closed list.
             unsafe { self.queue.ExecuteCommandLists(&[Some(first)]) };
@@ -1453,6 +1493,13 @@ impl Host {
                 unsafe { self.queue.ExecuteCommandLists(&[Some(after)]) };
                 card_after_ran = true;
             }
+            if let Some(clock) = clock {
+                // SAFETY: a closed list, after the submission's last.
+                unsafe { self.queue.ExecuteCommandLists(&[Some(clock.end())]) };
+            }
+            if !each {
+                crate::telemetry::stop(Count::Submit, submitting);
+            }
             *submitted += 1;
             let fence_val = *submitted;
             if can_async {
@@ -1464,6 +1511,9 @@ impl Host {
                         list.last_fence.store(fence_val, Ordering::Release);
                     }
                     async_signalled = true;
+                    if crate::telemetry::on() {
+                        crate::telemetry::add(Count::Unwaited, 1);
+                    }
                 }
                 continue;
             }
@@ -1522,12 +1572,16 @@ impl Host {
                     submission: this_submission,
                     _early_copies: early.copies,
                     _plans: batch.plans,
+                    timed: clock.is_some(),
                     finish: Some(Finish {
                         lists: keep.map(<[_]>::to_vec).unwrap_or_default(),
                         back: cpu_back,
                     }),
                 });
             return;
+        }
+        if let Some(clock) = clock {
+            clock.ran();
         }
         drop(early);
         FINISHED.fetch_max(this_submission, Ordering::AcqRel);
@@ -2832,7 +2886,9 @@ impl HostList {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
+                    let working = crate::telemetry::start();
                     work();
+                    crate::telemetry::stop(Count::Steps, working);
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
@@ -2842,7 +2898,9 @@ impl HostList {
                 Step::GpuWrite(shadow, address, len) => {
                     // The shaders start from the title's data.
                     batch.flush();
+                    let started = crate::telemetry::start();
                     shadow.writing(*address, *len);
+                    crate::telemetry::stop(Count::Snapshots, started);
                 }
                 Step::Texture(staging, copy) => {
                     if batch.texture_due(staging) && staging.refresh() {
@@ -3699,7 +3757,7 @@ impl Meter {
             frames_total: 0,
             drawn: crate::draw::drawn(),
             logged: now,
-            telemetry: std::env::var_os("VYCE_TELEMETRY").is_some_and(|v| v == "1"),
+            telemetry: crate::telemetry::on(),
             caption: None,
             shown: None,
         }
@@ -3745,10 +3803,14 @@ impl Meter {
         let pipeline_timeouts = ordinary.timeouts + screen.timeouts;
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
+        let count = |what| crate::telemetry::take(what) as f64 / frames;
+        let time = |what| crate::telemetry::take(what) as f64 / 1e3 / frames;
+        let prewarm_ms = PREWARM_US.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
         if self.telemetry && [fps, ms, draws, gpu, cpu, back_ms, dropped].into_iter().all(f64::is_finite) {
             // Keep one complete sample together with respect to other stderr writers.
             // A closed or unavailable monitor output must not interrupt rendering.
             use std::io::Write as _;
+            let [local, shared] = video_memory().unwrap_or_default();
             let _ = writeln!(
                 std::io::stderr().lock(),
                 "VYCE_TELEMETRY {{\"schema\":1,\"event\":\"frame\",\"fps\":{fps:.2},\
@@ -3761,8 +3823,26 @@ impl Meter {
                  \"pipeline_wait_ms\":{pipeline_wait_ms:.2},\"pipeline_waits\":{pipeline_waits},\
                  \"pipeline_world_wait_ms\":{world_wait_ms:.2},\"pipeline_screen_wait_ms\":{screen_wait_ms:.2},\
                  \"pipeline_wait_timeouts\":{pipeline_timeouts},\
+                 \"submissions_per_frame\":{:.2},\"unwaited_per_frame\":{:.2},\
+                 \"held_by_card_per_frame\":{:.2},\"gpu_busy_ms\":{:.2},\"gpu_timed_per_frame\":{:.2},\
+                 \"snapshot_ms\":{:.2},\"steps_ms\":{:.2},\"card_record_ms\":{:.2},\"submit_ms\":{:.2},\
+                 \"prewarm_ms\":{prewarm_ms:.2},\"vram_mb\":{},\"vram_budget_mb\":{},\
+                 \"shared_mb\":{},\"card_mb\":{},\
                  \"dropped_per_frame\":{dropped:.2},\"pipelines_building\":{}}}",
                 self.frames_total,
+                count(Count::Submissions),
+                count(Count::Unwaited),
+                count(Count::HeldByCard),
+                time(Count::Gpu),
+                count(Count::GpuTimed),
+                time(Count::Snapshots),
+                time(Count::Steps),
+                time(Count::Card),
+                time(Count::Submit),
+                local.0 >> 20,
+                local.1 >> 20,
+                shared.0 >> 20,
+                crate::card::bytes() >> 20,
                 crate::pipeline::making(),
             );
         }

@@ -40,6 +40,7 @@ pub mod list;
 mod memwait;
 #[cfg(windows)]
 mod memory;
+mod telemetry;
 mod timeline;
 pub mod memstat;
 pub mod object;
