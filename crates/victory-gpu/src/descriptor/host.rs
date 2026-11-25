@@ -511,7 +511,7 @@ pub(crate) fn near_heaps(va: u64) -> String {
 
 /// The host's limit for shader-visible view heaps on resource binding
 /// tiers 1 and 2; tier 3 hardware may take more.
-const PORTABLE_VIEWS: u32 = 1_000_000;
+pub(crate) const PORTABLE_VIEWS: u32 = 1_000_000;
 
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
@@ -779,7 +779,7 @@ impl HostHeap {
         let started = std::time::Instant::now();
         // SAFETY: a plain call on a live heap.
         let total = unsafe { h.heap.GetDesc() }.NumDescriptors;
-        if !sampler && total < victory_shader::emit::VIEW_SLOTS {
+        if !sampler && total < victory_shader::emit::host_views() {
             tracing::warn!(total, "a view heap shorter than shaders keep their indices in");
         }
         if let Err(e) = h.fill_null(kind, total) {

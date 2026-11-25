@@ -253,6 +253,114 @@ fn masks_read_whole_count_both_halves() {
     console_flow_case("s_bcnt1 of lanes below 40", &body, 32, |_| 32);
 }
 
+/// A whole-wave section summing `v0` (as the console compiler expands
+/// `WaveActiveSum` for wave64): each half of 32 lanes with DPP and
+/// `v_permlanex16`, then lanes 0 and 32 read and added. The sum is in s12.
+const WAVE_SUM: &[u32] = &[
+    0xBE8A_25C1, // s_or_saveexec_b64 s[10:11], -1
+    0xD501_0001,
+    0x002A_0080, // v_cndmask_b32_e64 v1, 0, v0, s[10:11]
+    0x4A02_02FA,
+    0xFF01_6101, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:1
+    0x4A02_02FA,
+    0xFF01_6201, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:2
+    0x4A02_02FA,
+    0xFF01_6401, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:4
+    0x4A02_02FA,
+    0xFF01_6801, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:8
+    0xD778_0006,
+    0x0305_8301, // v_permlanex16_b32 v6, v1, -1, -1
+    0x4A02_0D01, // v_add_nc_u32_e32 v1, v1, v6
+    0xD760_000C,
+    0x0001_0101, // v_readlane_b32 s12, v1, 0
+    0xD760_000D,
+    0x0001_4101, // v_readlane_b32 s13, v1, 32
+    0x800C_0D0C, // s_add_u32 s12, s12, s13
+    0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+];
+
+/// A reduction over the console wave, in two host waves: each reduces its
+/// half and they put the two together.
+#[test]
+fn wave_sums_cover_both_halves() {
+    let mut body = WAVE_SUM.to_vec();
+    body.push(0x7E04_020C); // v_mov_b32 v2, s12
+    console_flow_case("WaveActiveSum(t)", &body, 64, |_| 2016);
+    // The upper half is partial, or not there.
+    console_flow_case("WaveActiveSum(t)", &body, 48, |_| 1128);
+    console_flow_case("WaveActiveSum(t)", &body, 32, |_| 496);
+}
+
+/// The same inside a branch only lanes 10 to 49 take: the others bring
+/// nothing, and lanes of both halves get the sum.
+#[test]
+fn wave_sums_in_a_branch_count_its_lanes() {
+    let mut body = vec![
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x4A0E_00CA, // v_add_nc_u32 v7, -10, v0
+        0x7D88_0EA8, // v_cmp_gt_u32 vcc, 40, v7
+        0xBE8E_246A, // s_and_saveexec_b64 s[14:15], vcc
+        0xBF88_0015, // s_cbranch_execz +21
+    ];
+    body.extend_from_slice(WAVE_SUM);
+    body.push(0x7E04_020C); // v_mov_b32 v2, s12
+    body.push(0x88FE_0E7E); // s_or_b64 exec, exec, s[14:15]
+    console_flow_case("if (10 <= t < 50) WaveActiveSum(t)", &body, 64, |t| {
+        if (10..50).contains(&t) { 1180 } else { 1 }
+    });
+}
+
+/// A prefix sum: rows with `row_shr` steps, each 32 with `v_permlanex16`,
+/// the upper half with lane 31; then moved up by one lane (exclusive).
+#[test]
+fn wave_prefix_sums_continue_into_the_upper_half() {
+    let body = [
+        0xBE8A_25C1, // s_or_saveexec_b64 s[10:11], -1
+        0xD501_0001,
+        0x002A_0080, // v_cndmask_b32_e64 v1, 0, v0, s[10:11]
+        0x4A02_02FA,
+        0xFF01_1101, // v_add_nc_u32_dpp v1, v1, v1 row_shr:1
+        0x4A02_02FA,
+        0xFF01_1201, // v_add_nc_u32_dpp v1, v1, v1 row_shr:2
+        0x4A02_02FA,
+        0xFF01_1401, // v_add_nc_u32_dpp v1, v1, v1 row_shr:4
+        0x4A02_02FA,
+        0xFF01_1801, // v_add_nc_u32_dpp v1, v1, v1 row_shr:8
+        0xD778_0006,
+        0x0305_8301, // v_permlanex16_b32 v6, v1, -1, -1
+        0x7E0E_0280, // v_mov_b32_e32 v7, 0
+        0x7E0E_02FA,
+        0xAF00_E406, // v_mov_b32_dpp v7, v6 quad_perm:[0,1,2,3] row_mask:0xa
+        0x4A02_0F01, // v_add_nc_u32_e32 v1, v1, v7
+        0xD760_000C,
+        0x0001_3F01, // v_readlane_b32 s12, v1, 31
+        0x7E10_020C, // v_mov_b32_e32 v8, s12
+        0x7E0E_0280, // v_mov_b32_e32 v7, 0
+        0x7E0E_02FA,
+        0xCF00_E408, // v_mov_b32_dpp v7, v8 quad_perm:[0,1,2,3] row_mask:0xc
+        0x4A02_0F01, // v_add_nc_u32_e32 v1, v1, v7
+        0x7E12_0280, // v_mov_b32_e32 v9, 0
+        0x7E12_02FA,
+        0xFF01_1101, // v_mov_b32_dpp v9, v1 row_shr:1
+        0xD760_000D,
+        0x0001_1F01, // v_readlane_b32 s13, v1, 15
+        0xD761_0009,
+        0x0001_200D, // v_writelane_b32 v9, s13, 16
+        0xD760_000D,
+        0x0001_3F01, // v_readlane_b32 s13, v1, 31
+        0xD761_0009,
+        0x0001_400D, // v_writelane_b32 v9, s13, 32
+        0xD760_000D,
+        0x0001_5F01, // v_readlane_b32 s13, v1, 47
+        0xD761_0009,
+        0x0001_600D, // v_writelane_b32 v9, s13, 48
+        0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+        0x7E04_0309, // v_mov_b32 v2, v9
+    ];
+    console_flow_case("WavePrefixSum(t)", &body, 64, |t| t * t.saturating_sub(1) / 2);
+    console_flow_case("WavePrefixSum(t)", &body, 48, |t| t * t.saturating_sub(1) / 2);
+}
+
 /// A lane of the other half: lane 40 is the upper half's lane 8.
 #[test]
 fn lane_reads_cross_halves() {

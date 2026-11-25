@@ -24,6 +24,10 @@ pub use native::{
     HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, container_programs, native_programs,
 };
 
+/// A fingerprint of the translator's sources (`build.rs`): two builds with
+/// the same one translate alike.
+pub const SOURCES: &str = env!("VICTORY_SHADER_SOURCES");
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ShaderError {
     #[error("not a DXBC container")]

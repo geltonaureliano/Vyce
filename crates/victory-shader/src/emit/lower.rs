@@ -132,6 +132,9 @@ pub(crate) struct Parts<'a> {
     /// Never ask for the console flow: the per-lane form or nothing (what
     /// a program falls back to when the console flow cannot lower it).
     pub per_lane_only: bool,
+    /// Each host wave of 32 lanes as a console wave of its own
+    /// ([`super::local_waves`]).
+    pub local: bool,
 }
 
 #[cfg(test)]
@@ -1202,9 +1205,10 @@ impl<'a> Lower<'a> {
                 && x.target.runs(32)
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
             // The rest of such programs need the halves to exchange values
-            // (masks read whole, lanes of the other half): the console flow,
-            // for a group of one console wave. Its LDS accesses are ordered
-            // explicitly, since the two halves no longer run in lockstep.
+            // (masks read whole, lanes of the other half, reductions over the
+            // wave): the console flow, for a group of one console wave. Its
+            // LDS accesses are ordered explicitly, since the two halves no
+            // longer run in lockstep.
             wants_console_flow = (console_lanes || shared_wave)
                 && !split
                 && x.native.wave64
@@ -1212,8 +1216,7 @@ impl<'a> Lower<'a> {
                 && x.target.runs(32)
                 && (s.lds_dwords == 0 || shared_wave)
                 && one_wave
-                && !insts().any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32")
-                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+                && !insts().any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32");
             // On a host that runs the console's wave size: lane reads and
             // writes in a program whose lanes branch differently (see
             // [`CONSOLE_FLOW`]).
@@ -1237,7 +1240,12 @@ impl<'a> Lower<'a> {
                 split = x.native.wave64 && !x.target.runs(64);
                 sync_split_lds = split && shared_wave;
             }
-            if split {
+            if x.local {
+                console_lanes = true;
+                split = false;
+                wants_console_flow = false;
+            }
+            if split || x.local {
                 s.wave_size = Some(32);
             } else if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
@@ -1812,6 +1820,9 @@ impl<'a> Lower<'a> {
             Shape::Value(v) => return self.i32_of(v),
             Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
             Shape::ActiveF64(lo, hi, mask, is_hi) => {
+                if self.split && self.group_threads() > 32 {
+                    return Err("a 64-bit wave sum in a wave64 program split in halves");
+                }
                 let c = self.cur;
                 let &m = self
                     .x
@@ -1861,9 +1872,12 @@ impl<'a> Lower<'a> {
         if self.mask_data == MaskData::None {
             return Err("a wave reduction in a mesh shader");
         }
-        if self.split {
+        if self.split && !self.console_cf {
             return Err("a wave reduction in a wave64 program split in halves");
         }
+        // Two host waves stand for the console wave: both are here (console
+        // flow) and put together what each reduced.
+        let halves = self.split && self.group_threads() > 32;
         let c = self.cur;
         let &m = self
             .x
@@ -1900,23 +1914,73 @@ impl<'a> Lower<'a> {
                     121,
                     &[arg, k0, k1],
                 );
-                if inclusive {
+                let r = if inclusive {
                     self.s.m.bin(c, Bin::Add, r, arg)
+                } else {
+                    r
+                };
+                if halves {
+                    // The upper half's lanes come after all of the lower's.
+                    let total = self.wave_reduction(op, arg);
+                    let total = if float { self.as_int(total) } else { total };
+                    let (lo, _) = self.exchange(c, total);
+                    let lo = if float { self.as_float(lo) } else { lo };
+                    let more = self.s.m.bin(c, Bin::Add, lo, r);
+                    let (_, half) = self.console_lane();
+                    let z = self.s.m.i32(0);
+                    let low = self.s.m.cmp(c, pred::EQ, half, z);
+                    self.s.m.select(c, low, r, more)
                 } else {
                     r
                 }
             }
             (_, Some(_)) => return Err("a wave prefix of an operation other than a sum"),
-            (Op::Or | Op::And | Op::Xor, None) => {
+            (_, None) => {
+                let r = self.wave_reduction(op, arg);
+                if halves {
+                    let mine = if float { self.as_int(r) } else { r };
+                    let (lo, hi) = self.exchange(c, mine);
+                    let (lo, hi) = if float {
+                        (self.as_float(lo), self.as_float(hi))
+                    } else {
+                        (lo, hi)
+                    };
+                    self.reduce_pair(op, lo, hi)
+                } else {
+                    r
+                }
+            }
+        };
+        Ok(if f16 {
+            self.s
+                .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[r])
+        } else if float {
+            self.as_int(r)
+        } else {
+            r
+        })
+    }
+
+    /// `op` over `x` of the host wave's active lanes (a 32-bit float for the
+    /// float operations, 16-bit sums included).
+    fn wave_reduction(&mut self, op: super::wave::Op, x: V) -> V {
+        use super::wave::Op;
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        match op {
+            Op::Or | Op::And | Op::Xor => {
                 let k = self.s.m.i8(match op {
                     Op::And => 0,
                     Op::Or => 1,
                     _ => 2,
                 });
                 self.s
-                    .op(c, "waveActiveBit.i32", Attr::NoUnwind, i32t, 120, &[arg, k])
+                    .op(c, "waveActiveBit.i32", Attr::NoUnwind, i32t, 120, &[x, k])
             }
-            (_, None) => {
+            _ => {
+                let float = matches!(op, Op::AddF | Op::AddF16 | Op::MinF | Op::MaxF);
+                let ty = if float { self.s.t.f32 } else { i32t };
+                let sfx = if float { "f32" } else { "i32" };
                 let (code, unsigned) = match op {
                     Op::AddU => (0, 1),
                     Op::AddF | Op::AddF16 => (0, 0),
@@ -1932,18 +1996,36 @@ impl<'a> Lower<'a> {
                     Attr::NoUnwind,
                     ty,
                     119,
-                    &[arg, k, u],
+                    &[x, k, u],
                 )
             }
+        }
+    }
+
+    /// `op` of two values (as [`Self::wave_reduction`] gives them).
+    fn reduce_pair(&mut self, op: super::wave::Op, a: V, b: V) -> V {
+        use super::wave::Op;
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        // DXIL's IMax, IMin, UMax, UMin; FMax, FMin.
+        let code = match op {
+            Op::AddU | Op::AddF | Op::AddF16 => return self.s.m.bin(c, Bin::Add, a, b),
+            Op::Or => return self.s.m.bin(c, Bin::Or, a, b),
+            Op::And => return self.s.m.bin(c, Bin::And, a, b),
+            Op::Xor => return self.s.m.bin(c, Bin::Xor, a, b),
+            Op::MaxF => return self.binary(35, a, b),
+            Op::MinF => return self.binary(36, a, b),
+            Op::MaxI => 37,
+            Op::MinI => 38,
+            Op::MaxU => 39,
+            Op::MinU => 40,
         };
-        Ok(if f16 {
-            self.s
-                .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[r])
-        } else if float {
-            self.as_int(r)
-        } else {
-            r
-        })
+        self.s.op(c, "binary.i32", Attr::ReadNone, i32t, code, &[a, b])
+    }
+
+    /// Threads in a compute group.
+    fn group_threads(&self) -> u32 {
+        self.s.threads.map_or(0, |t| t.iter().product())
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
@@ -4261,6 +4343,19 @@ impl<'a> Lower<'a> {
         debug_assert!(self.s.threads.is_none() || self.console_lanes);
         self.s.flags |= flags::WAVE_OPS;
         Ok(())
+    }
+
+    /// A constant lane named by a program whose host waves each run as a
+    /// console wave of their own: those past the host wave are not there.
+    fn lane_here(&self, lane: Option<&Operand>) -> Result<(), Why> {
+        match lane {
+            Some(&Operand::Const(c))
+                if self.x.local && crate::resource::inline(c).is_none_or(|n| n >= 32) =>
+            {
+                Err("a named lane past the host wave")
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Component `c` of the thread id in the group. With console lanes, the
@@ -7245,7 +7340,7 @@ impl<'a> Lower<'a> {
         let table = self.s.stride_table_handle();
         // A root view has no bounds: a wild index would read past the table.
         let slot = if super::limits_indices() || from != 0 {
-            let (i32t, last) = (self.s.t.i32, self.s.m.i32(super::OWN_SLOTS - 1));
+            let (i32t, last) = (self.s.t.i32, self.s.m.i32(super::host_slots() - 1));
             self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last])
         } else {
             slot
@@ -8298,6 +8393,7 @@ impl<'a> Lower<'a> {
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
+                self.lane_here(v.src.get(1))?;
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
                 if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
@@ -8315,6 +8411,7 @@ impl<'a> Lower<'a> {
             "v_writelane_b32" => {
                 // The lane given takes the scalar; the others keep their value.
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
+                self.lane_here(v.src.get(1))?;
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a lane write");
                 };
@@ -13307,6 +13404,7 @@ mod tests {
             psv: None,
             console_cf: false,
             per_lane_only: false,
+            local: false,
         };
         lower(&parts).map(|l| l.dxil)
     }
@@ -13382,6 +13480,7 @@ mod tests {
             target: super::super::Target::ANY,
             console_cf: false,
             per_lane_only: false,
+            local: false,
         })
     }
 
@@ -14352,6 +14451,7 @@ mod tests {
             psv: None,
             console_cf: false,
             per_lane_only: false,
+            local: false,
         })
         .map(|l| l.dxil)
     }
@@ -14432,6 +14532,7 @@ mod tests {
             psv: None,
             console_cf: false,
             per_lane_only: false,
+            local: false,
         };
         let bad = HashMap::new();
         let mut l = super::Lower::new(&parts, &bad, false);
@@ -14514,6 +14615,7 @@ mod tests {
             psv: None,
             console_cf: false,
             per_lane_only: false,
+            local: false,
         })
         .map(|_| ())
     }
@@ -14610,6 +14712,7 @@ mod tests {
             psv: None,
             console_cf: false,
             per_lane_only: false,
+            local: false,
         })
         .unwrap();
 
@@ -14841,6 +14944,7 @@ mod tests {
                 psv: None,
                 console_cf: false,
                 per_lane_only: false,
+                local: false,
             })
         };
 
@@ -14930,6 +15034,7 @@ mod tests {
                 psv: None,
                 console_cf: false,
                 per_lane_only: false,
+                local: false,
             });
             // Cube (3) and MSAA (6, 7) descriptor_data() all lower without failing
             // on "an image dimension (cube or MSAA)".
@@ -15002,6 +15107,7 @@ mod tests {
                 psv: None,
                 console_cf: false,
                 per_lane_only: false,
+                local: false,
             })
             .unwrap();
         }
@@ -15074,6 +15180,7 @@ mod tests {
                 psv: None,
                 console_cf: false,
                 per_lane_only: false,
+                local: false,
             })
             .unwrap();
         }
@@ -15141,6 +15248,7 @@ mod tests {
                 psv: None,
                 console_cf: false,
                 per_lane_only: false,
+                local: false,
             })
             .unwrap();
         }

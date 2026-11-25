@@ -1,9 +1,10 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
-//! cache folder, keyed by the container's content and by the VIctory build
-//! that translated it (the BLAKE3 of our executable), so a rebuilt
-//! translator never serves an old translation. Entries go through
-//! `victory-pipeline`'s content-addressed cache, which writes them
-//! atomically; an entry that does not read back is translated again.
+//! cache folder, keyed by the container's content and by the translator that
+//! made it (a fingerprint of its sources and its settings), so a changed
+//! translator never serves an old translation, and a build that changed
+//! elsewhere serves every one. Entries go through `victory-pipeline`'s
+//! content-addressed cache, which writes them atomically; an entry that does
+//! not read back is translated again.
 //!
 //! The entry is our own encoding of [`HostShader`]: a field added to it
 //! must be added to `encode` and `decode` too (entries of older builds
@@ -36,22 +37,11 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// What identifies the translator: the fingerprint of its sources and of the
+/// settings it runs with (the loop limit, the host's view heaps).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        // Diagnostics (`VICTORY_SHADER_BUILD_OF=<executable>`): the entries
-        // of another build, for a build whose translation is the same (a
-        // change elsewhere), which then need not be made again.
-        let other = std::env::var_os("VICTORY_SHADER_BUILD_OF")
-            .filter(|_| cfg!(feature = "diagnostics"))
-            .map(std::path::PathBuf::from);
-        if let Some(other) = &other {
-            tracing::warn!(of = %other.display(), "shader cache entries of another build are used");
-        }
-        let exe = other.map_or_else(std::env::current_exe, Ok).and_then(std::fs::read);
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -59,21 +49,12 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        match exe {
-            Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
-                bytes.push(victory_shader::emit::rays().into());
-                *blake3::hash(&bytes).as_bytes()
-            }
-            Err(e) => {
-                // Without it no entry can be trusted: a fresh key per run.
-                tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                *blake3::hash(&now.as_nanos().to_le_bytes()).as_bytes()
-            }
-        }
+        let mut h = blake3::Hasher::new();
+        h.update(victory_shader::SOURCES.as_bytes());
+        h.update(&limit.to_le_bytes());
+        h.update(&[victory_shader::emit::rays().into()]);
+        h.update(&victory_shader::emit::host_views().to_le_bytes());
+        *h.finalize().as_bytes()
     })
 }
 
@@ -121,7 +102,7 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
         "shader.dxil"
     }
     fn version(&self) -> u32 {
-        // The build fingerprint in the input does the versioning.
+        // The translator's fingerprint in the input does the versioning.
         1
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {

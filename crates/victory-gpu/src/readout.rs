@@ -5,6 +5,31 @@
 use std::sync::OnceLock;
 
 use windows::Win32::Foundation::RECT;
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12GraphicsCommandList,
+};
+
+/// Rectangles cleared by one call. NVIDIA's driver (610.88, RTX 2070 SUPER)
+/// keeps them in an array of 32 on its stack and ends the process past it
+/// (0xc0000409 in nvwgf2umx.dll): the readout has about a hundred.
+pub(crate) const RECTS_AT_ONCE: usize = 32;
+
+/// Clears `rects` of the render target `view` to `color`.
+///
+/// # Safety
+/// `list` is open; `view` is a live view of a texture in the render target
+/// state that holds the rectangles.
+pub(crate) unsafe fn clear(
+    list: &ID3D12GraphicsCommandList,
+    view: D3D12_CPU_DESCRIPTOR_HANDLE,
+    color: &[f32; 4],
+    rects: &[RECT],
+) {
+    for part in rects.chunks(RECTS_AT_ONCE) {
+        // SAFETY: the caller's.
+        unsafe { list.ClearRenderTargetView(view, color, Some(part)) };
+    }
+}
 
 /// Whether the readout is drawn.
 pub(crate) fn on() -> bool {
@@ -88,5 +113,64 @@ mod tests {
         );
         assert!(rects(" ", (0, 0), 4).is_empty());
         assert_eq!(size("12 FPS"), (37, 9));
+    }
+
+    /// On the hardware device, as the driver is what failed: the whole text
+    /// in one call ended the process while recording.
+    #[test]
+    fn a_readout_of_many_rectangles_records() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let Some(host) = crate::host::host() else { return };
+        let marks = rects("888.8 FPS  8888 MS", (15, 15), 5);
+        assert!(marks.len() > RECTS_AT_ONCE);
+        // SAFETY: objects of our own; the list is never run.
+        unsafe {
+            let mut texture: Option<ID3D12Resource> = None;
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: 1920,
+                        Height: 1080,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut texture,
+                )
+                .unwrap();
+            let texture = texture.unwrap();
+            let heap: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })
+                .unwrap();
+            let view = heap.GetCPUDescriptorHandleForHeapStart();
+            host.device.CreateRenderTargetView(&texture, None, view);
+            let allocator: ID3D12CommandAllocator = host
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .unwrap();
+            let list: ID3D12GraphicsCommandList = host
+                .device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                .unwrap();
+            clear(&list, view, &[1.0, 0.9, 0.1, 1.0], &marks);
+            list.Close().unwrap();
+        }
     }
 }

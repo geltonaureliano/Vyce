@@ -1139,7 +1139,10 @@ extern "system" fn clear_rtv(
                     State(RENDER_TARGET as i32),
                 )]);
             }
-            list.list.ClearRenderTargetView(rtv, color, rects);
+            match rects {
+                Some(rects) => crate::readout::clear(&list.list, rtv, color, rects),
+                None => list.list.ClearRenderTargetView(rtv, color, None),
+            }
         }
     }
     #[cfg(not(windows))]
@@ -1181,11 +1184,17 @@ extern "system" fn clear_dsv(
         const DEPTH_WRITE: u32 = 0x10;
         ensure_state(&list, record.resource, DEPTH_WRITE);
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
+        let flags = D3D12_CLEAR_FLAGS(flags as i32 & 3);
         // SAFETY: an open list, a fresh view of a live texture.
-        unsafe {
-            list.list
-                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
+        let clear = |rects| unsafe {
+            list.list.ClearDepthStencilView(dsv, flags, depth, stencil, rects);
         };
+        match rects {
+            Some(rects) => rects
+                .chunks(crate::readout::RECTS_AT_ONCE)
+                .for_each(|part| clear(Some(part))),
+            None => clear(None),
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, handle, flags, depth, stencil, count, rects);

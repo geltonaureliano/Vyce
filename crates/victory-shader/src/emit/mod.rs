@@ -92,6 +92,7 @@ pub mod host;
 mod lds_tests;
 #[cfg(all(test, windows))]
 mod lane_read_loop_tests;
+mod local_waves;
 mod lower;
 mod rectangle;
 #[cfg(test)]
@@ -168,8 +169,29 @@ pub const VIEW_SLOTS: u32 = 2_294_784;
 /// such views stay below.
 pub const OWN_SLOTS: u32 = VIEW_SLOTS - 1024;
 
+static HOST_VIEWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(VIEW_SLOTS);
 
-/// Whether heap indices are kept below [`VIEW_SLOTS`]: skinning programs
+/// Tells the translator that the host's view heaps hold `slots` views, fewer
+/// than [`VIEW_SLOTS`] (NVIDIA: 1,000,000): heap indices stay below that. To
+/// be called before the first translation, and part of it (cache keys).
+pub fn set_host_views(slots: u32) {
+    let slots = slots.clamp(2048, VIEW_SLOTS);
+    HOST_VIEWS.store(slots, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The slots of the host's view heaps heap indices stay below (the views of
+/// memory by address, which come last, included).
+pub fn host_views() -> u32 {
+    HOST_VIEWS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The slots programs without views of memory by address stay below.
+fn host_slots() -> u32 {
+    host_views() - (VIEW_SLOTS - OWN_SLOTS)
+}
+
+
+/// Whether heap indices are kept below [`host_slots`]: skinning programs
 /// take them from title data, and one past the heap stops the host GPU.
 fn limits_indices() -> bool {
     !cfg!(test)
@@ -445,9 +467,33 @@ fn emit_program(
         target,
         console_cf: false,
         per_lane_only: false,
+        local: false,
+    };
+    let local = || match &native.io {
+        crate::native::StageIo::Cs(cs)
+            if native.wave64 && target.runs(32) && !target.runs(64) =>
+        {
+            Local::of(cs.threads.iter().product(), uses_lds(p), local_waves::sums(p), || {
+                let found = local_waves::independent(p, st);
+                if let Err((offset, why)) = found
+                    && std::env::var_os("VICTORY_WHY").is_some()
+                {
+                    eprintln!("not independent of how waves are divided: {why} at {offset:#x}");
+                }
+                found.is_ok()
+            })
+        }
+        _ => Local::No,
     };
     let l = match lower::lower(&parts) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
+            if local() == Local::First {
+                parts.local = true;
+                if let Ok(l) = lower::lower(&parts) {
+                    return Ok(host_shader(native, l));
+                }
+                parts.local = false;
+            }
             let console = structure::structure_console(p);
             let lowered = match &console {
                 Ok(console) => {
@@ -475,9 +521,65 @@ fn emit_program(
                 }
             }
         }
+        Err(e @ ShaderError::Unsupported { .. }) if local() != Local::No => {
+            parts.local = true;
+            lower::lower(&parts).map_err(|_| e)?
+        }
         l => l?,
     };
-    Ok(HostShader {
+    Ok(host_shader(native, l))
+}
+
+/// When a console wave64 compute program on a host of 32-lane waves runs with
+/// each host wave as a wave of its own ([`local_waves`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Local {
+    /// Never: the wave is its whole thread group to it, or it shares LDS
+    /// within the wave without barriers.
+    No,
+    /// Before the console flow: the same result without exchanges. (What
+    /// translates in the per-lane form keeps it.)
+    First,
+    /// Where nothing else translates it.
+    Last,
+}
+
+impl Local {
+    /// For a program of `threads` per group that uses LDS if `lds` and sums
+    /// over its waves if `sums`, where `independent` says its waves may be
+    /// divided another way.
+    fn of(threads: u32, lds: bool, sums: bool, independent: impl FnOnce() -> bool) -> Local {
+        // A group of one wave needs no barriers on the console.
+        if lds && threads <= 64 {
+            return Local::No;
+        }
+        if independent() {
+            Local::First
+        } else if threads > 64 && !lds && !sums {
+            // shortcut: what a program of several waves per group asks of a
+            // wave (whether any lane has something, the least and greatest
+            // of a value) holds for half a wave's lanes too, as its source
+            // cannot say which threads share a wave. The title's shadow
+            // tiles skip work no lane of the wave has, and take one way for
+            // a wave of like depths.
+            Local::Last
+        } else {
+            Local::No
+        }
+    }
+}
+
+/// Whether a program reads or writes group-shared memory.
+fn uses_lds(p: &ir::Program) -> bool {
+    p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+        matches!(i.fields, crate::gfx10::Fields::Ds { .. })
+            && !i.name().starts_with("ds_swizzle")
+            && !i.name().contains("permute")
+    })
+}
+
+fn host_shader(native: &NativeProgram, l: lower::Lowered) -> HostShader {
+    HostShader {
         stage: native.stage,
         dxil: l.dxil,
         user_data: l.user_data,
@@ -498,7 +600,7 @@ fn emit_program(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         stride_table: l.stride_table,
-    })
+    }
 }
 
 /// Interpolation modes of the input (for pixel) or output (for vertex/mesh)

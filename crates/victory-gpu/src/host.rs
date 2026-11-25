@@ -309,6 +309,12 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
+/// The host GPU's driver: its maker's PCI id and the driver's version.
+pub(crate) fn driver() -> &'static str {
+    static DRIVER: OnceLock<String> = OnceLock::new();
+    DRIVER.get_or_init(|| host().and_then(|h| h.driver()).unwrap_or_else(|| "unknown".into()))
+}
+
 /// Waits for any in-flight async host GPU submissions without creating the
 /// host device if it has not been initialised yet.
 /// Whether a submission is still to be waited for and finished.
@@ -385,6 +391,12 @@ fn create() -> windows::core::Result<Host> {
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
         let host = Host::from_device(device, messages)?;
+        let views = host.most_views();
+        if views < victory_shader::emit::VIEW_SLOTS {
+            // Before any shader is translated: their indices stay inside.
+            victory_shader::emit::set_host_views(views);
+            tracing::info!(views, "the host's view heaps hold fewer views than the title's");
+        }
         tracing::info!("host D3D12 device ready");
         Ok(host)
     }
@@ -470,6 +482,58 @@ impl Host {
                 indirect_zero: OnceLock::new(),
                 clock: OnceLock::new(),
             })
+        }
+    }
+
+    fn driver(&self) -> Option<String> {
+        // SAFETY: plain DXGI queries about the device's own adapter.
+        unsafe {
+            let factory: IDXGIFactory4 =
+                CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            let adapter: IDXGIAdapter1 =
+                factory.EnumAdapterByLuid(self.device.GetAdapterLuid()).ok()?;
+            let maker = adapter.GetDesc1().ok()?.VendorId;
+            let v = adapter.CheckInterfaceSupport(&IDXGIDevice::IID).unwrap_or_default();
+            Some(format!(
+                "{maker:04x} {}.{}.{}.{}",
+                v >> 48 & 0xffff,
+                v >> 32 & 0xffff,
+                v >> 16 & 0xffff,
+                v & 0xffff
+            ))
+        }
+    }
+
+    /// The most views a shader-visible heap of this host holds, if fewer than
+    /// shaders are made for (NVIDIA: 1,000,000).
+    fn most_views(&self) -> u32 {
+        const WANTED: u32 = victory_shader::emit::VIEW_SLOTS;
+        // SAFETY: plain queries and a heap that is let go of at once.
+        unsafe {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+            let asked = self
+                .device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS19,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+                .is_ok();
+            if asked && options.MaxViewDescriptorHeapSize >= WANTED {
+                return WANTED;
+            }
+            let whole: windows::core::Result<ID3D12DescriptorHeap> =
+                self.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: WANTED,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                });
+            if whole.is_ok() {
+                WANTED
+            } else {
+                crate::descriptor::host::PORTABLE_VIEWS
+            }
         }
     }
 
@@ -3727,7 +3791,7 @@ impl Presenter {
             device.CreateRenderTargetView(back, None, view);
             if behind.right <= self.width as i32 && behind.bottom <= self.height as i32 {
                 list.ClearRenderTargetView(view, &[0.0, 0.0, 0.0, 1.0], Some(&[behind]));
-                list.ClearRenderTargetView(view, &[1.0, 0.9, 0.1, 1.0], Some(&marks));
+                crate::readout::clear(list, view, &[1.0, 0.9, 0.1, 1.0], &marks);
             }
         }
     }

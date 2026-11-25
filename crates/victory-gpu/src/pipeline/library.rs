@@ -107,39 +107,60 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
-/// Pipelines a driver's compiler crashed on (names, one per line).
-const CRASHED_FILE: &str = "crashed.txt";
+/// The file of the pipelines the driver's compiler crashed on (names, one per
+/// line). One for each driver: another may make them (NVIDIA 621.40 makes
+/// the 160 that 610.88 crashed on).
+fn crashed_file(driver: &str) -> String {
+    let driver: String = driver
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' { c } else { '-' })
+        .collect();
+    format!("crashed-{driver}.txt")
+}
+
+fn crashed_path() -> Option<&'static std::path::Path> {
+    static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    PATH.get_or_init(|| Some(DIR.get()?.join(crashed_file(crate::host::driver()))))
+        .as_deref()
+}
 
 fn crashed_names() -> &'static Mutex<HashSet<String>> {
     static NAMES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     NAMES.get_or_init(|| {
-        let names = DIR.get()
-            .and_then(|d| std::fs::read_to_string(d.join(CRASHED_FILE)).ok())
+        let names: HashSet<String> = crashed_path()
+            .and_then(|f| std::fs::read_to_string(f).ok())
             .map(|t| t.lines().map(str::to_owned).collect())
             .unwrap_or_default();
+        if !names.is_empty() {
+            tracing::warn!(
+                pipelines = names.len(),
+                driver = crate::host::driver(),
+                "pipelines this driver's compiler crashed on before are left out"
+            );
+        }
         Mutex::new(names)
     })
 }
 
 /// Remember failures in this run immediately. Persist each new name once.
-fn remember_crash(names: &Mutex<HashSet<String>>, dir: Option<&std::path::Path>, name: &str) {
+fn remember_crash(names: &Mutex<HashSet<String>>, file: Option<&std::path::Path>, name: &str) {
     use std::io::Write;
     let mut names = names.lock().unwrap_or_else(|e| e.into_inner());
     if !names.insert(name.to_owned()) {
         return;
     }
-    let Some(dir) = dir else { return };
+    let Some(file) = file else { return };
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join(CRASHED_FILE));
+        .open(file);
     if let Ok(mut f) = file {
         let _ = writeln!(f, "{name}");
     }
 }
 
 fn note_crashed(name: &str) {
-    remember_crash(crashed_names(), DIR.get().map(PathBuf::as_path), name);
+    remember_crash(crashed_names(), crashed_path(), name);
 }
 
 /// Whether the driver crashed making the pipeline named `name` before.
@@ -588,16 +609,24 @@ mod tests {
     fn remembered_failure_is_visible_immediately_and_appended_once() {
         let dir = tempfile::tempdir().unwrap();
         let names = Mutex::new(HashSet::new());
+        let file = dir.path().join(crashed_file("10de 32.0.16.2140"));
 
         remember_crash(&names, None, "no-disk-cache");
-        remember_crash(&names, Some(dir.path()), "failed-pipeline");
-        remember_crash(&names, Some(dir.path()), "failed-pipeline");
+        remember_crash(&names, Some(&file), "failed-pipeline");
+        remember_crash(&names, Some(&file), "failed-pipeline");
 
         let known = names.into_inner().unwrap();
         assert!(known.contains("no-disk-cache"));
         assert!(known.contains("failed-pipeline"));
-        let contents = std::fs::read_to_string(dir.path().join(CRASHED_FILE)).unwrap();
+        let contents = std::fs::read_to_string(&file).unwrap();
         assert_eq!(contents.lines().collect::<Vec<_>>(), ["failed-pipeline"]);
+    }
+
+    #[test]
+    fn each_driver_has_its_own_list_of_crashes() {
+        assert_eq!(crashed_file("10de 32.0.16.2140"), "crashed-10de-32.0.16.2140.txt");
+        assert_ne!(crashed_file("10de 32.0.16.2140"), crashed_file("10de 32.0.16.1088"));
+        assert!(!crashed_file("a/b\\c:d").contains(['/', '\\', ':']));
     }
 
     #[test]
