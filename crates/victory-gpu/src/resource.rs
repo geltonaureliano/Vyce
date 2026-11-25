@@ -841,6 +841,9 @@ struct Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    /// An upload, copy or resolve has been recorded for this copy. Kept
+    /// with the texture because staging buffers can be evicted and remade.
+    pub(crate) initialized: std::sync::atomic::AtomicBool,
     /// What the driver allocates for it (counted in [`crate::memstat`]).
     pub(crate) bytes: u64,
     /// Its memory, if in a shared heap.
@@ -1429,6 +1432,7 @@ fn hand_out_resource(
                 slot,
                 skip,
                 written: Default::default(),
+                initialized: Default::default(),
                 twin: Default::default(),
                 state: state.into(),
             })

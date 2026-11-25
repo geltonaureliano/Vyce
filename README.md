@@ -1,4 +1,9 @@
-# VIctory fork for AMD Radeon (work in progress)
+# Vyce
+
+Vyce is a Windows development fork of Belobug's VIctory fork. See the
+[local Windows development guide](docs/vyce-windows.md) for the portable build,
+storage paths and launcher. The performance results below are from Belobug's
+test machine.
 
 This is a fork of [VIctory](https://github.com/Marvisak/VIctory) by Marvisak
 and its contributors. It follows upstream `main` up to `8e79c80` (2026-11-24),

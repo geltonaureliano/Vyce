@@ -501,6 +501,19 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn nested_parallel_work_reuses_the_current_worker() {
+        let processed = std::sync::atomic::AtomicUsize::new(0);
+        super::in_parallel(&[0; 12], 1, |outer| {
+            let worker = std::thread::current().id();
+            super::in_parallel(&[0; 4], 1, |inner| {
+                assert_eq!(std::thread::current().id(), worker);
+                processed.fetch_add(outer.len() * inner.len(), Ordering::Relaxed);
+            });
+        });
+        assert_eq!(processed.into_inner(), 48);
+    }
+
+    #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 5 << 16;
@@ -1012,7 +1025,9 @@ impl Host {
             );
             if !target.runs(64) {
                 tracing::warn!(
-                    "the host has no 64-lane waves: console wave64 compute programs that read                      other lanes do not translate, and their dispatches are dropped"
+                    lanes_min = target.lanes_min,
+                    lanes_max = target.lanes_max,
+                    "host wave sizes exclude Wave64; compute shaders without a compatible translation are skipped"
                 );
             }
             target
@@ -1199,31 +1214,20 @@ impl Host {
         let mut card_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> =
             Vec::new();
         let mut cpu_back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+        let mut write_ranges = std::collections::HashSet::new();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step {
-                    let target = if shadow.is_card() {
-                        &mut card_writes
-                    } else {
-                        &mut cpu_back
-                    };
-                    if !target.iter().any(|(s, a, l)| {
-                        std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len)
-                    }) {
-                        target.push((shadow.clone(), *address, *len));
-                    }
+                if let Step::GpuWrite(shadow, address, len) = step
+                    && write_ranges.insert((std::sync::Arc::as_ptr(shadow), *address, *len))
+                {
+                    let target = if shadow.is_card() { &mut card_writes } else { &mut cpu_back };
+                    target.push((shadow.clone(), *address, *len));
                 }
             }
         }
         for (shadow, address, len) in batch.bindless_writes.drain(..) {
-            let target = if shadow.is_card() {
-                &mut card_writes
-            } else {
-                &mut cpu_back
-            };
-            if !target.iter().any(|(s, a, l)| {
-                std::sync::Arc::ptr_eq(s, &shadow) && (*a, *l) == (address, len)
-            }) {
+            if write_ranges.insert((std::sync::Arc::as_ptr(&shadow), address, len)) {
+                let target = if shadow.is_card() { &mut card_writes } else { &mut cpu_back };
                 target.push((shadow, address, len));
             }
         }
@@ -1385,11 +1389,19 @@ impl Host {
         gpu_waits(gpu, runs);
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
-            let pipelines: std::collections::BTreeSet<String> = runs
-                .iter()
-                .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
-                .collect();
-            tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
+            tracing::warn!(
+                ms = gpu.as_millis(),
+                prepare_ms = (prepared - started).as_millis(),
+                lists = runs.len(),
+                "slow host submission"
+            );
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let pipelines: std::collections::BTreeSet<String> = runs
+                    .iter()
+                    .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                    .collect();
+                tracing::debug!(?pipelines, "slow submission pipelines");
+            }
         }
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
@@ -2870,13 +2882,26 @@ impl Early {
 /// Runs `f` on pieces of `list`, of `least` items or more, on some threads.
 pub(crate) fn in_parallel<T: Sync>(list: &[T], least: usize, f: impl Fn(&[T]) + Sync) {
     const THREADS: usize = 6;
-    if list.len() <= least {
+    thread_local! {
+        static WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if list.len() <= least || WORKER.with(std::cell::Cell::get) {
         return f(list);
     }
     // Small pieces, taken in turn: they are not equally long to do.
     let piece = (list.len() / (THREADS * 8)).max(least);
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let work = || {
+    let work = || WORKER.with(|worker| {
+        struct ResetWorker<'a>(&'a std::cell::Cell<bool>);
+        impl Drop for ResetWorker<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        // A copy-back already parallel over shadows must not start another
+        // set of workers for every sparse shadow it reaches.
+        worker.set(true);
+        let _reset = ResetWorker(worker);
         loop {
             let from = next.fetch_add(piece, Ordering::Relaxed);
             if from >= list.len() {
@@ -2884,7 +2909,7 @@ pub(crate) fn in_parallel<T: Sync>(list: &[T], least: usize, f: impl Fn(&[T]) + 
             }
             f(&list[from..(from + piece).min(list.len())]);
         }
-    };
+    });
     let threads = THREADS.min(list.len().div_ceil(piece));
     std::thread::scope(|s| {
         for _ in 1..threads {
@@ -3357,8 +3382,10 @@ struct Presenter {
 struct Meter {
     since: std::time::Instant,
     frames: u32,
+    frames_total: u64,
     drawn: u64,
     logged: std::time::Instant,
+    telemetry: bool,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
 }
@@ -3369,8 +3396,10 @@ impl Meter {
         Meter {
             since: now,
             frames: 0,
+            frames_total: 0,
             drawn: crate::draw::drawn(),
             logged: now,
+            telemetry: std::env::var_os("VYCE_TELEMETRY").is_some_and(|v| v == "1"),
             caption: None,
         }
     }
@@ -3380,6 +3409,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
+        self.frames_total += 1;
         #[cfg(feature = "diagnostics")]
         TIMED_FRAMES.fetch_add(1, Ordering::Relaxed);
         let elapsed = self.since.elapsed();
@@ -3407,6 +3437,20 @@ impl Meter {
             [0, 1].map(|i| BINDLESS_US[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
+        if self.telemetry && [fps, ms, draws, gpu, cpu, back_ms, dropped].into_iter().all(f64::is_finite) {
+            // Keep one complete sample together with respect to other stderr writers.
+            // A closed or unavailable monitor output must not interrupt rendering.
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "VYCE_TELEMETRY {{\"schema\":1,\"event\":\"frame\",\"fps\":{fps:.2},\
+                 \"frame_ms\":{ms:.2},\"frames_total\":{},\"draws_per_frame\":{draws:.2},\
+                 \"gpu_wait_ms\":{gpu:.2},\"cpu_prepare_ms\":{cpu:.2},\"copy_back_ms\":{back_ms:.2},\
+                 \"dropped_per_frame\":{dropped:.2},\"pipelines_building\":{}}}",
+                self.frames_total,
+                crate::pipeline::making(),
+            );
+        }
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
@@ -3563,8 +3607,9 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
-            p.meter.frame(p.hwnd);
+            if p.swap_chain.Present(0, DXGI_PRESENT(0)).is_ok() {
+                p.meter.frame(p.hwnd);
+            }
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
             #[cfg(not(feature = "diagnostics"))]
@@ -3645,8 +3690,9 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
-            p.meter.frame(p.hwnd);
+            if p.swap_chain.Present(0, DXGI_PRESENT(0)).is_ok() {
+                p.meter.frame(p.hwnd);
+            }
         }
         Some(())
     }

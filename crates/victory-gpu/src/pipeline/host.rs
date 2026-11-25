@@ -24,6 +24,7 @@ pub(crate) struct GraphicsState {
     sample_mask: u32,
     rasterizer: D3D12_RASTERIZER_DESC,
     depth: D3D12_DEPTH_STENCIL_DESC,
+    depth_explicit: bool,
     depth_bounds: bool,
     /// Input elements, their names pointing into `names`.
     inputs: Vec<D3D12_INPUT_ELEMENT_DESC>,
@@ -67,7 +68,6 @@ impl Default for GraphicsState {
                 ..Default::default()
             },
             depth: D3D12_DEPTH_STENCIL_DESC {
-                DepthEnable: true.into(),
                 DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
                 DepthFunc: D3D12_COMPARISON_FUNC_LESS,
                 StencilReadMask: 0xff,
@@ -76,6 +76,7 @@ impl Default for GraphicsState {
                 BackFace: keep,
                 ..Default::default()
             },
+            depth_explicit: false,
             depth_bounds: false,
             inputs: Vec::new(),
             names: Vec::new(),
@@ -91,7 +92,60 @@ impl Default for GraphicsState {
     }
 }
 
+/// Integer render target formats cannot be blended on D3D12.
+fn integer_target_format(format: DXGI_FORMAT) -> bool {
+    matches!(
+        format,
+        DXGI_FORMAT_R32G32B32A32_UINT
+            | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32B32_UINT
+            | DXGI_FORMAT_R32G32B32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT
+            | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R32G32_UINT
+            | DXGI_FORMAT_R32G32_SINT
+            | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R8G8B8A8_UINT
+            | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R16G16_UINT
+            | DXGI_FORMAT_R16G16_SINT
+            | DXGI_FORMAT_R32_UINT
+            | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R8G8_UINT
+            | DXGI_FORMAT_R8G8_SINT
+            | DXGI_FORMAT_R16_UINT
+            | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8_UINT
+            | DXGI_FORMAT_R8_SINT
+    )
+}
+
 impl GraphicsState {
+    /// The console ignores blending on integer targets, so the title can
+    /// leave it enabled. Keep blending on the other active targets.
+    fn host_blend(&self) -> D3D12_BLEND_DESC {
+        let count = self.targets.NumRenderTargets.min(8) as usize;
+        let independent = self.blend.IndependentBlendEnable.as_bool();
+        let integer_blends = |i: usize| {
+            integer_target_format(self.targets.RTFormats[i])
+                && self.blend.RenderTarget[if independent { i } else { 0 }]
+                    .BlendEnable
+                    .as_bool()
+        };
+        if !(0..count).any(integer_blends) {
+            return self.blend;
+        }
+        let mut blend = self.blend;
+        if !independent {
+            blend.IndependentBlendEnable = true.into();
+            blend.RenderTarget = [blend.RenderTarget[0]; 8];
+        }
+        for i in (0..count).filter(|&i| integer_blends(i)) {
+            blend.RenderTarget[i].BlendEnable = false.into();
+        }
+        blend
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -107,11 +161,13 @@ impl GraphicsState {
                 10 => self.rasterizer = data.cast::<D3D12_RASTERIZER_DESC>().read_unaligned(),
                 11 => {
                     self.depth = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned();
+                    self.depth_explicit = true;
                     self.depth_bounds = false;
                 }
                 21 => {
                     // As before, read this console subobject with the PC layout.
                     let d = data.cast::<D3D12_DEPTH_STENCIL_DESC1>().read_unaligned();
+                    self.depth_explicit = true;
                     self.depth_bounds = d.DepthBoundsTestEnable.as_bool();
                     self.depth = D3D12_DEPTH_STENCIL_DESC {
                         DepthEnable: d.DepthEnable,
@@ -166,6 +222,11 @@ impl GraphicsState {
                 16 => {
                     let f = data.cast::<u32>().read_unaligned();
                     self.depth_format = DXGI_FORMAT(crate::resource::pc_format(f) as i32);
+                    // A stream without a depth-stencil subobject defaults to
+                    // depth testing only if it specifies a depth format.
+                    if !self.depth_explicit {
+                        self.depth.DepthEnable = (self.depth_format != DXGI_FORMAT_UNKNOWN).into();
+                    }
                 }
                 17 => self.samples = data.cast::<DXGI_SAMPLE_DESC>().read_unaligned(),
                 _ => {}
@@ -173,9 +234,12 @@ impl GraphicsState {
         }
     }
 
-    /// Everything the state holds, as text: part of a pipeline's name in
-    /// the library and of the key a title pipeline is started early by.
+    /// Title state as text, for the key a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {
+        self.describe_with_blend(&self.blend)
+    }
+
+    fn describe_with_blend(&self, blend: &D3D12_BLEND_DESC) -> String {
         let inputs: Vec<String> = self
             .inputs
             .iter()
@@ -195,7 +259,7 @@ impl GraphicsState {
         let depth_bounds = if self.depth_bounds { " depth bounds" } else { "" };
         format!(
             "{:?} {} {:?} {:?} {inputs:?} {} {} {:?} {} {:?}{depth_bounds}",
-            self.blend,
+            blend,
             self.sample_mask,
             self.rasterizer,
             self.depth,
@@ -529,7 +593,8 @@ impl HostPipeline {
         let Some(g) = g else {
             return refuse("graphics state not kept (plain description)", shaders);
         };
-        let state = g.describe();
+        let blend = g.host_blend();
+        let state = g.describe_with_blend(&blend);
         let depth_with_bounds = g.depth_with_bounds(host);
         if mesh.is_some() {
             let name = super::library::name(
@@ -592,7 +657,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: blend,
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -655,7 +720,7 @@ impl HostPipeline {
             }
         };
         #[cfg(feature = "diagnostics")]
-        tracing::info!(?shaders, state = %g.describe(), "host pipeline");
+        tracing::info!(?shaders, %state, "host pipeline");
         #[cfg(not(feature = "diagnostics"))]
         tracing::info!(?shaders, "host pipeline");
         crate::host::name(&pso, || format!("{shaders:?}"));
@@ -664,7 +729,7 @@ impl HostPipeline {
             depth = ?g.depth,
             dsv = g.depth_format.0,
             targets = ?&g.targets.RTFormats[..g.targets.NumRenderTargets.min(8) as usize],
-            blend = ?g.blend.RenderTarget[0],
+            blend = ?blend.RenderTarget[0],
             cull = g.rasterizer.CullMode.0,
             "host graphics state"
         );
@@ -721,7 +786,7 @@ fn stream_pipeline<S, D>(
         root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
         stages,
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
         mask: Sub(
             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
             g.sample_mask,
@@ -800,5 +865,119 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn blending_state(formats: &[DXGI_FORMAT], independent: bool) -> GraphicsState {
+        let mut state = GraphicsState::default();
+        state.targets.NumRenderTargets = formats.len() as u32;
+        state.targets.RTFormats[..formats.len()].copy_from_slice(formats);
+        state.blend.IndependentBlendEnable = independent.into();
+        for target in &mut state.blend.RenderTarget {
+            target.BlendEnable = true.into();
+            target.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+            target.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        }
+        state
+    }
+
+    #[test]
+    fn integer_targets_do_not_blend() {
+        for independent in [false, true] {
+            let mut state = blending_state(
+                &[
+                    DXGI_FORMAT_R8G8B8A8_UNORM,
+                    DXGI_FORMAT_R8_SINT,
+                    DXGI_FORMAT_R16G16B16A16_FLOAT,
+                    DXGI_FORMAT_R8_UINT,
+                ],
+                independent,
+            );
+            let red = D3D12_COLOR_WRITE_ENABLE_RED.0 as u8;
+            state.blend.RenderTarget[1].RenderTargetWriteMask = red;
+            let host = state.host_blend();
+            assert!(host.IndependentBlendEnable.as_bool());
+            assert!(host.RenderTarget[0].BlendEnable.as_bool());
+            assert!(!host.RenderTarget[1].BlendEnable.as_bool());
+            assert!(host.RenderTarget[2].BlendEnable.as_bool());
+            assert!(!host.RenderTarget[3].BlendEnable.as_bool());
+            assert_eq!(host.RenderTarget[3].SrcBlend, D3D12_BLEND_SRC_ALPHA);
+            assert_eq!(host.RenderTarget[2].DestBlend, D3D12_BLEND_INV_SRC_ALPHA);
+            let expected = if independent {
+                red
+            } else {
+                state.blend.RenderTarget[0].RenderTargetWriteMask
+            };
+            assert_eq!(host.RenderTarget[1].RenderTargetWriteMask, expected);
+            assert_ne!(state.describe_with_blend(&host), state.describe());
+        }
+    }
+
+    #[test]
+    fn states_without_active_integer_blending_keep_their_state_and_key() {
+        let mut state = blending_state(&[DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R11G11B10_FLOAT], false);
+        state.targets.RTFormats[2] = DXGI_FORMAT_R8_UINT;
+        let host = state.host_blend();
+        assert_eq!(host, state.blend);
+        assert_eq!(state.describe_with_blend(&host), state.describe());
+
+        let mut state = blending_state(&[DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_UINT], true);
+        state.blend.RenderTarget[1].BlendEnable = false.into();
+        assert_eq!(state.host_blend(), state.blend);
+    }
+
+    #[test]
+    fn stream_defaults_depth_testing_to_the_presence_of_a_depth_format() {
+        assert!(!GraphicsState::default().depth.DepthEnable.as_bool());
+        for (format, enabled) in [(DXGI_FORMAT_UNKNOWN, false), (DXGI_FORMAT_D32_FLOAT, true)] {
+            let mut state = GraphicsState::default();
+            let sub = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, format);
+            // SAFETY: `sub` is a whole depth-format subobject.
+            unsafe { state.read(sub.0.0 as u32, std::ptr::from_ref(&sub).cast()) };
+            assert_eq!(state.depth.DepthEnable.as_bool(), enabled);
+        }
+    }
+
+    #[test]
+    fn explicit_depth_stencil_state_overrides_the_default_in_either_order() {
+        let format = Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT,
+            DXGI_FORMAT_D32_FLOAT,
+        );
+        let depth = Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL,
+            D3D12_DEPTH_STENCIL_DESC {
+                StencilEnable: true.into(),
+                ..Default::default()
+            },
+        );
+        let depth1 = Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1,
+            D3D12_DEPTH_STENCIL_DESC1 {
+                StencilEnable: true.into(),
+                DepthBoundsTestEnable: true.into(),
+                ..Default::default()
+            },
+        );
+        let format_sub = (format.0.0 as u32, std::ptr::from_ref(&format).cast());
+        for (sub, bounds) in [
+            ((depth.0.0 as u32, std::ptr::from_ref(&depth).cast()), false),
+            ((depth1.0.0 as u32, std::ptr::from_ref(&depth1).cast()), true),
+        ] {
+            for order in [[format_sub, sub], [sub, format_sub]] {
+                let mut state = GraphicsState::default();
+                for (kind, at) in order {
+                    // SAFETY: each pair points at a whole subobject of its kind.
+                    unsafe { state.read(kind, at) };
+                }
+                assert!(!state.depth.DepthEnable.as_bool());
+                assert!(state.depth.StencilEnable.as_bool());
+                assert_eq!(state.depth_bounds, bounds);
+            }
+        }
     }
 }

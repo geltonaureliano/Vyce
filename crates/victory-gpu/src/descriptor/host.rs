@@ -511,9 +511,18 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// subsurface resolve, tree imposters). `victory_shader::emit::VIEW_SLOTS`
 /// is the title's 1,245,184 slots, these and those of [`crate::memory`].
 const DYNAMIC: u32 = 1 << 20;
-/// Smaller dynamic reserve when the host caps the whole view heap at
-/// [`PORTABLE_VIEWS`].
-const DYNAMIC_CAPPED: u32 = 1 << 16;
+/// Reserve enough dynamic slots for world tables on capped NVIDIA heaps.
+/// Titles still use the remaining slots directly; tables beyond that range
+/// are remapped. The previous 64 Ki-slot split is available for comparison.
+const DYNAMIC_CAPPED: u32 = 1 << 18;
+
+fn capped_view_layout(override_slots: Option<&str>) -> (u32, u32) {
+    let reserve = override_slots
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&n| (1 << 16..=DYNAMIC_CAPPED).contains(&n))
+        .unwrap_or(DYNAMIC_CAPPED);
+    (PORTABLE_VIEWS - crate::memory::SLOTS - reserve, reserve)
+}
 
 /// The host's limit for shader-visible sampler heaps, on every binding
 /// tier.
@@ -585,18 +594,17 @@ impl HostHeap {
             Err(e) if !sampler && count + extra + crate::memory::SLOTS > PORTABLE_VIEWS => {
                 // shortcut: descriptors past the host's limit are left out;
                 // draw::tables now remaps the root tables that reach them.
+                let override_slots = std::env::var("VICTORY_CAPPED_DYNAMIC").ok();
+                let (mirrored, reserve) = capped_view_layout(override_slots.as_deref());
                 tracing::warn!(
                     error = %e,
                     wanted,
-                    made = PORTABLE_VIEWS - DYNAMIC_CAPPED,
-                    lost = wanted + DYNAMIC_CAPPED - PORTABLE_VIEWS,
+                    mirrored,
+                    reserve,
+                    lost = wanted.saturating_sub(mirrored),
                     "host view heap capped at {PORTABLE_VIEWS}"
                 );
-                (
-                    make(PORTABLE_VIEWS - crate::memory::SLOTS).ok()?,
-                    PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS,
-                    DYNAMIC_CAPPED,
-                )
+                (make(PORTABLE_VIEWS - crate::memory::SLOTS).ok()?, mirrored, reserve)
             }
             Err(e) => {
                 tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -3000,6 +3008,15 @@ void main() {
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn capped_view_reserve_keeps_the_host_within_its_limit() {
+        let (mirrored, reserve) = capped_view_layout(None);
+        assert_eq!(reserve, 262_144);
+        assert_eq!(mirrored + reserve + crate::memory::SLOTS, PORTABLE_VIEWS);
+        assert_eq!(capped_view_layout(Some("65536")).1, 65_536);
+        assert_eq!(capped_view_layout(Some("1000000")), (mirrored, reserve));
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.

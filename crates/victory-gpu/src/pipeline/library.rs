@@ -109,10 +109,25 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 /// Pipelines a driver's compiler crashed on (names, one per line).
 const CRASHED_FILE: &str = "crashed.txt";
 
-/// The pipeline named `name` is left out from the next run on.
-fn note_crashed(name: &str) {
+fn crashed_names() -> &'static Mutex<HashSet<String>> {
+    static NAMES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        let names = DIR.get()
+            .and_then(|d| std::fs::read_to_string(d.join(CRASHED_FILE)).ok())
+            .map(|t| t.lines().map(str::to_owned).collect())
+            .unwrap_or_default();
+        Mutex::new(names)
+    })
+}
+
+/// Remember failures in this run immediately. Persist each new name once.
+fn remember_crash(names: &Mutex<HashSet<String>>, dir: Option<&std::path::Path>, name: &str) {
     use std::io::Write;
-    let Some(dir) = DIR.get() else { return };
+    let mut names = names.lock().unwrap_or_else(|e| e.into_inner());
+    if !names.insert(name.to_owned()) {
+        return;
+    }
+    let Some(dir) = dir else { return };
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -122,16 +137,15 @@ fn note_crashed(name: &str) {
     }
 }
 
+fn note_crashed(name: &str) {
+    remember_crash(crashed_names(), DIR.get().map(PathBuf::as_path), name);
+}
+
 /// Whether the driver crashed making the pipeline named `name` before.
 fn crashed(name: &str) -> bool {
-    static NAMES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
-    NAMES
-        .get_or_init(|| {
-            DIR.get()
-                .and_then(|d| std::fs::read_to_string(d.join(CRASHED_FILE)).ok())
-                .map(|t| t.lines().map(str::to_owned).collect())
-                .unwrap_or_default()
-        })
+    crashed_names()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
         .contains(name)
 }
 
@@ -252,12 +266,12 @@ fn endless(name: &str, begins: bool) {
     static AT_WORK: Mutex<Vec<(String, Instant, u32)>> = Mutex::new(Vec::new());
     static WATCH: std::sync::Once = std::sync::Once::new();
     {
+        // SAFETY: a plain call.
+        let id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
         let mut at_work = AT_WORK.lock().unwrap_or_else(|e| e.into_inner());
         if begins {
-            // SAFETY: a plain call.
-            let id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
             at_work.push((name.to_owned(), Instant::now(), id));
-        } else if let Some(i) = at_work.iter().position(|w| w.0 == name) {
+        } else if let Some(i) = at_work.iter().position(|w| w.0 == name && w.2 == id) {
             at_work.swap_remove(i);
         }
     }
@@ -340,8 +354,8 @@ unsafe extern "system" fn compiler_crashed(
     {
         return 0; // not ours
     }
-    tracing::error!(name, "the driver's compiler crashed making a pipeline: it is left out");
     note_crashed(&name);
+    tracing::error!(name, "the driver's compiler crashed making a pipeline: it is left out");
     endless(&name, false);
     // SAFETY: a plain call.
     let id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
@@ -358,12 +372,16 @@ pub(crate) fn pipeline(
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
-    let wide = HSTRING::from(name);
+    let reject = || windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL);
     if crashed(name) {
-        // E_FAIL.
-        return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x8000_4005_u32 as i32)));
+        return Err(reject());
     }
+    let wide = HSTRING::from(name);
     let create = || {
+        // Another worker may have hit the failure while we looked in the library.
+        if crashed(name) {
+            return Err(reject());
+        }
         let _making = Making::new(name);
         create()
     };
@@ -501,6 +519,22 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remembered_failure_is_visible_immediately_and_appended_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = Mutex::new(HashSet::new());
+
+        remember_crash(&names, None, "no-disk-cache");
+        remember_crash(&names, Some(dir.path()), "failed-pipeline");
+        remember_crash(&names, Some(dir.path()), "failed-pipeline");
+
+        let known = names.into_inner().unwrap();
+        assert!(known.contains("no-disk-cache"));
+        assert!(known.contains("failed-pipeline"));
+        let contents = std::fs::read_to_string(dir.path().join(CRASHED_FILE)).unwrap();
+        assert_eq!(contents.lines().collect::<Vec<_>>(), ["failed-pipeline"]);
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {

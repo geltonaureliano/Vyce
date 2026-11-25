@@ -284,6 +284,96 @@ fn exchanges_inside_a_branch_one_half_skips() {
     });
 }
 
+// v1 = thread index in bytes; gather from the next lane, wrapping at 32.
+const GATHER_NEXT: &[u32] = &[
+    0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+    0xDACC_0004,
+    0x0200_0001, // ds_bpermute_b32 v2, v1, v0 offset:4
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+];
+
+#[test]
+fn backward_permute_wraps_in_each_half() {
+    let nvidia = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    for threads in [32, 48, 64, 128] {
+        let cs = emit_for(&program(GATHER_NEXT, threads), nvidia).expect("half-wave gather");
+        assert_eq!(wave_size(&cs.dxil), Some(32));
+        console_flow_case("ds_bpermute within each half", GATHER_NEXT, threads, |t| {
+            let source = (t & !31) | ((t + 1) & 31);
+            if source < threads { source } else { 0 }
+        });
+    }
+}
+
+#[test]
+fn backward_permute_zeros_inactive_sources() {
+    let mut body = vec![
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0004, // s_cbranch_execz +4
+    ];
+    body.extend_from_slice(GATHER_NEXT);
+    body.push(0x88FE_0A7E); // s_or_b64 exec, exec, s[10:11]
+    console_flow_case("ds_bpermute with an EXEC mask", &body, 64, |t| match t {
+        0..=18 => t + 1,
+        19 => 0,
+        _ => 1,
+    });
+}
+
+#[test]
+fn lds_reads_cross_halves_inside_a_masked_branch() {
+    let body = [
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xD834_0000,
+        0x0000_0001, // ds_write_b32 v1, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0), with no console group barrier
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0005, // s_cbranch_execz +5
+        0x4A02_00A0, // v_add_nc_u32 v1, 32, v0
+        0x3402_0282, // v_lshlrev_b32 v1, 2, v1
+        0xD8D8_0000,
+        0x0200_0001, // ds_read_b32 v2, v1
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    ];
+    let mut p = program(&body, 64);
+    let StageIo::Cs(io) = &mut p.io else {
+        unreachable!()
+    };
+    io.rsrc2 |= 1 << 15; // 512 bytes of group-shared memory.
+    let nvidia = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let cs = emit_for(&p, nvidia).expect("one group split into two 32-lane waves");
+    assert_eq!(wave_size(&cs.dxil), Some(32));
+
+    for name in adapters().unwrap_or_default() {
+        let Ok(host) = Host::on(&name) else {
+            continue;
+        };
+        // This test exercises the fallback's barriers. Use an ordinary
+        // native Wave64 program on other adapters.
+        if host.target().runs(64) {
+            continue;
+        }
+        let groups = 8;
+        let out = run(&host, &p, groups).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let expected: Vec<u32> = (0..groups)
+            .flat_map(|_| (0..64).map(|t| if t < 20 { t + 32 } else { 1 }))
+            .collect();
+        assert_eq!(out, expected, "{name}: masked cross-half LDS reads");
+        eprintln!("{name}: masked cross-half LDS reads exact");
+    }
+}
+
 /// Groups of several console waves need the halves to meet without a
 /// group barrier: not yet.
 #[test]

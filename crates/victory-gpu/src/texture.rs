@@ -18,7 +18,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -51,6 +51,7 @@ pub(crate) struct Staging {
     mips: u32,
     skip: u32,
     memory: *const u8,
+    owner: Weak<crate::resource::HostTexture>,
     last: Mutex<Last>,
     /// The runtime wrote the memory since it was last looked at.
     rewritten: std::sync::atomic::AtomicBool,
@@ -170,7 +171,12 @@ thread_local! {
 static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
 
 /// A host copy or resolve writes `resource`.
-pub(crate) fn host_written(resource: This) {
+pub(crate) fn host_written(resource: This, copy: Option<&crate::resource::HostTexture>) {
+    // Like HOST_WRITTEN, a recorded copy or resolve is enough to prevent a
+    // later first-use upload with holes from overwriting the GPU contents.
+    if let Some(copy) = copy {
+        copy.initialized.store(true, Ordering::Release);
+    }
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     set.get_or_insert_with(Default::default)
         .insert(resource as usize);
@@ -227,7 +233,7 @@ pub(crate) fn upload_first(resource: This, texture: &ID3D12Resource) {
         return;
     }
     if let Some(copy) = crate::resource::host_copy(resource)
-        && let Some(staging) = staging(resource, texture)
+        && let Some(staging) = staging(resource, texture, &copy)
     {
         FIRST.lock().unwrap_or_else(|e| e.into_inner()).push((staging, copy));
     }
@@ -256,7 +262,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     let Some(copy) = crate::resource::host_copy(resource) else {
         return;
     };
-    let Some(staging) = staging(resource, texture) else {
+    let Some(staging) = staging(resource, texture, &copy) else {
         return;
     };
     // Once per submission however many of its lists sample the texture;
@@ -319,7 +325,19 @@ impl Staging {
         {
             return (0, false);
         }
-        if !committed(self.memory, size) {
+        let can_bootstrap = |last: &Last| {
+            #[cfg(feature = "diagnostics")]
+            if crate::copystat::mode() != 0 {
+                return false; // diagnostic copy overrides require fully mapped pages
+            }
+            last.hash.is_none()
+                && self.owner.upgrade().is_some_and(|copy| {
+                    !copy.initialized.load(Ordering::Acquire) && title_written(&copy.texture)
+                })
+                && readable_regions(start, size, |_, _| true)
+        };
+        let mapped = committed(self.memory, size);
+        if !mapped && !can_bootstrap(last) {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
@@ -333,7 +351,17 @@ impl Staging {
         // (evicting a texture a big table lists) while we read them.
         SCRATCH.with_borrow_mut(|tiled| {
             tiled.resize(size, 0);
-            crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
+            // The preflight can miss a hole inside a 64 KiB block, and
+            // mappings may change during the copy. Require the actual read
+            // to complete before replacing any existing GPU contents.
+            if (!mapped || !read_complete(self.memory, tiled))
+                && (mapped && !can_bootstrap(last) || !read_partial(self.memory, tiled))
+            {
+                if tiled.capacity() > 64 << 20 {
+                    *tiled = Vec::new();
+                }
+                return (0, false);
+            }
             let read = self.changed(last, tiled, rewritten);
             last.still = if read.1 { 0 } else { (last.still + 1).min(6) };
             // Not all in the same frame; static textures back off up to 32 frames
@@ -398,6 +426,11 @@ impl Staging {
             #[cfg(test)]
             self.gpu_uploads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(copy) = self.owner.upgrade() {
+            // A new staging buffer for the same texture must not treat it
+            // as empty after this buffer is evicted. Full uploads can retry.
+            copy.initialized.store(true, Ordering::Release);
         }
     }
 
@@ -582,8 +615,76 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     true
 }
 
+/// Reads a complete staging image and retains the copy timing counters.
+fn read_complete(at: *const u8, tiled: &mut [u8]) -> bool {
+    #[cfg(feature = "diagnostics")]
+    if crate::copystat::mode() != 0 {
+        crate::host::copy_mapped(tiled.as_mut_ptr(), at, tiled.len(), false);
+        return true;
+    }
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let read = crate::host::read_into(at, tiled);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::MoveUs, started.elapsed().as_micros() as u64);
+    read
+}
+
+/// Copies only readable regions into a fresh staging image. A failed region
+/// read can have copied a prefix, so explicitly clear it before moving on.
+fn read_partial(at: *const u8, tiled: &mut [u8]) -> bool {
+    let start = at as usize;
+    let mut copied = false;
+    tiled.fill(0);
+    readable_regions(start, tiled.len(), |from, to| {
+        let bytes = &mut tiled[from - start..to - start];
+        if read_complete(from as *const u8, bytes) {
+            copied = true;
+        } else {
+            bytes.fill(0);
+        }
+        false
+    });
+    copied
+}
+
+/// Asks Windows by region so holes at the ends do not hide resident pages.
+/// Returns early when the visitor accepts a readable span.
+fn readable_regions(start: usize, len: usize, mut visit: impl FnMut(usize, usize) -> bool) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+        PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+    };
+    let Some(end) = start.checked_add(len) else { return false };
+    let mut at = start;
+    while at < end {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: the query only writes the local structure.
+        let queried = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if queried != size_of_val(&info) || next <= at {
+            return false;
+        }
+        let readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ
+            | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if info.State == MEM_COMMIT
+            && info.Protect & PAGE_GUARD == 0
+            && info.Protect & readable != 0
+            && visit(at, next.min(end))
+        {
+            return true;
+        }
+        at = next;
+    }
+    false
+}
+
 /// The staging state of a title texture, made on first use.
-fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
+fn staging(
+    resource: This,
+    texture: &ID3D12Resource,
+    copy: &Arc<crate::resource::HostTexture>,
+) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
     let now = USES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -605,7 +706,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         return None;
     }
     let host = host()?;
-    let s = create_staging(host, Some(map), now, resource, texture, layout, memory)?;
+    let s = create_staging(host, Some(map), resource, texture, layout, memory, copy)?;
+    s.used.store(now, Ordering::Relaxed);
     tracing::debug!(?desc, "texture contents queued for staging upload");
     map.insert(resource as usize, s.clone());
     Some(s)
@@ -616,11 +718,11 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 fn create_staging(
     host: &crate::host::Host,
     map: Option<&mut HashMap<usize, Arc<Staging>>>,
-    now: u64,
     resource: This,
     texture: &ID3D12Resource,
     layout: victory_formats::texture::Layout,
     memory: *const u8,
+    copy: &Arc<crate::resource::HostTexture>,
 ) -> Option<Arc<Staging>> {
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
@@ -671,7 +773,7 @@ fn create_staging(
         buffer,
         _slot: slot,
         size: total,
-        used: AtomicU64::new(now),
+        used: AtomicU64::new(0),
         data,
         footprints,
         rows,
@@ -679,6 +781,7 @@ fn create_staging(
         mips: u32::from(d.MipLevels),
         skip: crate::resource::skipped_mips(resource),
         memory,
+        owner: Arc::downgrade(copy),
         last: Mutex::default(),
         rewritten: Default::default(),
         not_watched: Default::default(),
@@ -747,6 +850,7 @@ mod tests {
             slot: None,
             skip: 0,
             written: Default::default(),
+            initialized: Default::default(),
             twin: Default::default(),
             texture: resource.unwrap(),
             state: AtomicU32::new(D3D12_RESOURCE_STATE_COMMON.0 as u32),
@@ -899,11 +1003,11 @@ mod tests {
         let staging = create_staging(
             &host,
             None,
-            0,
             std::ptr::null(),
             &copy.texture,
             layout.clone(),
             title_mem.as_ptr(),
+            &copy,
         )
         .expect("create staging");
         assert_eq!(staging.gpu_uploads(), 0);
@@ -966,6 +1070,97 @@ mod tests {
         assert_eq!(staging.gpu_uploads(), 2);
     }
 
+    #[test]
+    fn warp_uploads_interior_pages_once_without_replacing_resident_pixels() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE,
+            VirtualAlloc, VirtualFree,
+        };
+
+        #[cfg(feature = "diagnostics")]
+        if crate::copystat::mode() != 0 {
+            return; // Copy overrides require fully mapped memory.
+        }
+        let Some(host) = Host::new_warp() else {
+            return;
+        };
+        const PAGE: usize = 4096;
+        const SIZE: usize = 3 * PAGE;
+        let (width, height) = (64, 48);
+        let (copy, tex) = make_rgba_texture(&host, width, height);
+        let layout = tex.planes[0].layout.clone();
+        assert_eq!(layout.reach(0) as usize, SIZE);
+
+        struct Reservation(*mut u8);
+        impl Drop for Reservation {
+            fn drop(&mut self) {
+                // SAFETY: this is the base of our private reservation.
+                unsafe { VirtualFree(self.0.cast(), 0, MEM_RELEASE) };
+            }
+        }
+        // SAFETY: reserve a private range at an address chosen by Windows.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        let base = Reservation(base.cast());
+        // SAFETY: the middle page is in this private reservation.
+        let middle = unsafe { base.0.add(PAGE) };
+        let make_staging = || {
+            create_staging(
+                &host,
+                None,
+                std::ptr::null(),
+                &copy.texture,
+                layout.clone(),
+                base.0,
+                &copy,
+            )
+            .expect("create staging")
+        };
+        let sample = |staging: &Arc<Staging>| {
+            let list = host.new_list().expect("new list");
+            list.defer_texture(staging.clone(), copy.clone());
+            list.expect_texture_state(&copy, SHADER_RESOURCE);
+            list.close();
+            host.execute(&[&list]);
+        };
+        let staging = make_staging();
+
+        sample(&staging);
+        assert_eq!(staging.gpu_uploads(), 0, "a fully unmapped texture must wait");
+        // SAFETY: commit and write only the middle page.
+        unsafe {
+            assert_eq!(VirtualAlloc(middle.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE), middle.cast());
+            middle.write_bytes(0x32, PAGE);
+        }
+        sample(&staging);
+        assert_eq!(staging.gpu_uploads(), 1);
+        let pixels = read_back_rgba(&host, &copy, width, height);
+        assert_eq!(&pixels[..PAGE], &[0; PAGE]);
+        assert_eq!(&pixels[PAGE..2 * PAGE], &[0x32; PAGE]);
+        assert_eq!(&pixels[2 * PAGE..], &[0; PAGE]);
+
+        // SAFETY: commit the entire reservation and initialize the full image.
+        unsafe {
+            assert_eq!(VirtualAlloc(base.0.cast(), SIZE, MEM_COMMIT, PAGE_READWRITE), base.0.cast());
+            base.0.write_bytes(0x73, SIZE);
+        }
+        sample(&staging);
+        assert_eq!(staging.gpu_uploads(), 2);
+        assert_eq!(read_back_rgba(&host, &copy, width, height), vec![0x73; SIZE]);
+
+        // SAFETY: the reservation stays live for the existing staging buffer.
+        assert_ne!(unsafe { VirtualFree(middle.cast(), PAGE, MEM_DECOMMIT) }, 0);
+        sample(&staging);
+        assert_eq!(staging.gpu_uploads(), 2);
+
+        // Simulate staging eviction. The new staging buffer still points to
+        // the same initialized GPU texture and must preserve the full image.
+        let replacement = make_staging();
+        sample(&replacement);
+        assert_eq!(replacement.gpu_uploads(), 0);
+        assert_eq!(read_back_rgba(&host, &copy, width, height), vec![0x73; SIZE]);
+    }
+
     /// Verifies the write-watched (`MEM_WRITE_WATCH`) dirty-tracking path on
     /// real D3D12 WARP: first use uploads, clean frames skip, and a CPU page
     /// write triggers a single fresh upload.
@@ -1001,7 +1196,7 @@ mod tests {
             fill_linear_rgba(&layout, mem, v1);
         }
 
-        let staging = create_staging(&host, None, 0, std::ptr::null(), &copy.texture, layout.clone(), raw)
+        let staging = create_staging(&host, None, std::ptr::null(), &copy.texture, layout.clone(), raw, &copy)
             .expect("create staging");
 
         let run_once = || {
@@ -1053,7 +1248,8 @@ mod tests {
         };
         let (copy, _) = make_rgba_texture(&host, 4, 4);
         let fake_resource = 0x1234_5678usize as This;
-        host_written(fake_resource);
+        host_written(fake_resource, Some(&copy));
+        assert!(copy.initialized.load(Ordering::Acquire));
         let list = host.new_list().expect("new list");
         upload(&list, fake_resource, &copy.texture);
         assert!(

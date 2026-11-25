@@ -154,7 +154,7 @@ fn read_reports(pad: &Pad) {
 /// Opens the first DualSense and keeps its HID description.
 fn open_pad() -> Option<Pad> {
     for path in device_paths() {
-        // SAFETY: a path from SetupAPI, opened for reading only.
+        // SAFETY: a NUL-terminated path from SetupAPI, opened for reading only.
         let handle = unsafe {
             CreateFileW(
                 path.as_ptr(),
@@ -257,10 +257,11 @@ fn device_paths() -> Vec<Vec<u16>> {
                 std::ptr::null_mut(),
             )
         };
-        if required == 0 {
+        if (required as usize) < std::mem::size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() {
             continue;
         }
-        let mut buffer = vec![0u8; required as usize];
+        // The fixed header includes a DWORD and needs its alignment.
+        let mut buffer = vec![0u32; (required as usize).div_ceil(std::mem::size_of::<u32>())];
         let detail = buffer
             .as_mut_ptr()
             .cast::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>();
@@ -279,20 +280,29 @@ fn device_paths() -> Vec<Vec<u16>> {
                 continue;
             }
         }
-        // The path starts after the u32 cbSize, as UTF-16.
-        // SAFETY: the API wrote the path at this offset in our buffer.
-        let path = unsafe { buffer.as_ptr().add(4).cast::<u16>() };
-        let mut len = 0usize;
-        // SAFETY: the API wrote a NUL-terminated path into the buffer.
-        while unsafe { *path.add(len) } != 0 {
-            len += 1;
+        const PATH_START: usize = std::mem::offset_of!(SP_DEVICE_INTERFACE_DETAIL_DATA_W, DevicePath)
+            / std::mem::size_of::<u16>();
+        // SAFETY: the initialized buffer is aligned for u16 and contains
+        // at least the number of bytes passed to SetupAPI.
+        let units = unsafe {
+            std::slice::from_raw_parts(
+                buffer.as_ptr().cast::<u16>(),
+                required as usize / std::mem::size_of::<u16>(),
+            )
+        };
+        if let Some(path) = terminated_path(&units[PATH_START..]) {
+            paths.push(path.to_vec());
         }
-        // SAFETY: `path` is valid for `len` u16s in the live buffer.
-        paths.push(unsafe { std::slice::from_raw_parts(path, len) }.to_vec());
     }
     // SAFETY: the set is ours.
     unsafe { SetupDiDestroyDeviceInfoList(set) };
     paths
+}
+
+/// A non-empty UTF-16 path, including the terminator required by CreateFileW.
+fn terminated_path(units: &[u16]) -> Option<&[u16]> {
+    let end = units.iter().position(|&unit| unit == 0)?;
+    (end != 0).then_some(&units[..=end])
 }
 
 /// A declared usage's value in `report`, if the descriptor has it.
@@ -478,6 +488,14 @@ mod tests {
         assert!(!input_report(&[]));
     }
 
+    #[test]
+    fn device_path_keeps_its_terminator_and_rejects_incomplete_paths() {
+        assert_eq!(terminated_path(&[65, 66, 0, 99]), Some(&[65, 66, 0][..]));
+        assert_eq!(terminated_path(&[65, 66]), None);
+        assert_eq!(terminated_path(&[0, 65]), None);
+        assert_eq!(terminated_path(&[]), None);
+    }
+
     /// Not part of the suite: prints what the HID scan sees on this machine.
     /// `cargo test -p victory-hle --lib dualsense -- --ignored --nocapture`
     #[test]
@@ -486,7 +504,7 @@ mod tests {
         let paths = device_paths();
         println!("hid interfaces: {}", paths.len());
         for path in &paths {
-            println!("  {}", String::from_utf16_lossy(path));
+            println!("  {}", String::from_utf16_lossy(&path[..path.len() - 1]));
         }
         match open_pad() {
             Some(pad) => println!("opened a DualSense: report length {}", pad.input_len),

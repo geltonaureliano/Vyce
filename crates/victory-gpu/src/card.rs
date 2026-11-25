@@ -46,6 +46,12 @@ RWByteAddressBuffer differs : register(u1);
 
 groupshared uint4 s_acc[64];
 
+uint4 hash_mix(uint4 a, uint4 b) {
+    uint4 m = (a ^ (b * uint4(0x27D4EB2Fu, 0x165667B1u, 0x9E3779B9u, 0x85EBCA6Bu)))
+            * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+    return m.yzwx ^ (m >> 15);
+}
+
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
@@ -68,20 +74,27 @@ void main(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
     s_acc[tid] = h;
     GroupMemoryBarrierWithGroupSync();
 
-    [unroll]
-    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            uint4 a = s_acc[tid];
-            uint4 b = s_acc[tid + stride];
-            uint4 m = (a ^ (b * uint4(0x27D4EB2Fu, 0x165667B1u, 0x9E3779B9u, 0x85EBCA6Bu)))
-                    * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-            s_acc[tid] = m.yzwx ^ (m >> 15);
-        }
-        GroupMemoryBarrierWithGroupSync();
+    // Preserve the original 32, 16, 8, 4, 2, 1 reduction tree. In each
+    // stage each thread reads four disjoint slots and writes only its own.
+    // Keep the two intermediate digests in registers between levels.
+    if (tid < 16u) {
+        uint4 a = hash_mix(s_acc[tid], s_acc[tid + 32u]);
+        uint4 b = hash_mix(s_acc[tid + 16u], s_acc[tid + 48u]);
+        s_acc[tid] = hash_mix(a, b);
     }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (tid < 4u) {
+        uint4 a = hash_mix(s_acc[tid], s_acc[tid + 8u]);
+        uint4 b = hash_mix(s_acc[tid + 4u], s_acc[tid + 12u]);
+        s_acc[tid] = hash_mix(a, b);
+    }
+    GroupMemoryBarrierWithGroupSync();
 
     if (tid == 0u) {
-        uint4 final_h = s_acc[0];
+        uint4 a = hash_mix(s_acc[0], s_acc[2]);
+        uint4 b = hash_mix(s_acc[1], s_acc[3]);
+        uint4 final_h = hash_mix(a, b);
         if (compare != 0u) {
             uint4 prev = hashes.Load4(piece * 16u);
             differs.Store(out_at + gid.x * 4u, any(final_h != prev) ? 1u : 0u);
@@ -978,6 +991,143 @@ fn drop_barriers(barriers: impl IntoIterator<Item = D3D12_RESOURCE_BARRIER>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type Digest = [u32; 4];
+    const MULTIPLIERS: Digest = [0x0100_0193, 0x9E37_79B1, 0x85EB_CA77, 0xC2B2_AE3D];
+
+    fn permute(words: Digest) -> Digest {
+        std::array::from_fn(|i| words[(i + 1) % 4] ^ (words[i] >> 15))
+    }
+
+    fn mix(a: Digest, b: Digest) -> Digest {
+        let salt = [0x27D4_EB2F, 0x1656_67B1, 0x9E37_79B9, 0x85EB_CA6B];
+        permute(std::array::from_fn(|i| {
+            (a[i] ^ b[i].wrapping_mul(salt[i])).wrapping_mul(MULTIPLIERS[i])
+        }))
+    }
+
+    fn legacy_tree(mut slots: [Digest; 64]) -> Digest {
+        for stride in [32, 16, 8, 4, 2, 1] {
+            for i in 0..stride {
+                slots[i] = mix(slots[i], slots[i + stride]);
+            }
+        }
+        slots[0]
+    }
+
+    fn random_word(state: &mut u32) -> u32 {
+        *state ^= *state << 13;
+        *state ^= *state >> 17;
+        *state ^= *state << 5;
+        *state
+    }
+
+    #[test]
+    fn grouped_hash_retains_the_legacy_reduction_tree() {
+        let mut state = 0x5b4e_712d;
+        for _ in 0..1024 {
+            let mut lanes = std::array::from_fn(|_| std::array::from_fn(|_| random_word(&mut state)));
+            let expected = legacy_tree(lanes);
+            for i in 0..16 {
+                lanes[i] = mix(
+                    mix(lanes[i], lanes[i + 32]),
+                    mix(lanes[i + 16], lanes[i + 48]),
+                );
+            }
+            for i in 0..4 {
+                lanes[i] = mix(
+                    mix(lanes[i], lanes[i + 8]),
+                    mix(lanes[i + 4], lanes[i + 12]),
+                );
+            }
+            assert_eq!(mix(mix(lanes[0], lanes[2]), mix(lanes[1], lanes[3])), expected);
+        }
+    }
+
+    fn legacy_page_digest(page: &[u8]) -> Digest {
+        assert_eq!(page.len(), PAGE);
+        let initial = [0x9E37_79B9, 0x85EB_CA6B, 0xC2B2_AE35, 0x27D4_EB2F];
+        let salt = [0x85EB_CA6B, 0xC2B2_AE35, 0x27D4_EB2F, 0x1656_67B1];
+        legacy_tree(std::array::from_fn(|tid| {
+            let mut digest = std::array::from_fn(|i| initial[i] ^ (tid as u32).wrapping_mul(salt[i]));
+            for at in (tid * 16..PAGE).step_by(1024) {
+                digest = permute(std::array::from_fn(|i| {
+                    let start = at + i * 4;
+                    let word = u32::from_le_bytes(page[start..start + 4].try_into().unwrap());
+                    (digest[i] ^ word).wrapping_mul(MULTIPLIERS[i])
+                }));
+            }
+            digest
+        }))
+    }
+
+    fn compare_gpu_hashes(host: &Host) {
+        let engine = CardEngine::new(host).expect("hash pipeline");
+        let pages = 8;
+        let size = pages * PAGE;
+        let hash_bytes = (pages * size_of::<Digest>()) as u64;
+        let (input, input_ptr) = host.shared_buffer(size as u64).expect("test hash input");
+        let hashes = host.uav_buffer(hash_bytes).expect("test hash output");
+        let (readback, readback_ptr) = host.readback_buffer(hash_bytes).expect("test readback");
+
+        let mut bytes = vec![0u8; size];
+        bytes[PAGE..2 * PAGE].fill(0xff);
+        bytes[3 * PAGE - 1] = 0x80;
+        let mut state = 0xc843_751e;
+        for word in bytes[3 * PAGE..].chunks_exact_mut(4) {
+            word.copy_from_slice(&random_word(&mut state).to_le_bytes());
+        }
+        let expected: Vec<_> = bytes.chunks_exact(PAGE).map(legacy_page_digest).collect();
+
+        // SAFETY: Dedicated queue and resources for a bounded test dispatch.
+        // The null event waits synchronously for the signalled fence value.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), input_ptr, size);
+            let queue: ID3D12CommandQueue = host.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            }).expect("test queue");
+            let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("test fence");
+            let alloc: ID3D12CommandAllocator = host.device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .expect("test allocator");
+            let list: ID3D12GraphicsCommandList = host.device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &engine.pso)
+                .expect("test command list");
+            list.SetComputeRootSignature(&engine.root_sig);
+            engine.dispatch_hash(
+                &list, &input, &hashes, &engine.dummy_uav, 0, size as u32, pages as u32, 0, 0,
+            );
+            let barrier = [transition_barrier(
+                &hashes,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )];
+            list.ResourceBarrier(&barrier);
+            drop_barriers(barrier);
+            list.CopyBufferRegion(&readback, 0, &hashes, 0, hash_bytes);
+            list.Close().expect("close test command list");
+            queue.ExecuteCommandLists(&[Some(list.cast().expect("cast test list"))]);
+            queue.Signal(&fence, 1).expect("signal test fence");
+            fence.SetEventOnCompletion(1, Default::default()).expect("wait for test fence");
+            host.device.GetDeviceRemovedReason().expect("hash ran successfully");
+            assert_eq!(std::slice::from_raw_parts(readback_ptr.cast::<Digest>(), pages), expected);
+        }
+    }
+
+    #[test]
+    fn warp_card_hash_bytes_match_the_legacy_tree() {
+        if let Some(host) = Host::new_warp() {
+            compare_gpu_hashes(&host);
+            println!("validated hash bits on WARP");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a local D3D12 hardware adapter"]
+    fn hardware_card_hash_bytes_match_the_legacy_tree() {
+        compare_gpu_hashes(crate::host::host().expect("D3D12 host device"));
+    }
 
     #[test]
     fn range_helpers_merge_and_convert_pieces() {

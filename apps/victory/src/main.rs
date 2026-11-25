@@ -93,7 +93,8 @@ enum Command {
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
-        exe: PathBuf,
+        /// Game executable. Defaults to game_scarlett_master.exe in the configured game directory.
+        exe: Option<PathBuf>,
         /// What unimplemented imports do when called.
         #[arg(long, value_enum, default_value_t = Unimplemented::Trap)]
         unimplemented: Unimplemented,
@@ -167,7 +168,15 @@ fn main() -> Result<()> {
             execute,
             console,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        } => {
+            let exe = match exe {
+                Some(path) => path,
+                None => victory_core::Config::load()?
+                    .require_game_dir()?
+                    .join("game_scarlett_master.exe"),
+            };
+            run::run(&exe, unimplemented, strict, execute, console)
+        }
         Command::Config => show_config(),
     }
 }

@@ -519,6 +519,8 @@ struct Lower<'a> {
     split: bool,
     /// Split, and run as the console runs it ([`CONSOLE_FLOW`]).
     console_cf: bool,
+    /// Order group-shared accesses across both halves of one console wave.
+    sync_split_lds: bool,
     /// Split without [`Self::console_cf`] cannot run it, the console flow can.
     wants_console_flow: bool,
     /// The console thread's flat id in the group (relabelled; see
@@ -1110,6 +1112,7 @@ impl<'a> Lower<'a> {
             insts().any(|i| ds_integer_atomic(i.name()).is_some_and(|(_, wide, _)| wide));
         let mut console_lanes = false;
         let mut split = false;
+        let mut sync_split_lds = false;
         let mut wants_console_flow = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
@@ -1134,12 +1137,13 @@ impl<'a> Lower<'a> {
             // other half of a wave64.
             let in_half = |i: &Inst| {
                 i.name().starts_with("ds_swizzle")
+                    || i.name() == "ds_bpermute_b32"
                     || implicit_derivatives(i.name())
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
             };
             let whole = |i: &Inst| {
                 let n = i.name();
-                n.contains("permute")
+                n.contains("permute") && n != "ds_bpermute_b32"
                     || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     // Its derivatives are the quad's.
@@ -1176,6 +1180,13 @@ impl<'a> Lower<'a> {
             console_lanes = reads_whole || masks_held || live().any(in_half);
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
+            // A single console wave can synchronize at group scope in the
+            // console flow. Address-based dispatches can return early in
+            // individual lanes and cannot participate in these barriers.
+            // The exchange uses two additional dwords of group-shared memory.
+            let shared_wave = s.lds_dwords != 0
+                && s.lds_dwords <= 8 * 1024 - 2
+                && !x.res.addresses;
             // On a host without 64-lane waves, a wave64 program whose lanes
             // read only their own half runs as two 32-lane waves: what each
             // lane reads is in its host wave, at its host lane's place in the
@@ -1192,15 +1203,16 @@ impl<'a> Lower<'a> {
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
             // The rest of such programs need the halves to exchange values
             // (masks read whole, lanes of the other half): the console flow,
-            // for a group of one console wave without LDS.
-            wants_console_flow = console_lanes
+            // for a group of one console wave. Its LDS accesses are ordered
+            // explicitly, since the two halves no longer run in lockstep.
+            wants_console_flow = (console_lanes || shared_wave)
                 && !split
                 && x.native.wave64
                 && !x.target.runs(64)
                 && x.target.runs(32)
-                && s.lds_dwords == 0
-                && cs.threads.iter().product::<u32>() <= 64
-                && !insts().any(|i| i.name().contains("permute"))
+                && (s.lds_dwords == 0 || shared_wave)
+                && one_wave
+                && !insts().any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32")
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
             // On a host that runs the console's wave size: lane reads and
             // writes in a program whose lanes branch differently (see
@@ -1217,12 +1229,13 @@ impl<'a> Lower<'a> {
                     .exits
                     .iter()
                     .any(|e| matches!(*e, LaneExit::Branch { when, .. } if !uniform(when)))
-                && !insts().any(|i| i.name().contains("permute"))
+                && !insts().any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32")
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
             if x.console_cf {
                 console_lanes = true;
                 // In halves only where the host cannot run the console wave.
                 split = x.native.wave64 && !x.target.runs(64);
+                sync_split_lds = split && shared_wave;
             }
             if split {
                 s.wave_size = Some(32);
@@ -1316,6 +1329,7 @@ impl<'a> Lower<'a> {
             numeric_selects,
             split,
             console_cf: x.console_cf,
+            sync_split_lds,
             wants_console_flow,
             console_flat: None,
             xchg: None,
@@ -4172,6 +4186,16 @@ impl<'a> Lower<'a> {
         self.s.m.load(self.cur, p)
     }
 
+    fn lds_read_dword(&mut self, byte: V, guard: Option<V>) -> V {
+        if self.sync_split_lds && guard.is_some() {
+            let place = self.begin_guarded(guard);
+            let data = self.lds_load_dword(byte);
+            let zero = self.s.m.i32(0);
+            return self.end_guarded(place, &[(data, zero)])[0];
+        }
+        self.lds_load_dword(byte)
+    }
+
     fn lds_update_dword(&mut self, byte: V, update: impl FnOnce(&mut Self, V) -> V) -> V {
         let p = self.lds_ptr(byte);
         let zero = if self.wide_lds {
@@ -4349,11 +4373,28 @@ impl<'a> Lower<'a> {
         )
     }
 
-    /// `x` of lane `src` (in this lane's quad) through quad reads, whose
-    /// lane must be a constant.
-    fn quad_pick(&mut self, x: V, src: V) -> V {
+    /// Reads another lane in this quad, including pixel helper lanes.
+    /// Common permutations map to a single native quad operation.
+    fn quad_pick(&mut self, x: V, src: V, pattern: Option<u8>) -> V {
         self.s.flags |= flags::WAVE_OPS;
         let c = self.cur;
+        match pattern {
+            Some(0xe4) => return x,
+            Some(p @ (0x00 | 0x55 | 0xaa | 0xff)) => {
+                let lane = self.s.m.i32(u32::from(p & 3));
+                return self.s.op(
+                    c, "quadReadLaneAt.i32", Attr::NoUnwind, self.s.t.i32, 122, &[x, lane],
+                );
+            }
+            Some(p @ (0xb1 | 0x4e | 0x1b)) => {
+                // The low bits are lane 0's source lane: XOR 1, 2 or 3.
+                let direction = self.s.m.i8((p & 3) - 1);
+                return self.s.op(
+                    c, "quadOp.i32", Attr::NoUnwind, self.s.t.i32, 123, &[x, direction],
+                );
+            }
+            _ => {}
+        }
         let three = self.s.m.i32(3);
         let q = self.s.m.bin(c, Bin::And, src, three);
         let mut r = x;
@@ -4443,6 +4484,35 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// Read an EXEC-enabled source in the current 32-lane half, otherwise
+    /// return zero. A DXIL wave read targeting an inactive lane is undefined,
+    /// including a lane absent from a partial workgroup.
+    fn read_active_half_lane(&mut self, value: V, index: V, exec: Option<V>) -> V {
+        let c = self.cur;
+        let exec = exec.unwrap_or_else(|| self.s.m.bool(true));
+        let own = self.lane_index();
+        let ballot = self.wave_ballot(c, exec);
+        let lo = self.s.m.extract(c, ballot, 0);
+        let (active, source) = if self.s.wave_size == Some(64) {
+            let hi = self.s.m.extract(c, ballot, 1);
+            let bit = self.s.m.i32(32);
+            let half = self.s.m.bin(c, Bin::And, own, bit);
+            let upper = self.s.m.cmp(c, pred::EQ, half, bit);
+            let active = self.s.m.select(c, upper, hi, lo);
+            (active, self.s.m.bin(c, Bin::Or, index, half))
+        } else {
+            (lo, index)
+        };
+        let one = self.s.m.i32(1);
+        let zero = self.s.m.i32(0);
+        let bit = self.s.m.bin(c, Bin::Shl, one, index);
+        let present = self.s.m.bin(c, Bin::And, active, bit);
+        let enabled = self.s.m.cmp(c, pred::NE, present, zero);
+        let safe_source = self.s.m.select(c, enabled, source, own);
+        let gathered = self.read_lane(value, safe_source);
+        self.s.m.select(c, enabled, gathered, zero)
+    }
+
     /// Coarse derivatives of `coords` across this lane's quad, as DXIL
     /// gradients (x for up to three coordinates, then y), each times
     /// `scale` if given.
@@ -4464,7 +4534,7 @@ impl<'a> Lower<'a> {
             let pixel = self.s.pixel;
             let at = |l: &mut Self, lane: V| {
                 // A pixel's quad through quad reads (see `helpers_read`).
-                let r = if pixel { l.quad_pick(xi, lane) } else { l.read_lane(xi, lane) };
+                let r = if pixel { l.quad_pick(xi, lane, None) } else { l.read_lane(xi, lane) };
                 l.as_float(r)
             };
             let origin = at(self, base);
@@ -4529,7 +4599,7 @@ impl<'a> Lower<'a> {
         let mask = k(self, (1 << sub.bits) - 1);
         if !sub.write {
             let reg = dst_reg.ok_or("an LDS read result")?;
-            let x = self.lds_load_dword(aligned);
+            let x = self.lds_read_dword(aligned, guard);
             let c = self.cur;
             let x = self.s.m.bin(c, Bin::LShr, x, shift);
             let x = if sub.signed {
@@ -4656,7 +4726,8 @@ impl<'a> Lower<'a> {
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
             let r = if mesh_quad || self.helpers_read(quad) {
-                self.quad_pick(x, src)
+                let pattern = (offset & 0x8000 != 0).then_some(offset as u8);
+                self.quad_pick(x, src, pattern)
             } else {
                 self.read_lane(x, src)
             };
@@ -4665,28 +4736,21 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if name == "ds_bpermute_b32" {
-            // Each lane reads the data of the lane it names (times 4): 0 if
-            // that one does not run this.
+            // RDNA 2 indexes only within the destination lane's 32-lane
+            // half, even on a native Wave64 host. EXEC-disabled sources
+            // return zero. The byte offset wraps at 32 dwords.
             self.cross_lane(false)?;
-            if self.split {
-                return Err("a lane permutation in a wave64 program split in halves");
-            }
             let at = self.vgprs(inst, addr.as_ref().ok_or("a permutation address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("permutation data")?, 1)?[0];
             let (by, two, last) = (
-                self.s.m.i32(offset),
+                self.s.m.i32(u32::from(*offset0)),
                 self.s.m.i32(2),
-                self.s.m.i32(self.wave() - 1),
+                self.s.m.i32(31),
             );
             let at = self.s.m.bin(c, Bin::Add, at, by);
             let at = self.s.m.bin(c, Bin::LShr, at, two);
-            let src = self.s.m.bin(c, Bin::And, at, last);
-            let z = self.s.m.i32(0);
-            let x = match guard {
-                Some(g) => self.s.m.select(c, g, x, z),
-                None => x,
-            };
-            let r = self.read_lane(x, src);
+            let index = self.s.m.bin(c, Bin::And, at, last);
+            let r = self.read_active_half_lane(x, index, guard);
             let reg = dst_reg.ok_or("a permutation result")?;
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
@@ -4741,7 +4805,7 @@ impl<'a> Lower<'a> {
             for (off, w) in elements {
                 for k in 0..w {
                     let address = byte(self, off + 4 * k);
-                    let x = self.lds_load_dword(address);
+                    let x = self.lds_read_dword(address, guard);
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
@@ -5003,6 +5067,18 @@ impl<'a> Lower<'a> {
         };
         if fence && r.is_ok() {
             self.uav_fence();
+        }
+        if self.sync_split_lds
+            && r.is_ok()
+            && matches!(inst.fields, Fields::Ds { gds: false, .. })
+            && !matches!(name, "ds_nop" | "ds_bpermute_b32")
+            && !name.starts_with("ds_swizzle")
+        {
+            // Both halves have rejoined after any EXEC guard. Order reads
+            // and writes before either half can issue the next LDS access.
+            let mode = self.s.m.i32(1 | 8);
+            self.s
+                .op(self.cur, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
         }
         if let Err(w) = &r && std::env::var_os("VICTORY_WHY").is_some() {
             eprintln!("missing {offset:#x} {name} {w}");
@@ -7292,8 +7368,12 @@ impl<'a> Lower<'a> {
             return Err("a DPP operand");
         };
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
-        // Quad permutations and DPP8 stay in groups the pixel layout shares.
-        let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
+        // Each DPP8 group contains two quads. The high bit of each source
+        // must match its destination's before quad operations can read it.
+        let quad = match dpp {
+            Dpp::Row { ctrl, .. } => ctrl <= 0xff,
+            Dpp::Lanes { sel, .. } => (0..8).all(|lane| ((sel >> (3 * lane)) ^ lane) & 4 == 0),
+        };
         let mesh_quad = self.s.mesh.is_some() && quad;
         if !mesh_quad {
             self.cross_lane(quad)?;
@@ -7374,7 +7454,11 @@ impl<'a> Lower<'a> {
             }
         };
         let mut r = if mesh_quad || self.helpers_read(quad) {
-            self.quad_pick(x, src)
+            let pattern = match dpp {
+                Dpp::Row { ctrl, .. } => Some(ctrl as u8),
+                Dpp::Lanes { .. } => None,
+            };
+            self.quad_pick(x, src, pattern)
         } else {
             self.read_lane(x, src)
         };
@@ -10431,6 +10515,92 @@ impl<'a> Lower<'a> {
     }
 
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        let sampler = self.descriptors.get(&((b, i), true)).copied();
+        if inst.name().starts_with("image_sample")
+            && let Some(Source::Phi { block, args }) = sampler
+            && *block == b
+            && let [left @ Source::Constant(_), right @ Source::Constant(_)] = args.as_slice()
+        {
+            if left == right {
+                return self.image_with_sampler(inst, b, i, Some(left));
+            }
+            if let Some(pick_left) = self.sampler_choice(b) {
+                // Both reads run at the original sample site, which
+                // preserves the control flow used by implicit derivatives.
+                self.image_with_sampler(inst, b, i, Some(left))?;
+                let left_values = inst
+                    .writes
+                    .iter()
+                    .map(|&(_, v)| self.i32_of(v))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.image_with_sampler(inst, b, i, Some(right))?;
+                for (&(_, value), left) in inst.writes.iter().zip(left_values) {
+                    let right = self.i32_of(value)?;
+                    let selected = self.s.m.select(self.cur, pick_left, left, right);
+                    self.vals.insert(value, Val::I32(selected));
+                }
+                return Ok(());
+            }
+        }
+        self.image_with_sampler(inst, b, i, sampler)
+    }
+
+    /// The first incoming edge of a uniform diamond at the sample's block.
+    /// Require the original control-flow edges to survive lowering, so this
+    /// phi dominates the sample and the two sampler values stay in IR order.
+    fn sampler_choice(&mut self, block: usize) -> Option<V> {
+        let p = self.x.p;
+        let st = self.x.st;
+        let &[left, right] = p.blocks[block].preds.as_slice() else {
+            return None;
+        };
+        let &[fork] = p.blocks[left].preds.as_slice() else {
+            return None;
+        };
+        let Exit::Branch { taken, not_taken } = p.blocks[fork].exit else {
+            return None;
+        };
+        let LaneExit::Branch { when, taken: yes, not_taken: no } = st.exits[fork] else {
+            return None;
+        };
+        if self.console_cf
+            || p.blocks[right].preds.as_slice() != [fork]
+            || [taken, not_taken] != [yes, no]
+            || ([taken, not_taken] != [left, right] && [taken, not_taken] != [right, left])
+            || [left, right].into_iter().any(|arm| {
+                self.tail[arm].is_none()
+                    || p.blocks[arm].exit != Exit::Jump(block)
+                    || !matches!(st.exits[arm], LaneExit::Jump(to) if to == block)
+            })
+            || !st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_)))
+        {
+            return None;
+        }
+        // A restructured branch must not have added a third live edge.
+        if st.exits.iter().enumerate().any(|(from, exit)| {
+            from != left && from != right && self.block[from].is_some() && match *exit {
+                LaneExit::Jump(to) => to == block,
+                LaneExit::Branch { taken, not_taken, .. } => taken == block || not_taken == block,
+                _ => false,
+            }
+        }) {
+            return None;
+        }
+        let join = self.block[block]?;
+        let edges = [self.edge_block(left, block), self.edge_block(right, block)];
+        let phi = self.s.m.phi(join, self.s.t.i1);
+        let (yes, no) = (self.s.m.bool(true), self.s.m.bool(false));
+        self.s.m.set_phi(phi, vec![(yes, edges[0]), (no, edges[1])]);
+        Some(phi)
+    }
+
+    fn image_with_sampler(
+        &mut self,
+        inst: &Inst,
+        b: usize,
+        i: usize,
+        sampler: Option<&Source>,
+    ) -> Result<(), Why> {
         let Fields::Image {
             data,
             addr,
@@ -10754,11 +10924,7 @@ impl<'a> Lower<'a> {
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
         let r = if sample {
-            let ss = self
-                .descriptors
-                .get(&(site, true))
-                .copied()
-                .ok_or("an untracked sampler")?;
+            let ss = sampler.ok_or("an untracked sampler")?;
             let f = form.unwrap_or_default();
             if f.c && dmask.count_ones() != 1 {
                 return Err("a comparison sample of several channels");
@@ -12584,24 +12750,22 @@ impl<'a> Lower<'a> {
         }
         // One host wave is the console wave (the high word is 0 in waves
         // of 32).
-        let i32t = self.s.t.i32;
-        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-        let r = self
-            .s
-            .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
-        self.s.flags |= flags::WAVE_OPS;
+        let r = self.wave_ballot(at, bit);
         (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1))
     }
 
     /// The host wave's ballot of `bit` (32 lanes: the first word).
     fn ballot_word(&mut self, at: usize, bit: V) -> V {
+        let r = self.wave_ballot(at, bit);
+        self.s.m.extract(at, r, 0)
+    }
+
+    fn wave_ballot(&mut self, at: usize, bit: V) -> V {
         let i32t = self.s.t.i32;
         let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-        let r = self
-            .s
-            .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
         self.s.flags |= flags::WAVE_OPS;
-        self.s.m.extract(at, r, 0)
+        self.s
+            .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit])
     }
 
     /// The console thread's flat id in the group (see [`Self::thread_id`]).
@@ -13805,6 +13969,33 @@ mod tests {
                 range(ResourceType::Sampler, 1, 1),
             ],
         )
+    }
+
+    #[test]
+    fn a_uniform_branch_can_choose_between_immediate_samplers() {
+        for (second, expected) in [(0x92, 2), (0, 1)] {
+            // A root constant selects wrap or clamp. The LDS store keeps
+            // the sampled texel live at the join.
+            let words = [
+                0xbe84_0300, 0xbe85_0380, // s[4:5] = texture table
+                0xf40c_0302, 0xfa00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0
+                0xbe89_0380, 0xbe8a_0380, 0xbe8b_0380, // sampler words 1–3
+                0xbf06_8001, // s_cmp_eq_u32 s1, 0
+                0xbf85_0002, // branch to clamp
+                0xbe88_0380, 0xbf82_0002, // wrap, skip clamp
+                0xbe88_03ff, second, // second sampler
+                0xf09c_0f08, 0x0043_0c02, // image_sample_lz v[12:15], ..., s[8:11]
+                0xd834_0000, 0x0000_0c00, // ds_write_b32 v0, v12
+                S_ENDPGM,
+            ];
+            let (mut layout, mut used) = texture_tables();
+            layout[1] = root(RootType::Constants, 1, 1);
+            used.truncate(1);
+            let shader = lower_with(&words, layout, used).unwrap();
+            assert_eq!(shader.samplers.len(), expected);
+            assert!(shader.samplers.contains(&[0, 0, 0, 0]));
+            assert!(shader.samplers.contains(&[second, 0, 0, 0]));
+        }
     }
 
     #[test]

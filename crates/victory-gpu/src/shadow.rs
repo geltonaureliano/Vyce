@@ -138,12 +138,17 @@ static TILE_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 /// Tile snapshots kept at most (512 MiB).
 const TILE_POOL_MOST: usize = 8192;
 
-/// An empty buffer with room for a tile.
-fn pooled_tile() -> Vec<u8> {
-    let kept = TILE_POOL.lock().unwrap_or_else(|e| e.into_inner()).pop();
-    let mut v = kept.unwrap_or_else(|| Vec::with_capacity(PAGE));
-    v.clear();
-    v
+/// `n` empty buffers with room for a tile, under one lock of the pool.
+fn pooled_tiles(n: usize) -> Vec<Vec<u8>> {
+    let mut buffers = Vec::with_capacity(n);
+    {
+        let mut pool = TILE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let from = pool.len().saturating_sub(n);
+        buffers.extend(pool.drain(from..));
+    }
+    buffers.iter_mut().for_each(Vec::clear);
+    buffers.resize_with(n, || Vec::with_capacity(PAGE));
+    buffers
 }
 
 /// Returns tile snapshots to their pool.
@@ -1931,74 +1936,133 @@ impl Shadow {
         None
     }
 
-    /// [`Shadow::writing`] of a sparse copy.
+    /// The CPU's views of each tile's part of `[from, to)`: its title
+    /// address, the view, its length. Tiles already mapped are found under
+    /// one lock (the world declares ~160 GB of ranges a frame: one lock per
+    /// 64 KiB tile was a tenth of the submitting thread's time).
+    fn tiles_of(&self, s: &Sparse, from: usize, to: usize) -> Vec<(usize, usize, usize)> {
+        let start = self.start as usize;
+        let mut views = Vec::with_capacity((to - from).div_ceil(PAGE) + 1);
+        {
+            let mut tiles = s.tiles.lock().unwrap_or_else(|e| e.into_inner());
+            let frame = crate::queue::presented();
+            let mut at = from;
+            while at < to {
+                let n = (PAGE - at % PAGE).min(to - at);
+                let data = tiles.get_mut(&(((at - start) / PAGE) as u32)).map(|tile| {
+                    tile.used = frame;
+                    tile.data + at % PAGE
+                });
+                views.push((at, data.unwrap_or(0), n));
+                at += n;
+            }
+        }
+        views.retain_mut(|(at, data, _)| {
+            if *data == 0 {
+                let Some(mapped) = self.tile(s, *at) else {
+                    return false;
+                };
+                *data = mapped + *at % PAGE;
+            }
+            true
+        });
+        views
+    }
+
+    /// [`Shadow::writing`] of a sparse copy. Take each tile's snapshot once,
+    /// copying the new tiles on several threads.
     fn sparse_writing(&self, s: &Sparse, address: usize, len: usize) {
+        let end = address + len;
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push((address, address + len));
-        let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
-        let start = self.start as usize;
+            .push((address, end));
         #[cfg(feature = "diagnostics")]
         SPARSE_WRITES[0].fetch_add(len as u64, Ordering::Relaxed);
-        self.each_tile(s, address, address + len, |at, data, _| {
-            let tile = ((at - start) / PAGE) as u32;
-            before.entry(tile).or_insert_with(|| {
-                #[cfg(feature = "diagnostics")]
-                SPARSE_WRITES[1].fetch_add(PAGE as u64, Ordering::Relaxed);
-                let whole = data as usize & !(PAGE - 1);
-                let mut buf = pooled_tile();
-                // SAFETY: the tile's mapping.
-                buf.extend_from_slice(unsafe { std::slice::from_raw_parts(whole as *const u8, PAGE) });
-                buf
-            });
-        });
-    }
-
-    /// [`Shadow::copy_back`] of a sparse copy.
-    fn sparse_back(&self, s: &Sparse, address: usize, len: usize) -> usize {
+        let views = self.tiles_of(s, address, end);
         let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
         let start = self.start as usize;
-        let mut written = 0;
-        let mut title: Option<Vec<u8>> = None;
-        self.each_tile(s, address, address + len, |at, data, n| {
-            let Some(old) = before.get_mut(&(((at - start) / PAGE) as u32)) else {
-                return;
-            };
-            let old = &mut old[at % PAGE..at % PAGE + n];
-            // SAFETY: the tile's mapping; only this thread writes it.
-            let host = unsafe { std::slice::from_raw_parts_mut(data, n) };
-            #[cfg(feature = "diagnostics")]
-            SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
-            if host == old {
-                return;
-            }
-            #[cfg(feature = "diagnostics")]
-            SPARSE_WRITES[3].fetch_add(n as u64, Ordering::Relaxed);
-            let buf = title.get_or_insert_with(|| {
-                let mut v = pooled(PAGE);
-                v.resize(PAGE, 0);
-                v
-            });
-            if !crate::host::read_into(at as *const u8, &mut buf[..n]) {
-                return;
-            }
-            if let Some((dirty_start, dirty_end)) =
-                merge_gpu_writes_mut(&mut buf[..n], host, old)
-            {
-                let dirty_len = dirty_end - dirty_start;
-                crate::watch::writing(at + dirty_start, dirty_len);
-                crate::host::write_mapped(
-                    (at + dirty_start) as *mut u8,
-                    buf[dirty_start..].as_ptr(),
-                    dirty_len,
-                );
-                written += dirty_len;
+        // (tile, the start of its view) of tiles without a snapshot yet.
+        let new: Vec<(u32, usize)> = views
+            .iter()
+            .map(|&(at, data, _)| (((at - start) / PAGE) as u32, data - at % PAGE))
+            .filter(|(tile, _)| !before.contains_key(tile))
+            .collect();
+        if new.is_empty() {
+            return;
+        }
+        #[cfg(feature = "diagnostics")]
+        SPARSE_WRITES[1].fetch_add((new.len() * PAGE) as u64, Ordering::Relaxed);
+        let mut bufs = pooled_tiles(new.len());
+        let copies: Vec<(usize, usize)> =
+            new.iter().zip(&mut bufs).map(|(&(_, view), buf)| (view, buf.as_mut_ptr() as usize)).collect();
+        crate::host::in_parallel(&copies, 16, |chunk| {
+            for &(view, buf) in chunk {
+                // SAFETY: the tile's mapping; a buffer with room for a tile,
+                // each written by one thread.
+                unsafe { std::ptr::copy_nonoverlapping(view as *const u8, buf as *mut u8, PAGE) };
             }
         });
-        if let Some(buf) = title {
-            give_back(buf);
+        for (&(tile, _), mut buf) in new.iter().zip(bufs) {
+            // SAFETY: filled above, within its capacity.
+            unsafe { buf.set_len(PAGE) };
+            before.insert(tile, buf);
         }
+    }
+
+    /// [`Shadow::copy_back`] of a sparse copy, its tiles on several threads.
+    fn sparse_back(&self, s: &Sparse, address: usize, len: usize) -> usize {
+        let views = self.tiles_of(s, address, address + len);
+        let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
+        let start = self.start as usize;
+        // (title address, view, length, the snapshot's bytes): one tile each,
+        // so no two touch the same memory.
+        let work: Vec<(usize, usize, usize, usize)> = views
+            .iter()
+            .filter_map(|&(at, data, n)| {
+                let old = before.get_mut(&(((at - start) / PAGE) as u32))?;
+                Some((at, data, n, old.as_mut_ptr() as usize + at % PAGE))
+            })
+            .collect();
+        let written = std::sync::atomic::AtomicUsize::new(0);
+        crate::host::in_parallel(&work, 8, |chunk| {
+            let mut title: Option<Vec<u8>> = None;
+            for &(at, data, n, old) in chunk {
+                // SAFETY: the tile's mapping and its snapshot (kept under the
+                // lock held above); this tile is this thread's alone.
+                let host = unsafe { std::slice::from_raw_parts_mut(data as *mut u8, n) };
+                let old = unsafe { std::slice::from_raw_parts_mut(old as *mut u8, n) };
+                #[cfg(feature = "diagnostics")]
+                SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
+                if host == old {
+                    continue;
+                }
+                #[cfg(feature = "diagnostics")]
+                SPARSE_WRITES[3].fetch_add(n as u64, Ordering::Relaxed);
+                let buf = title.get_or_insert_with(|| {
+                    let mut v = pooled(PAGE);
+                    v.resize(PAGE, 0);
+                    v
+                });
+                if !crate::host::read_into(at as *const u8, &mut buf[..n]) {
+                    continue;
+                }
+                if let Some((dirty_start, dirty_end)) = merge_gpu_writes_mut(&mut buf[..n], host, old) {
+                    let dirty_len = dirty_end - dirty_start;
+                    crate::watch::writing(at + dirty_start, dirty_len);
+                    crate::host::write_mapped(
+                        (at + dirty_start) as *mut u8,
+                        buf[dirty_start..].as_ptr(),
+                        dirty_len,
+                    );
+                    written.fetch_add(dirty_len, Ordering::Relaxed);
+                }
+            }
+            if let Some(buf) = title {
+                give_back(buf);
+            }
+        });
+        let written = written.into_inner();
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
         if pending.is_empty() {
@@ -2098,6 +2162,86 @@ fn merge_gpu_writes_mut(
 /// where `cpu_modified` is true if any byte unchanged by the GPU differed in `title`
 /// (a concurrent title CPU write that must be uploaded back to VRAM).
 fn merge_gpu_writes_card(
+    title: &mut [u8],
+    staging_old: &mut [u8],
+    gpu_new: &[u8],
+) -> (Option<(usize, usize)>, bool) {
+    #[cfg(target_arch = "x86_64")]
+    if title.len().min(staging_old.len()).min(gpu_new.len()) >= 32
+        && std::is_x86_feature_detected!("avx2")
+    {
+        // SAFETY: AVX2 is available on this CPU.
+        return unsafe { merge_gpu_writes_card_avx2(title, staging_old, gpu_new) };
+    }
+    merge_gpu_writes_card_scalar(title, staging_old, gpu_new)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn merge_gpu_writes_card_avx2(
+    title: &mut [u8],
+    staging_old: &mut [u8],
+    gpu_new: &[u8],
+) -> (Option<(usize, usize)>, bool) {
+    use std::arch::x86_64::{
+        _mm256_blendv_epi8, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
+        _mm256_storeu_si256,
+    };
+
+    let n = title.len().min(staging_old.len()).min(gpu_new.len());
+    let vector_end = n / 32 * 32;
+    let mut first = usize::MAX;
+    let mut last = 0;
+    let mut cpu_modified = false;
+    for at in (0..vector_end).step_by(32) {
+        // SAFETY: [at, at + 32) is in all three slices and loads can be unaligned.
+        let (title_bytes, old_bytes, gpu_bytes) = unsafe {
+            (
+                _mm256_loadu_si256(title.as_ptr().add(at).cast()),
+                _mm256_loadu_si256(staging_old.as_ptr().add(at).cast()),
+                _mm256_loadu_si256(gpu_new.as_ptr().add(at).cast()),
+            )
+        };
+        let gpu_unchanged = _mm256_cmpeq_epi8(gpu_bytes, old_bytes);
+        let gpu_unchanged_bits = _mm256_movemask_epi8(gpu_unchanged) as u32;
+        let title_differs = !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(title_bytes, gpu_bytes)) as u32);
+        let cpu_changed_bits = gpu_unchanged_bits & title_differs;
+        cpu_modified |= cpu_changed_bits != 0;
+
+        if gpu_unchanged_bits != u32::MAX || cpu_changed_bits != 0 {
+            let merged = _mm256_blendv_epi8(gpu_bytes, title_bytes, gpu_unchanged);
+            // SAFETY: [at, at + 32) is in the mutable staging slice; unaligned store.
+            unsafe { _mm256_storeu_si256(staging_old.as_mut_ptr().add(at).cast(), merged) };
+        }
+
+        let mut title_changes = !gpu_unchanged_bits & title_differs;
+        if title_changes != 0 {
+            first = first.min(at + title_changes.trailing_zeros() as usize);
+            last = at + 32 - title_changes.leading_zeros() as usize;
+            // Only write the selected bytes, as the scalar merge does. The
+            // unchanged bytes still carry the title's concurrent CPU writes.
+            while title_changes != 0 {
+                let start = title_changes.trailing_zeros() as usize;
+                let end = start + (title_changes >> start).trailing_ones() as usize;
+                title[at + start..at + end].copy_from_slice(&gpu_new[at + start..at + end]);
+                title_changes &= u32::MAX.checked_shl(end as u32).unwrap_or(0);
+            }
+        }
+    }
+
+    let (tail, cpu_tail) = merge_gpu_writes_card_scalar(
+        &mut title[vector_end..n],
+        &mut staging_old[vector_end..n],
+        &gpu_new[vector_end..n],
+    );
+    if let Some((start, end)) = tail {
+        first = first.min(vector_end + start);
+        last = vector_end + end;
+    }
+    ((first < last).then_some((first, last)), cpu_modified || cpu_tail)
+}
+
+fn merge_gpu_writes_card_scalar(
     title: &mut [u8],
     staging_old: &mut [u8],
     gpu_new: &[u8],
@@ -2398,6 +2542,101 @@ pub(crate) fn near(va: u64) -> String {
 mod tests {
     use super::*;
     use std::ops::Range;
+
+    #[test]
+    fn sparse_copy_back_keeps_gpu_and_cpu_changes_on_disjoint_bytes() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        struct Reservation(*mut u8);
+        impl Drop for Reservation {
+            fn drop(&mut self) {
+                // SAFETY: this is the live allocation received from VirtualAlloc.
+                unsafe { VirtualFree(self.0.cast(), 0, MEM_RELEASE) };
+            }
+        }
+        const TILES: usize = 24;
+        const SIZE: usize = TILES * PAGE;
+        // SAFETY: creates a private, page-aligned writable region for the test.
+        let base = unsafe {
+            VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        }
+        .cast::<u8>();
+        assert!(!base.is_null());
+        let _reservation = Reservation(base);
+        let Some(shadow) = sparse_buffer(base as u64, SIZE as u64, None) else {
+            eprintln!("no sparse D3D12 buffer; skipped");
+            return;
+        };
+        let sparse = shadow.sparse.as_ref().unwrap();
+        for tile in 0..TILES {
+            let address = base as usize + tile * PAGE;
+            let view = shadow.tile(sparse, address).expect("a mapped tile");
+            // SAFETY: both views contain this tile's writable bytes.
+            unsafe {
+                (address as *mut u8).write_bytes(7, PAGE);
+                (view as *mut u8).write_bytes(7, PAGE);
+            }
+        }
+        let begin = base as usize + 3;
+        let length = SIZE - 9;
+        shadow.writing(begin, length);
+        assert_eq!(sparse.before.lock().unwrap().len(), TILES);
+        for tile in 0..TILES {
+            let address = base as usize + tile * PAGE;
+            let view = shadow.tile(sparse, address).unwrap();
+            // SAFETY: both offsets are inside the views. Simulate writes to
+            // different bytes by the GPU and the title CPU.
+            unsafe {
+                (view as *mut u8).add(17).write(13);
+                (address as *mut u8).add(33).write(29);
+            }
+        }
+        assert_eq!(shadow.copy_back(begin, length), TILES);
+        assert!(sparse.before.lock().unwrap().is_empty());
+        for tile in 0..TILES {
+            // SAFETY: the reservation is still alive and the test owns it.
+            let bytes = unsafe { std::slice::from_raw_parts(base.add(tile * PAGE), PAGE) };
+            assert_eq!((bytes[16], bytes[17], bytes[18], bytes[33]), (7, 13, 7, 29));
+        }
+    }
+
+    #[test]
+    fn card_merge_matches_scalar_for_unaligned_pages_and_tails() {
+        for len in [0, 1, 31, 32, 33, 63, 64, 65, PAGE - 1, PAGE] {
+            let initial = vec![42u8; len + 4];
+            let mut title = initial.clone();
+            let mut staging = initial.clone();
+            let mut gpu = initial;
+            for i in 0..len {
+                let offset = i % 127;
+                if (31..64).contains(&offset) || i % 17 == 0 {
+                    gpu[i + 3] = 53;
+                }
+                if i % 7 == 0 {
+                    title[i + 1] = 61;
+                } else if i % 11 == 0 {
+                    title[i + 1] = gpu[i + 3];
+                }
+            }
+
+            let mut reference_title = title.clone();
+            let mut reference_staging = staging.clone();
+            let reference = merge_gpu_writes_card_scalar(
+                &mut reference_title[1..1 + len],
+                &mut reference_staging[2..3 + len],
+                &gpu[3..],
+            );
+            let result = merge_gpu_writes_card(
+                &mut title[1..1 + len],
+                &mut staging[2..3 + len],
+                &gpu[3..],
+            );
+            assert_eq!(result, reference, "length {len}");
+            assert_eq!(title, reference_title, "title at length {len}");
+            assert_eq!(staging, reference_staging, "staging at length {len}");
+        }
+    }
 
     #[test]
     fn partial_match_leaves_unchecked_bytes_visible() {

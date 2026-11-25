@@ -22,7 +22,8 @@
 //! for screen passes) are guesses; another pass the title runs only once
 //! and whose pipeline takes longer is lost.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -33,7 +34,7 @@ use super::host::{GraphicsState, HostPipeline};
 pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
-    queued: AtomicBool,
+    queue_state: AtomicU8,
     made: OnceLock<Option<HostPipeline>>,
     /// Its worker was lost to it: it will not be made.
     lost: AtomicBool,
@@ -63,7 +64,7 @@ impl Pending {
             screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
             shaders,
             graphics,
-            queued: AtomicBool::new(false),
+            queue_state: AtomicU8::new(NEW),
             made: OnceLock::new(),
             lost: AtomicBool::new(false),
             key: key.finalize().to_hex()[..32].to_owned(),
@@ -75,9 +76,7 @@ impl Pending {
         // Not `get_or_init`: a worker lost in it would leave it locked.
         let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
         let _ = self.made.set(made);
-        let (lock, done) = &DONE;
-        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
-        done.notify_all();
+        wake_waiters();
     }
 }
 
@@ -107,6 +106,12 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
+fn wake_waiters() {
+    let (lock, done) = &DONE;
+    let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    done.notify_all();
+}
+
 /// Waiting allowed per title frame, over all threads.
 const BUDGET: Duration = Duration::from_millis(500);
 
@@ -125,8 +130,8 @@ pub(crate) fn waiting() -> u64 {
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
-        start(p);
-        if p.lost.load(Ordering::Relaxed) {
+        start(p, REQUESTED);
+        if p.lost.load(Ordering::Acquire) {
             return None;
         }
         // Also with a world's worth queued: passes the title runs only once
@@ -140,20 +145,12 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     made
 }
 
-/// Queues `p` for the workers, once.
-fn start(p: &Arc<Pending>) {
-    if !p.queued.swap(true, Ordering::Relaxed) {
-        PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
-        queue(p.clone());
-    }
-}
-
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p);
+        start(p, EARLY);
     }
 }
 
@@ -171,7 +168,7 @@ fn wait(p: &Pending, frame: u64) {
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() {
+    while p.made.get().is_none() && !p.lost.load(Ordering::Acquire) {
         let rest = left.saturating_sub(started.elapsed());
         if rest.is_zero() {
             break;
@@ -181,15 +178,129 @@ fn wait(p: &Pending, frame: u64) {
     waited.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
-/// What the workers take from: the ordinary pipelines, the screen passes.
-static RECEIVER: [OnceLock<Mutex<std::sync::mpsc::Receiver<Arc<Pending>>>>; 2] =
-    [const { OnceLock::new() }; 2];
+const NEW: u8 = 0;
+const EARLY: u8 = 1;
+const REQUESTED: u8 = 2;
+const CLAIMED: u8 = 3;
+
+#[derive(Default)]
+struct Queue {
+    early: VecDeque<Arc<Pending>>,
+    requested: VecDeque<Arc<Pending>>,
+    workers: usize,
+}
+
+impl Queue {
+    /// Returns whether this is a new job or a promotion. Once claimed, a job
+    /// cannot be queued again even if the driver fails to compile it.
+    fn push(&mut self, p: &Arc<Pending>, priority: u8) -> Option<bool> {
+        let prev = p.queue_state.load(Ordering::Relaxed);
+        if prev >= priority {
+            return None;
+        }
+        p.queue_state.store(priority, Ordering::Relaxed);
+        match priority {
+            REQUESTED => self.requested.push_back(p.clone()),
+            EARLY => self.early.push_back(p.clone()),
+            _ => unreachable!("invalid pipeline priority"),
+        }
+        Some(prev == NEW)
+    }
+
+    fn pop(&mut self) -> Option<Arc<Pending>> {
+        let next = self.requested.pop_front().or_else(|| {
+            // A promoted entry's old prewarm reference can still be here.
+            std::iter::from_fn(|| self.early.pop_front())
+                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+        })?;
+        next.queue_state.store(CLAIMED, Ordering::Relaxed);
+        Some(next)
+    }
+
+    fn fail_waiting(&mut self) -> u64 {
+        let mut failed = 0;
+        while let Some(p) = self.pop() {
+            p.lost.store(true, Ordering::Release);
+            failed += 1;
+        }
+        failed
+    }
+}
+
+struct Pool {
+    queue: Mutex<Queue>,
+    available: Condvar,
+    started: OnceLock<()>,
+}
+
+impl Pool {
+    const fn new() -> Self {
+        Self {
+            queue: Mutex::new(Queue {
+                early: VecDeque::new(),
+                requested: VecDeque::new(),
+                workers: 0,
+            }),
+            available: Condvar::new(),
+            started: OnceLock::new(),
+        }
+    }
+
+    fn next(&self) -> Arc<Pending> {
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(p) = queue.pop() {
+                return p;
+            }
+            queue = self.available.wait(queue).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// Keep the screen passes' workers independent of the ordinary pipelines.
+static POOLS: [Pool; 2] = [const { Pool::new() }; 2];
+
+/// Queue a prewarm job or promote a job needed by a draw. Claims and
+/// promotions are serialized by the pool's queue lock.
+fn start(p: &Arc<Pending>, priority: u8) {
+    if p.queue_state.load(Ordering::Relaxed) >= priority {
+        return;
+    }
+    let pool = &POOLS[usize::from(p.screen)];
+    pool.started.get_or_init(|| {
+        let mut queue = pool.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let count = if p.screen {
+            2
+        } else {
+            std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
+        };
+        for i in 0..count {
+            queue.workers += usize::from(worker(i + if p.screen { 50 } else { 0 }, p.screen));
+        }
+    });
+    let mut queue = pool.queue.lock().unwrap_or_else(|e| e.into_inner());
+    if queue.workers == 0 {
+        // The driver's crash handler can park a compiler thread. Compiling
+        // here would expose the game's recording thread to that failure.
+        p.queue_state.store(CLAIMED, Ordering::Relaxed);
+        p.lost.store(true, Ordering::Release);
+        drop(queue);
+        wake_waiters();
+        return;
+    }
+    if let Some(new) = queue.push(p, priority) {
+        if new {
+            PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+        }
+        pool.available.notify_one();
+    }
+}
 
 /// What the workers (by thread) are making.
 static AT_WORK: Mutex<Vec<(u32, Arc<Pending>)>> = Mutex::new(Vec::new());
 
 /// Starts worker `i`, for screen passes or for the others.
-fn worker(i: usize, screen: bool) {
+fn worker(i: usize, screen: bool) -> bool {
     let spawned = std::thread::Builder::new()
         .name(format!("victory-pipelines-{i}"))
         .spawn(move || {
@@ -199,15 +310,21 @@ fn worker(i: usize, screen: bool) {
                 use windows::Win32::System::Threading::*;
                 let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
             }
-            let Some(receiver) = RECEIVER[usize::from(screen)].get() else { return };
+            let pool = &POOLS[usize::from(screen)];
             loop {
-                let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                let Ok(p) = next else { return };
+                let p = pool.next();
                 // SAFETY: a plain call.
                 let id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
                 AT_WORK.lock().unwrap_or_else(|e| e.into_inner()).push((id, p.clone()));
                 p.make();
-                AT_WORK.lock().unwrap_or_else(|e| e.into_inner()).retain(|w| w.0 != id);
+                let tracked = {
+                    let mut working = AT_WORK.lock().unwrap_or_else(|e| e.into_inner());
+                    working.iter().position(|w| w.0 == id).map(|i| working.swap_remove(i))
+                };
+                if tracked.is_none() {
+                    // A watchdog already accounted for and replaced this worker.
+                    return;
+                }
                 if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                     drained();
                 } else {
@@ -217,7 +334,9 @@ fn worker(i: usize, screen: bool) {
         });
     if let Err(e) = spawned {
         tracing::warn!(error = %e, "no pipeline worker");
+        return false;
     }
+    true
 }
 
 /// A worker is lost to a compile that crashed or never ends: another takes
@@ -228,40 +347,25 @@ pub(super) fn worker_lost(id: u32) {
     let mut lost = None;
     AT_WORK.lock().unwrap_or_else(|e| e.into_inner()).retain(|w| {
         if w.0 == id {
-            w.1.lost.store(true, Ordering::Relaxed);
+            w.1.lost.store(true, Ordering::Release);
             lost = Some(w.1.screen);
         }
         w.0 != id
     });
     if let Some(screen) = lost {
-        WAITING.fetch_sub(1, Ordering::Relaxed);
-        worker(LOST.fetch_add(1, Ordering::Relaxed), screen);
-    }
-}
-
-/// Hands `p` to the workers (half the logical processors, 2 to 8, and two
-/// for screen passes), started on first use.
-fn queue(p: Arc<Pending>) {
-    static SENDER: [OnceLock<std::sync::mpsc::Sender<Arc<Pending>>>; 2] =
-        [const { OnceLock::new() }; 2];
-    let screen = p.screen;
-    let sender = SENDER[usize::from(screen)].get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
-        let _ = RECEIVER[usize::from(screen)].set(Mutex::new(receiver));
-        let workers = if screen {
-            2
-        } else {
-            std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
+        let pool = &POOLS[usize::from(screen)];
+        let failed = {
+            let mut queue = pool.queue.lock().unwrap_or_else(|e| e.into_inner());
+            if !worker(LOST.fetch_add(1, Ordering::Relaxed), screen) {
+                queue.workers -= 1;
+            }
+            if queue.workers == 0 { queue.fail_waiting() } else { 0 }
         };
-        for i in 0..workers {
-            worker(i + if screen { 50 } else { 0 }, screen);
+        let finished = WAITING.fetch_sub(failed + 1, Ordering::Relaxed) == failed + 1;
+        wake_waiters();
+        if finished {
+            drained();
         }
-        sender
-    });
-    if let Err(e) = sender.send(p) {
-        // No worker: made here instead.
-        e.0.make();
-        WAITING.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -293,11 +397,52 @@ mod tests {
     fn first_use_is_made_by_a_worker() {
         let p = Arc::new(Pending::new(Vec::new(), None));
         assert!(ready(&p).is_none());
-        assert!(p.queued.load(Ordering::Relaxed));
+        assert_ne!(p.queue_state.load(Ordering::Relaxed), NEW);
         let started = Instant::now();
         while p.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn requested_pipelines_take_priority_and_promotions_compile_once() {
+        let warm = Arc::new(Pending::new(Vec::new(), None));
+        let promote = Arc::new(Pending::new(Vec::new(), None));
+        let requested = Arc::new(Pending::new(Vec::new(), None));
+        let mut queue = Queue::default();
+        assert_eq!(queue.push(&warm, EARLY), Some(true));
+        assert_eq!(queue.push(&promote, EARLY), Some(true));
+        assert_eq!(queue.push(&promote, REQUESTED), Some(false));
+        assert_eq!(queue.push(&promote, REQUESTED), None);
+        assert_eq!(queue.push(&requested, REQUESTED), Some(true));
+        for expected in [&promote, &requested, &warm] {
+            assert!(Arc::ptr_eq(&queue.pop().unwrap(), expected));
+            assert_eq!(queue.push(expected, REQUESTED), None);
+        }
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn lost_pipeline_does_not_spend_the_frame_wait_budget() {
+        let p = Pending::new(Vec::new(), None);
+        p.lost.store(true, Ordering::Release);
+        let start = Instant::now();
+        wait(&p, u64::MAX - 1);
+        assert!(start.elapsed() < BUDGET, "a lost worker cannot finish");
+    }
+
+    #[test]
+    fn failing_a_queue_marks_each_promoted_job_only_once() {
+        let early = Arc::new(Pending::new(Vec::new(), None));
+        let promoted = Arc::new(Pending::new(Vec::new(), None));
+        let mut queue = Queue::default();
+        queue.push(&early, EARLY);
+        queue.push(&promoted, EARLY);
+        queue.push(&promoted, REQUESTED);
+        assert_eq!(queue.fail_waiting(), 2);
+        assert!(early.lost.load(Ordering::Acquire));
+        assert!(promoted.lost.load(Ordering::Acquire));
+        assert!(queue.pop().is_none());
     }
 }

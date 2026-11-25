@@ -3,8 +3,8 @@
 Status: steps 1, 2, 4 and 5 are in. On NVIDIA, wave64 programs whose lanes
 read only their own half run as two 32-lane waves. Groups of one console
 wave also run in the console flow: masks read whole, lanes of the other
-half, divergent branches and loops. Still open: groups of several console
-waves, LDS, whole-wave sections and `ds_(b)permute`.
+half, divergent branches, loops and single-wave LDS. Still open: groups of
+several console waves, whole-wave sections and `ds_permute_b32` scatter.
 
 ## The problem
 
@@ -45,14 +45,20 @@ of each host wave adds 32 to it when the wave starts and shares the result,
 and the wave's lanes take the next 32 console threads in lane order.
 
 **What stays inside a half** needs nothing: DPP16 and DPP8 (rows of 16,
-groups of 8), `ds_swizzle` (groups of 32 or 4), and `v_permlane16` /
-`v_permlanex16` (the two rows of a 32-lane half; not lowered at all yet).
-Their lowering computes the source lane from the host lane's place in its
-row or group, so it is unchanged in the split form.
+groups of 8), `ds_swizzle` (groups of 32 or 4), and `ds_bpermute_b32`
+(gather within 32 lanes). `v_permlane16` and `v_permlanex16` also stay
+within a half, but their lowering does not yet support the split form.
+The split DPP and `ds_swizzle` paths use the same source-lane calculation
+as on a native Wave64 host.
+
+RDNA 2 takes the gather index from bits 6:2 of the byte address. A
+gather in the upper half maps that index to the upper half on a native
+Wave64 host. The DXIL lowering checks the ballot before reading the lane,
+so an EXEC-disabled or absent source gives zero on either host.
 
 Step 4 (`split` in `Lower::new`) runs a program as two 32-lane waves when
 the host has no 64-lane waves and the program:
-- reads other lanes only through DPP and `ds_swizzle`;
+- reads other lanes only through DPP, `ds_swizzle` or `ds_bpermute_b32`;
 - reads no mask whole and tests no bit of a mask held as a number;
 - has no whole-wave sections (their reductions would cover a half);
 - uses no LDS (the console compiler may have left out barriers between
@@ -71,7 +77,6 @@ already did for every wave64 program without a declared wave size.
 | `v_mbcnt_lo` in the upper half | the lower half's ballot |
 | `v_readlane`, `v_readfirstlane` (uniform lane) | the value of lane `l & 31` from the half that owns `l` |
 | `v_writelane` to the other half | the value and lane |
-| `ds_bpermute`, `ds_permute` | open: check whether GFX10 wave64 crosses halves for these, then 32 words per half if it does |
 
 A mask read only lane by lane (a `v_cndmask` selector, a carry-in) needs
 just the lane's own half. Exchanging those anyway is correct but slow.
@@ -112,9 +117,16 @@ does (step 5, `lower::CONSOLE_FLOW`):
 
 `lower` tries the per-lane form first. A program that needs the console
 flow stops with `CONSOLE_FLOW`, and `emit` lowers it again from the
-console structure. Eligible: wave64 compute on a host without 64-lane
-waves, at most 64 threads per group, no LDS, no `ds_(b)permute`, and no
-whole-wave sections.
+console structure. Eligible: wave64 compute on a 32-lane host, at most
+64 threads per group, no `ds_permute_b32` and no whole-wave sections.
+
+For a single wave using LDS, the lowering emits a group barrier after each
+LDS instruction, after both halves have rejoined from any EXEC guard.
+Reads with an inactive EXEC lane skip the memory access. The group's LDS
+and the two exchange dwords must fit in 32 KiB. Address-based dispatches
+that can let individual threads return early are ineligible for this LDS
+path. `emit::split_tests` checks a read across halves inside a masked
+branch against known output values.
 
 Groups of several console waves still need another meeting point: a group
 barrier would wait for console waves elsewhere. The plan stays per-console-
@@ -169,7 +181,7 @@ takes `WaveSize(64)`, the NVIDIA reports 32-32).
    whose waves already meet at barriers.
 5. ~~The console flow and the one-wave exchange (ballots, readlane,
    readfirstlane, writelane, mbcnt, divergent branches and loops).~~
-6. Multi-wave groups (counters), then one-wave LDS sharing.
+6. Multi-wave groups (counters). One-wave LDS sharing is implemented.
 
 ## Credit
 

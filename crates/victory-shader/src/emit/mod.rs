@@ -125,21 +125,15 @@ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 /// The iteration count after which a translated loop is left, per lane and
 /// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
 ///
-/// With the `diagnostics` feature, `VICTORY_SHADER_LOOP_LIMIT` (decimal or
-/// `0x` hex, at least 1) sets it instead. A loop that hits the limit in
+/// An explicit `VICTORY_SHADER_LOOP_LIMIT` (decimal or `0x` hex, at least 1)
+/// sets it in any build. A loop that hits the limit in
 /// every lane of a full-screen pass still runs for seconds (2^20 times a
 /// 4K screen is about 10^13 iterations); a much lower limit shows whether
 /// such loops are what makes a frame slow. The value is part of the
 /// translation, so the shader cache must key on it (`victory-gpu`'s does).
 pub fn loop_limit() -> u32 {
     static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        if cfg!(feature = "diagnostics") {
-            parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
-        } else {
-            lower::LOOP_LIMIT
-        }
-    })
+    *LIMIT.get_or_init(|| parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref()))
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -1971,6 +1965,34 @@ mod barycentric_tests {
             v.validate(&mut shader.dxil.clone()).unwrap();
         }
         let _ = shader;
+    }
+
+    #[test]
+    fn pixel_quad_swizzles_and_dpp8_translate_without_crossing_quads() {
+        let [e0, e1] = exp_mrt0(3);
+        let swizzle = |instruction: [u32; 2]| {
+            pixel(
+                &[
+                    0xc808_0000, 0xc809_0001, // interpolate attr0.x into v2
+                    instruction[0], instruction[1], e0, e1, 0xbf81_0000,
+                ],
+                PERSP_CENTER,
+            )
+        };
+        for pattern in [0x00, 0x55, 0xaa, 0xff, 0xb1, 0x4e, 0x1b, 0xe4, 0x27] {
+            // ds_swizzle_b32 v3,v2 and v_mov_b32 v3,v2 quad_perm.
+            validate(&swizzle([0xd8d4_8000 | pattern, 0x0300_0002]).unwrap());
+            validate(&swizzle([0x7e06_02fa, 0xff00_0002 | pattern << 8]).unwrap());
+        }
+
+        // DPP8 selects a different permutation in each quad of the octet.
+        let sources = [3u32, 0, 2, 1, 4, 6, 5, 7];
+        let selectors = sources.into_iter().enumerate().fold(0, |bits, (lane, source)| {
+            bits | source << (3 * lane)
+        });
+        let dpp8 = |selectors: u32| [0x7e06_02e9, (selectors << 8) | 2];
+        validate(&swizzle(dpp8(selectors)).unwrap());
+        assert!(swizzle(dpp8(selectors ^ 4)).is_err(), "lane 0 reads lane 7");
     }
 
     /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as
