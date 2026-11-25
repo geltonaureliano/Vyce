@@ -374,12 +374,9 @@ impl Shadow {
         if !synced_pages.is_empty() && mode != NOT_WATCHED && min_addr < max_addr {
             let (first, last) = (min_addr.div_ceil(PAGE), max_addr / PAGE);
             if first < last {
-                let res = if mode == WATCHED_GUARDED {
-                    crate::watch::writes_guarded(first * PAGE, last * PAGE)
-                } else {
-                    crate::watch::writes(first * PAGE, last * PAGE, true)
-                };
-                if let Some((now, _)) = res {
+                if let Some(now) =
+                    crate::watch::copy_epoch(first * PAGE, last * PAGE, mode == WATCHED_GUARDED)
+                {
                     let base = start / PAGE;
                     let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                     for page in synced_pages {
@@ -524,9 +521,22 @@ impl Shadow {
             Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
             None => (from, to),
         };
-        if let Some((at, bytes)) = &*before
-            && (*at, at + bytes.len()) == (start, end)
+        if let Some((at, bytes)) = before.as_mut()
+            && *at == start
         {
+            let old_end = start + bytes.len();
+            if end > old_end {
+                let needed = end - start;
+                if needed > bytes.capacity() {
+                    // Reserve geometrically for successive extensions, but
+                    // do not reserve beyond this entire shadow.
+                    let capacity = bytes.capacity().saturating_mul(2).max(needed).min(self.len as usize);
+                    bytes.reserve_exact(capacity - bytes.len());
+                }
+                // Keep the old baseline even if the existing bytes have
+                // changed. Only the new suffix belongs to this recording.
+                bytes.extend_from_slice(host(old_end, end));
+            }
             return;
         }
         // Parts newly covered from the copy, the rest as it was taken.
@@ -565,13 +575,14 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = &*snapshot
+        if let Some((taken, before)) = snapshot.as_mut()
             && *taken <= from
-            && to <= taken + before.len()
+            && to <= *taken + before.len()
             && from < to
         {
+            let taken = *taken;
             unchanged.begin(start + taken, start + taken + before.len());
-            let before = &before[from - taken..to - taken];
+            let before = &mut before[from - taken..to - taken];
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             // An unchanged page is never modified by copy-back, so later
@@ -585,7 +596,7 @@ impl Shadow {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
+                let old = &mut before[at - from..at - from + n];
                 if unchanged.differs(start + at, host, old) {
                     let buf = title.get_or_insert_with(|| {
                         let mut v = pooled(PAGE);
@@ -594,10 +605,11 @@ impl Shadow {
                     });
                     let title_slice = &mut buf[..n];
                     if crate::host::read_into((start + at) as *const u8, title_slice) {
-                        // Title memory with the GPU's bytes put in; the copy
-                        // takes the title's bytes in turn.
+                        // Advance the baseline only for bytes just merged.
+                        // An overlapping range must not treat CPU bytes we
+                        // copied into the shadow as a new GPU write.
                         if let Some((dirty_start, dirty_end)) =
-                            merge_gpu_writes(title_slice, host, old)
+                            merge_gpu_writes_mut(title_slice, host, old)
                         {
                             let dirty_len = dirty_end - dirty_start;
                             if mode != 1 {
@@ -623,12 +635,9 @@ impl Shadow {
             // they had (a title write there shows at the next refresh).
             let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
             if first < last && !synced.is_empty() && mode != NOT_WATCHED {
-                let res = if mode == WATCHED_GUARDED {
-                    crate::watch::writes_guarded(first * PAGE, last * PAGE)
-                } else {
-                    crate::watch::writes(first * PAGE, last * PAGE, true)
-                };
-                if let Some((now, _)) = res {
+                if let Some(now) =
+                    crate::watch::copy_epoch(first * PAGE, last * PAGE, mode == WATCHED_GUARDED)
+                {
                     let base = start / PAGE;
                     let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                     for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
@@ -2072,11 +2081,63 @@ impl Shadow {
     }
 }
 
-/// Merges bytes the GPU changed (`host != old`) into `title`, syncs `host` to
-/// `title`, and returns the tight `[first, last)` byte span where `title` was
-/// modified (or `None` if nothing changed). Scans 8 bytes at a time so
-/// unchanged 64-bit words skip per-byte branching.
-fn merge_gpu_writes(title: &mut [u8], host: &mut [u8], old: &[u8]) -> Option<(usize, usize)> {
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn merge_gpu_writes_avx2(
+    title: &mut [u8],
+    host: &mut [u8],
+    old: &[u8],
+) -> Option<(usize, usize)> {
+    use std::arch::x86_64::{
+        _mm256_blendv_epi8, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
+        _mm256_storeu_si256,
+    };
+
+    let n = title.len().min(host.len()).min(old.len());
+    let vector_end = n / 32 * 32;
+    let mut first = usize::MAX;
+    let mut last = 0;
+    for at in (0..vector_end).step_by(32) {
+        // SAFETY: the vector fits in all three slices, with no alignment requirement.
+        let (title_bytes, gpu_bytes, old_bytes) = unsafe {
+            (
+                _mm256_loadu_si256(title.as_ptr().add(at).cast()),
+                _mm256_loadu_si256(host.as_ptr().add(at).cast()),
+                _mm256_loadu_si256(old.as_ptr().add(at).cast()),
+            )
+        };
+        let gpu_unchanged = _mm256_cmpeq_epi8(gpu_bytes, old_bytes);
+        let unchanged_bits = _mm256_movemask_epi8(gpu_unchanged) as u32;
+        let differing_bits = !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(title_bytes, gpu_bytes)) as u32);
+        if differing_bits == 0 {
+            continue;
+        }
+        let merged = _mm256_blendv_epi8(gpu_bytes, title_bytes, gpu_unchanged);
+        let title_changes = !unchanged_bits & differing_bits;
+        if title_changes != 0 {
+            first = first.min(at + title_changes.trailing_zeros() as usize);
+            last = at + 32 - title_changes.leading_zeros() as usize;
+            // SAFETY: the vector fits in the title snapshot; unchanged bytes keep their value.
+            unsafe { _mm256_storeu_si256(title.as_mut_ptr().add(at).cast(), merged) };
+        }
+        if unchanged_bits & differing_bits != 0 {
+            // SAFETY: the vector fits in the mutable host copy.
+            unsafe { _mm256_storeu_si256(host.as_mut_ptr().add(at).cast(), merged) };
+        }
+    }
+    if let Some((a, b)) = merge_gpu_writes_scalar(
+        &mut title[vector_end..n],
+        &mut host[vector_end..n],
+        &old[vector_end..n],
+    ) {
+        first = first.min(vector_end + a);
+        last = vector_end + b;
+    }
+    (first < last).then_some((first, last))
+}
+
+#[cfg(any(target_arch = "x86_64", test))]
+fn merge_gpu_writes_scalar(title: &mut [u8], host: &mut [u8], old: &[u8]) -> Option<(usize, usize)> {
     let n = title.len().min(host.len()).min(old.len());
     let mut first = usize::MAX;
     let mut last = 0usize;
@@ -2111,13 +2172,21 @@ fn merge_gpu_writes(title: &mut [u8], host: &mut [u8], old: &[u8]) -> Option<(us
     (first < last).then_some((first, last))
 }
 
-/// Same as [`merge_gpu_writes`], also updating `old` to match `title`.
+/// Applies the GPU changes (`host != old`) to the title snapshot. It returns
+/// the dirty byte span and updates the shadow and baseline to the merged bytes.
 fn merge_gpu_writes_mut(
     title: &mut [u8],
     host: &mut [u8],
     old: &mut [u8],
 ) -> Option<(usize, usize)> {
     let n = title.len().min(host.len()).min(old.len());
+    #[cfg(target_arch = "x86_64")]
+    if n >= 32 && std::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 is available on this CPU.
+        let result = unsafe { merge_gpu_writes_avx2(title, host, old) };
+        old[..n].copy_from_slice(&host[..n]);
+        return result;
+    }
     let mut first = usize::MAX;
     let mut last = 0usize;
     let mut i = 0;
@@ -2544,6 +2613,110 @@ mod tests {
     use std::ops::Range;
 
     #[test]
+    fn growing_snapshot_keeps_the_first_seen_bytes() {
+        let Some(host) = crate::host::Host::new_warp() else { return };
+        const BASE: usize = 0x10000;
+        const PAGES: usize = 32;
+        const SIZE: usize = PAGES * PAGE;
+        let (buffer, data) = host.shared_buffer(SIZE as u64).expect("host shadow buffer");
+        // SAFETY: a live buffer with a writable mapping of SIZE bytes.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let shadow = Shadow::new(buffer, data, gpu, BASE as u64, SIZE as u64, None);
+        // SAFETY: the test has sole access to the mapped buffer.
+        unsafe { data.write_bytes(7, SIZE) };
+        shadow.writing(BASE + PAGE, PAGE);
+
+        // Make spare capacity deterministic even if another test used the pool.
+        let snapshot_ptr = {
+            let mut before = shadow.before.lock().unwrap();
+            let (at, bytes) = before.snapshot.as_mut().unwrap();
+            assert_eq!(*at, PAGE);
+            let mut reserved = Vec::with_capacity(2 * PAGE);
+            reserved.extend_from_slice(bytes);
+            *bytes = reserved;
+            bytes.as_ptr()
+        };
+        // SAFETY: distinct pages of the test's host buffer.
+        unsafe {
+            data.add(PAGE).write_bytes(99, PAGE);
+            data.add(2 * PAGE).write_bytes(11, PAGE);
+        }
+        shadow.writing(BASE + 2 * PAGE, PAGE);
+        {
+            let before = shadow.before.lock().unwrap();
+            let (_, bytes) = before.snapshot.as_ref().unwrap();
+            assert_eq!(bytes.as_ptr(), snapshot_ptr, "an extension with spare capacity stays in place");
+            assert!(bytes[..PAGE].iter().all(|&byte| byte == 7));
+            assert!(bytes[PAGE..].iter().all(|&byte| byte == 11));
+        }
+
+        for page in 3..PAGES {
+            // SAFETY: this page is inside the test's host buffer.
+            unsafe { data.add(page * PAGE).write_bytes(page as u8, PAGE) };
+            shadow.writing(BASE + page * PAGE, PAGE);
+        }
+        shadow.writing(BASE + PAGE, 2 * PAGE);
+        {
+            let before = shadow.before.lock().unwrap();
+            let (at, bytes) = before.snapshot.as_ref().unwrap();
+            assert_eq!(*at, PAGE);
+            assert_eq!(bytes.len(), SIZE - PAGE);
+            assert!(bytes.capacity() <= SIZE);
+            for (page, chunk) in (1..PAGES).zip(bytes.chunks_exact(PAGE)) {
+                let expected = match page { 1 => 7, 2 => 11, _ => page as u8 };
+                assert!(chunk.iter().all(|&byte| byte == expected), "snapshot page {page}");
+            }
+        }
+
+        // The old growth path must preserve the baseline when it prepends.
+        // SAFETY: the first page of the test's host buffer.
+        unsafe { data.write_bytes(5, PAGE) };
+        shadow.writing(BASE, PAGE);
+        let before = shadow.before.lock().unwrap();
+        let (at, bytes) = before.snapshot.as_ref().unwrap();
+        assert_eq!((*at, bytes.len()), (0, SIZE));
+        assert!(bytes[..PAGE].iter().all(|&byte| byte == 5));
+        assert!(bytes[PAGE..2 * PAGE].iter().all(|&byte| byte == 7));
+    }
+
+    #[test]
+    fn dense_overlapping_copy_back_preserves_later_cpu_writes() {
+        let Some(host) = crate::host::Host::new_warp() else { return };
+        let mut title = vec![7u8; 2 * PAGE];
+        let base = title.as_mut_ptr() as usize;
+        let address = base.next_multiple_of(PAGE);
+        let offset = address - base;
+
+        let (buffer, data) = host.shared_buffer(PAGE as u64).expect("host shadow buffer");
+        // SAFETY: the test owns the live buffer and its PAGE-byte mapping.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let shadow = Shadow::new(buffer, data, gpu, address as u64, PAGE as u64, None);
+        shadow.watched.store(NOT_WATCHED, Ordering::Relaxed);
+        unsafe { data.write_bytes(7, PAGE) };
+        shadow.writing(address, 48);
+        shadow.writing(address + 8, 72);
+
+        title[offset + 10] = 2;
+        // SAFETY: the test models two GPU writes to its own mapped buffer.
+        unsafe {
+            data.add(20).write(17);
+            data.add(64).write(23);
+        }
+        assert_eq!(shadow.copy_back(address, 48), 1);
+        assert_eq!((title[offset + 10], title[offset + 20], title[offset + 64]), (2, 17, 7));
+
+        // The CPU writes to the overlap after the first copy-back. The
+        // remaining GPU byte must land without reverting either CPU byte.
+        title[offset + 10] = 3;
+        title[offset + 20] = 9;
+        assert_eq!(shadow.copy_back(address + 8, 72), 1);
+        assert_eq!((title[offset + 10], title[offset + 20], title[offset + 64]), (3, 9, 23));
+        let before = shadow.before.lock().unwrap();
+        assert!(before.snapshot.is_none());
+        assert!(before.unchanged.pages.is_empty());
+    }
+
+    #[test]
     fn sparse_copy_back_keeps_gpu_and_cpu_changes_on_disjoint_bytes() {
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
@@ -2598,6 +2771,43 @@ mod tests {
             // SAFETY: the reservation is still alive and the test owns it.
             let bytes = unsafe { std::slice::from_raw_parts(base.add(tile * PAGE), PAGE) };
             assert_eq!((bytes[16], bytes[17], bytes[18], bytes[33]), (7, 13, 7, 29));
+        }
+    }
+
+    #[test]
+    fn copy_back_merges_match_scalar_for_unaligned_slices_and_tails() {
+        for len in [0, 1, 31, 32, 33, 63, 64, 65, PAGE - 1, PAGE] {
+            let old = vec![42; len + 5];
+            let mut title = vec![42; len + 5];
+            let mut host = title.clone();
+            for i in 0..len {
+                if (31..64).contains(&(i % 127)) || i % 17 == 0 {
+                    host[i + 1] = 53;
+                }
+                if i % 9 == 0 {
+                    title[i + 3] = 87;
+                } else if i % 3 == 0 {
+                    title[i + 3] = 53;
+                }
+            }
+
+            let (mut expected_title, mut expected_host) = (title.clone(), host.clone());
+            let expected = merge_gpu_writes_scalar(
+                &mut expected_title[3..3 + len],
+                &mut expected_host[1..],
+                &old[2..],
+            );
+            let mut baseline = old;
+            assert_eq!(
+                merge_gpu_writes_mut(&mut title[3..3 + len], &mut host[1..], &mut baseline[2..]),
+                expected,
+                "length {len}",
+            );
+            assert_eq!(title, expected_title);
+            assert_eq!(host, expected_host);
+            assert_eq!(baseline[..2], [42; 2]);
+            assert_eq!(baseline[2..2 + len], expected_host[1..1 + len]);
+            assert_eq!(baseline[2 + len..], [42; 3]);
         }
     }
 

@@ -851,6 +851,7 @@ mod tests {
             skip: 0,
             written: Default::default(),
             initialized: Default::default(),
+            shared_exponent: false,
             twin: Default::default(),
             texture: resource.unwrap(),
             state: AtomicU32::new(D3D12_RESOURCE_STATE_COMMON.0 as u32),

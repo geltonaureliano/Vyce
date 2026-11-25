@@ -563,6 +563,7 @@ impl HostPipeline {
             let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
             let made = super::library::pipeline(
                 &name,
+                shaders,
                 // SAFETY: the description points at live data.
                 |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
                 // SAFETY: as above.
@@ -571,12 +572,12 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    tracing::warn!(error = %e, name = name.as_str(), ?shaders, "host pipeline refused");
                     host.log_messages();
                     return None;
                 }
             };
-            tracing::info!(?shaders, "host pipeline");
+            tracing::info!(name = name.as_str(), ?shaders, "host pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: true,
@@ -608,23 +609,23 @@ impl HostPipeline {
                 Some(depth) => stream_pipeline(
                     &host.device, &root, ms, code(1), g,
                     Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth),
-                    &name,
+                    (&name, shaders),
                 ),
                 None => stream_pipeline(
                     &host.device, &root, ms, code(1), g,
                     Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
-                    &name,
+                    (&name, shaders),
                 ),
             };
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
+                    tracing::warn!(error = %e, name = name.as_str(), ?shaders, "host mesh pipeline refused");
                     host.log_messages();
                     return None;
                 }
             };
-            tracing::info!(?shaders, "host mesh pipeline");
+            tracing::info!(name = name.as_str(), ?shaders, "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,
@@ -700,11 +701,12 @@ impl HostPipeline {
             stream_pipeline(
                 &host.device, &root, vertex, desc.PS, g,
                 Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth),
-                &name,
+                (&name, shaders),
             )
         } else {
             super::library::pipeline(
                 &name,
+                shaders,
                 // SAFETY: the description points at live data.
                 |library, name| unsafe { library.LoadGraphicsPipeline(name, &desc) },
                 // SAFETY: as above.
@@ -714,15 +716,15 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                tracing::warn!(error = %e, name = name.as_str(), ?shaders, "host pipeline refused");
                 host.log_messages();
                 return None;
             }
         };
         #[cfg(feature = "diagnostics")]
-        tracing::info!(?shaders, %state, "host pipeline");
+        tracing::info!(name = name.as_str(), ?shaders, %state, "host pipeline");
         #[cfg(not(feature = "diagnostics"))]
-        tracing::info!(?shaders, "host pipeline");
+        tracing::info!(name = name.as_str(), ?shaders, "host pipeline");
         crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
@@ -767,7 +769,7 @@ fn stream_pipeline<S, D>(
     ps: D3D12_SHADER_BYTECODE,
     g: &GraphicsState,
     depth: Sub<D>,
-    name: &str,
+    (name, shaders): (&str, &[Arc<Shader>]),
 ) -> windows::core::Result<ID3D12PipelineState> {
     #[repr(C)]
     struct Stream<S, D> {
@@ -804,6 +806,7 @@ fn stream_pipeline<S, D>(
     let device = device.cast::<ID3D12Device2>()?;
     super::library::pipeline(
         name,
+        shaders,
         // SAFETY: the stream holds whole subobjects pointing at live data.
         |library, name| unsafe { library.LoadPipeline(name, &desc) },
         // SAFETY: as above.

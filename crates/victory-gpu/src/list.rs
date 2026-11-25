@@ -1593,17 +1593,26 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        if vertices == 0 || instances == 0 {
+            return;
+        }
         with_state(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
+        if x == 0 || y == 0 || z == 0 {
+            return;
+        }
         with_state(this, |list, s| s.dispatch(list, x, y, z, false));
     }
     /// A dispatch whose `x` counts threads.
     pub(super) extern "system" fn dispatch_threads(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
+        if x == 0 || y == 0 || z == 0 {
+            return;
+        }
         with_state(this, |list, s| s.dispatch(list, x, y, z, true));
     }
     /// The groups a mesh dispatch of `x` × `y` × `z` groups runs: the
@@ -1672,6 +1681,9 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        if indices == 0 || instances == 0 {
+            return;
+        }
         with_state(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
@@ -1744,6 +1756,9 @@ extern "system" fn execute_indirect(
     count_offset: u64,
 ) {
     count_draw();
+    if max == 0 {
+        return;
+    }
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
@@ -2038,6 +2053,52 @@ mod tests {
         assert_eq!(mesh_groups(5, 1, 0), None);
         assert_eq!(mesh_groups(5, 2, 3), Some(5));
         assert_eq!(mesh_groups(5, u32::MAX, u32::MAX), Some(5));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn empty_draws_and_dispatches_do_not_invalidate_an_occlusion_query() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_QUERY_HEAP_DESC, D3D12_QUERY_HEAP_TYPE_OCCLUSION, ID3D12QueryHeap,
+        };
+
+        let Some(host) = crate::host::host() else { return };
+        let mut heap: Option<ID3D12QueryHeap> = None;
+        let desc = D3D12_QUERY_HEAP_DESC {
+            Type: D3D12_QUERY_HEAP_TYPE_OCCLUSION,
+            Count: 1,
+            NodeMask: 0,
+        };
+        // SAFETY: the descriptor and the output slot are live.
+        unsafe { host.device.CreateQueryHeap(&desc, &mut heap) }.unwrap();
+        let heap = heap.unwrap();
+        let null = std::ptr::null();
+        let (mut allocator, mut list) = (null, null);
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        let commands = host_list(list).unwrap();
+        let kind = crate::query::OCCLUSION;
+        assert!(commands.begin_query(&heap, kind, 0));
+
+        // No pipeline is bound. An empty command must not appear dropped.
+        state::draw(list, 0, 2, 0, 0);
+        state::draw(list, 3, 0, 0, 0);
+        state::draw_indexed(list, 0, 2, 0, 0, 0);
+        state::draw_indexed(list, 3, 0, 0, 0, 0);
+        state::dispatch(list, 0, 2, 3);
+        state::dispatch(list, 2, 0, 3);
+        state::dispatch(list, 2, 3, 0);
+        state::dispatch_threads(list, 0, 2, 3);
+        state::dispatch_mesh(list, 2, 0, 1);
+        state::dispatch_mesh_x(list, 0, 0, 0, 0);
+
+        assert_eq!(commands.end_query(&heap, kind, 0), Some(kind));
+        assert!(!commands.worked());
+        assert_eq!(commands.writes(), 0);
+        assert_eq!(close(list), S_OK);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
     }
 
     /// An indirect mesh dispatch the host does not run (indirect execution

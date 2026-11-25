@@ -18,7 +18,8 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -149,9 +150,14 @@ fn crashed(name: &str) -> bool {
         .contains(name)
 }
 
+struct CompileReport {
+    name: String,
+    shaders: String,
+}
+
 thread_local! {
     /// The pipeline the driver makes on this thread.
-    static MAKING: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    static MAKING: std::cell::RefCell<Option<Arc<CompileReport>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// The driver makes a pipeline on this thread. If its compiler crashes there
@@ -161,15 +167,19 @@ thread_local! {
 struct Making;
 
 impl Making {
-    fn new(name: &str) -> Making {
+    fn new(name: &str, shaders: &[Arc<super::Shader>]) -> Making {
         use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
         static HANDLER: std::sync::Once = std::sync::Once::new();
         // SAFETY: a handler that lives as long as the process.
         HANDLER.call_once(|| unsafe {
             AddVectoredExceptionHandler(1, Some(compiler_crashed));
         });
-        MAKING.with(|m| name.clone_into(&mut m.borrow_mut()));
-        endless(name, true);
+        let report = Arc::new(CompileReport {
+            name: name.to_owned(),
+            shaders: format!("{shaders:?}"),
+        });
+        MAKING.with(|m| *m.borrow_mut() = Some(report.clone()));
+        endless(&report, true);
         Making
     }
 }
@@ -190,7 +200,39 @@ fn committed() -> u64 {
 }
 
 /// Workers (threads) lost to compiles that crashed, not replaced yet.
-static LOST: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+static LOST: LostWorkers = LostWorkers::new();
+
+struct LostWorkers {
+    pending: Mutex<Vec<u32>>,
+    ready: Condvar,
+}
+
+impl LostWorkers {
+    const fn new() -> Self {
+        Self {
+            pending: Mutex::new(Vec::new()),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn enqueue(&self, id: u32) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(id);
+        self.ready.notify_one();
+    }
+
+    fn take_until(&self, deadline: Instant) -> Vec<u32> {
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let wait = deadline.saturating_duration_since(Instant::now());
+        let (mut pending, _) = self
+            .ready
+            .wait_timeout_while(pending, wait, |ids| ids.is_empty())
+            .unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *pending)
+    }
+}
 
 /// Suspends thread `id`, at work in the driver's compiler (never in a heap
 /// function, whose lock it would keep); false if it was not caught there.
@@ -256,22 +298,22 @@ fn suspend(id: u32) -> bool {
 /// ([`ENDLESS`]): they are left out from the next run on. AMD's never ends
 /// some of the world's ray tracing programs, and takes memory all the while
 /// (16 GB in two minutes), so their threads are stopped.
-fn endless(name: &str, begins: bool) {
-    use std::time::{Duration, Instant};
+fn endless(report: &Arc<CompileReport>, begins: bool) {
+    const SCAN_INTERVAL: Duration = Duration::from_secs(2);
     // Some long programs take a while (the upscaler's 10,000 instructions);
     // what takes memory all along goes first.
     const ENDLESS: Duration = Duration::from_secs(20);
     const EVEN_SO: Duration = Duration::from_secs(150);
     const GROWTH: u64 = 3 << 30;
-    static AT_WORK: Mutex<Vec<(String, Instant, u32)>> = Mutex::new(Vec::new());
+    static AT_WORK: Mutex<Vec<(Arc<CompileReport>, Instant, u32)>> = Mutex::new(Vec::new());
     static WATCH: std::sync::Once = std::sync::Once::new();
     {
         // SAFETY: a plain call.
         let id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
         let mut at_work = AT_WORK.lock().unwrap_or_else(|e| e.into_inner());
         if begins {
-            at_work.push((name.to_owned(), Instant::now(), id));
-        } else if let Some(i) = at_work.iter().position(|w| w.0 == name && w.2 == id) {
+            at_work.push((report.clone(), Instant::now(), id));
+        } else if let Some(i) = at_work.iter().position(|w| Arc::ptr_eq(&w.0, report) && w.2 == id) {
             at_work.swap_remove(i);
         }
     }
@@ -282,17 +324,22 @@ fn endless(name: &str, begins: bool) {
                 let mut noted: Vec<String> = Vec::new();
                 // The process's commit when a compile was first seen late.
                 let mut late: Option<u64> = None;
+                let mut next_scan = Instant::now() + SCAN_INTERVAL;
                 loop {
-                    std::thread::sleep(Duration::from_secs(2));
-                    let lost = std::mem::take(&mut *LOST.lock().unwrap_or_else(|e| e.into_inner()));
-                    for id in lost {
+                    for id in LOST.take_until(next_scan) {
                         super::make::worker_lost(id);
                     }
-                    let long: Vec<(String, u32)> = AT_WORK
+                    // Crash notifications do not reset the hang scan timer.
+                    let now = Instant::now();
+                    if now < next_scan {
+                        continue;
+                    }
+                    next_scan = now + SCAN_INTERVAL;
+                    let long: Vec<(Arc<CompileReport>, u32)> = AT_WORK
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .iter()
-                        .filter(|w| w.1.elapsed() > ENDLESS && !noted.contains(&w.0))
+                        .filter(|w| w.1.elapsed() > ENDLESS && !noted.contains(&w.0.name))
                         .map(|w| (w.0.clone(), w.2))
                         .collect();
                     if long.is_empty() {
@@ -301,7 +348,7 @@ fn endless(name: &str, begins: bool) {
                     }
                     let now = committed();
                     let grown = now.saturating_sub(*late.get_or_insert(now)) > GROWTH;
-                    let long: Vec<(String, u32)> = if grown {
+                    let long: Vec<(Arc<CompileReport>, u32)> = if grown {
                         late = None;
                         long
                     } else {
@@ -309,22 +356,23 @@ fn endless(name: &str, begins: bool) {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .iter()
-                            .filter(|w| w.1.elapsed() > EVEN_SO && !noted.contains(&w.0))
+                            .filter(|w| w.1.elapsed() > EVEN_SO && !noted.contains(&w.0.name))
                             .map(|w| (w.0.clone(), w.2))
                             .collect()
                     };
-                    for (name, id) in long {
+                    for (report, id) in long {
                         let stopped = suspend(id);
                         if stopped {
                             super::make::worker_lost(id);
                         }
                         tracing::error!(
-                            name,
+                            name = report.name.as_str(),
+                            shaders = %report.shaders,
                             stopped,
                             "the driver's compiler does not end a pipeline: it is left out from the next run on"
                         );
-                        note_crashed(&name);
-                        noted.push(name);
+                        note_crashed(&report.name);
+                        noted.push(report.name.clone());
                     }
                 }
             });
@@ -333,8 +381,9 @@ fn endless(name: &str, begins: bool) {
 
 impl Drop for Making {
     fn drop(&mut self) {
-        let name = MAKING.with(|m| std::mem::take(&mut *m.borrow_mut()));
-        endless(&name, false);
+        if let Some(report) = MAKING.with(|m| m.borrow_mut().take()) {
+            endless(&report, false);
+        }
     }
 }
 
@@ -344,22 +393,26 @@ unsafe extern "system" fn compiler_crashed(
     const ACCESS_VIOLATION: i32 = 0xc000_0005_u32 as i32;
     // SAFETY: the system passes a live record.
     let record = unsafe { &*(*info).ExceptionRecord };
-    let name = MAKING.try_with(|m| m.try_borrow().map(|m| m.clone()).unwrap_or_default());
-    let name = name.unwrap_or_default();
     // Only reads or writes of the first pages: our own guards' faults are
     // elsewhere.
-    if record.ExceptionCode != ACCESS_VIOLATION
-        || name.is_empty()
-        || record.ExceptionInformation[1] >= 0x10000
-    {
+    if record.ExceptionCode != ACCESS_VIOLATION || record.ExceptionInformation[1] >= 0x10000 {
         return 0; // not ours
     }
-    note_crashed(&name);
-    tracing::error!(name, "the driver's compiler crashed making a pipeline: it is left out");
-    endless(&name, false);
+    // The report was formatted before entering the driver; cloning the Arc
+    // lets us log it without holding the TLS borrow or allocating a string.
+    let Ok(Some(report)) = MAKING.try_with(|m| m.try_borrow().ok()?.as_ref().cloned()) else {
+        return 0; // no compiler call to attribute it to
+    };
+    note_crashed(&report.name);
+    tracing::error!(
+        name = report.name.as_str(),
+        shaders = %report.shaders,
+        "the driver's compiler crashed making a pipeline: it is left out"
+    );
+    endless(&report, false);
     // SAFETY: a plain call.
     let id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
-    LOST.lock().unwrap_or_else(|e| e.into_inner()).push(id);
+    LOST.enqueue(id);
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));
     }
@@ -369,6 +422,7 @@ unsafe extern "system" fn compiler_crashed(
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
     name: &str,
+    shaders: &[Arc<super::Shader>],
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
@@ -382,7 +436,7 @@ pub(crate) fn pipeline(
         if crashed(name) {
             return Err(reject());
         }
-        let _making = Making::new(name);
+        let _making = Making::new(name, shaders);
         create()
     };
     let Some(library) = library() else {
@@ -519,6 +573,16 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_worker_losses_are_taken_without_a_second_notification() {
+        let lost = LostWorkers::new();
+        lost.enqueue(4);
+        lost.enqueue(9);
+
+        assert_eq!(lost.take_until(Instant::now()), [4, 9]);
+        assert!(lost.take_until(Instant::now()).is_empty());
+    }
 
     #[test]
     fn remembered_failure_is_visible_immediately_and_appended_once() {

@@ -226,6 +226,38 @@ fn root_view(list: &HostList, address: u64, kind: u8) -> Option<u64> {
 /// read them to.
 const LARGE: u32 = 64;
 
+/// Checks exactly the part of the table this shader uses. With one candidate
+/// a hit needs no snapshot. Several candidates share one prefix snapshot,
+/// which the caller can extend if it has to build a new table.
+fn cached_table_prefix(
+    variants: &[(Vec<[u32; 3]>, u32)],
+    needed: u32,
+    mut read: impl FnMut(u32) -> [u32; 3],
+    snapshot: &mut Vec<[u32; 3]>,
+) -> Option<u32> {
+    let mut candidates = variants
+        .iter()
+        .filter_map(|(records, first)| Some((records.get(..needed as usize)?, *first)))
+        .peekable();
+    let (prefix, first) = candidates.next()?;
+    if candidates.peek().is_none() {
+        for (i, expected) in prefix.iter().enumerate() {
+            let word = read(i as u32);
+            if word != *expected {
+                snapshot.reserve(needed as usize);
+                snapshot.extend_from_slice(&prefix[..i]);
+                snapshot.push(word);
+                return None;
+            }
+        }
+        return Some(first);
+    }
+    snapshot.extend((0..needed).map(read));
+    std::iter::once((prefix, first))
+        .chain(candidates)
+        .find_map(|(prefix, first)| (prefix == snapshot.as_slice()).then_some(first))
+}
+
 /// The longest `table` of `heap` was asked for, now for `n` entries.
 fn longest(heap: &crate::descriptor::Heap, table: u64, n: u32) -> u32 {
     static LONGEST: std::sync::Mutex<Option<std::collections::HashMap<u64, u32>>> =
@@ -1001,7 +1033,7 @@ impl State {
     #[cfg(feature = "diagnostics")]
     fn op_text(&self, kind: String, compute: bool, full: bool) -> String {
         use std::fmt::Write;
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::peek_host_pipeline(self.pipeline as This) else {
             return kind;
         };
         let mut text = format!("{kind} {}", p.name);
@@ -1190,43 +1222,26 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let n = entries
+            let needed = entries
                 .iter()
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
-            let last = table + u64::from(n - 1) * 32;
-            // Shaders read such a table to many lengths, and a copy for each
-            // ran out of slots: the longest seen serves all.
-            let n = if n >= LARGE { longest(heap, table, n) } else { n };
+            let last = table + u64::from(needed - 1) * 32;
             if heap.index(last).is_none() {
                 for u in entries {
                     self.table_entry(list, u, compute);
                 }
                 continue;
             }
-            let records: Vec<[u32; 3]> = if n >= LARGE {
-                (0..n)
-                    // SAFETY: descriptor slots in title memory.
-                    .map(|k| unsafe {
-                        ((table + u64::from(k) * 32) as *const [u32; 3]).read_unaligned()
-                    })
-                    .collect()
-            } else {
-                Vec::new()
+            let read_record = |k: u32| {
+                // SAFETY: callers only read within the validated heap range.
+                unsafe { ((table + u64::from(k) * 32) as *const [u32; 3]).read_unaligned() }
             };
-            let needed = entries
-                .iter()
-                .map(|u| u.table_offset_dwords as usize / 8 + 1)
-                .max()
-                .unwrap_or(1);
-            let same = self.large_tables.get(&table).and_then(|made| {
-                made.iter()
-                    .find(|(r, _)| r.len() >= needed && r[..needed] == records[..needed.min(records.len())])
-                    .map(|&(_, first)| first)
-            });
-            if n >= LARGE
-                && let Some(first) = same
+            let mut records = Vec::new();
+            if needed >= LARGE
+                && let Some(variants) = self.large_tables.get(&table)
+                && let Some(first) = cached_table_prefix(variants, needed, read_record, &mut records)
             {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
@@ -1238,14 +1253,25 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
+            // Shaders read tables to many lengths. Making up to the longest
+            // seen lets a later shader reuse the prefix with fewer slots.
+            let n = if needed >= LARGE {
+                longest(heap, table, needed)
+            } else {
+                needed
+            };
+            if needed >= LARGE {
+                records.extend((records.len() as u32..n).map(read_record));
+            }
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                for word in &records {
+                    word.hash(&mut h);
+                }
+                for k in records.len() as u32..n {
+                    read_record(k).hash(&mut h);
                 }
                 (table, h.finish())
             };
@@ -1359,7 +1385,7 @@ impl State {
     /// builds).
     #[cfg(feature = "diagnostics")]
     fn reads(&self, compute: bool) -> Vec<String> {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::peek_host_pipeline(self.pipeline as This) else {
             return vec!["no host pipeline".into()];
         };
         let mut out = Vec::new();
@@ -1756,7 +1782,7 @@ impl State {
                 crate::indirect::done(list, &bounded);
             }
             #[cfg(feature = "diagnostics")]
-            match crate::pipeline::host_pipeline(self.pipeline as This) {
+            match crate::pipeline::peek_host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
                 Some(p) => why(&format!(
                     "prepare failed: {} (topology {}, vertex slots {:#x}, {})",
@@ -2042,5 +2068,66 @@ mod group_limit_tests {
         assert!(!super::dispatch_fits(65_536, 1, 1));
         assert!(!super::dispatch_fits(1, u32::MAX, 1));
         assert!(!super::dispatch_fits(1, 1, 65_536));
+    }
+}
+
+#[cfg(test)]
+mod table_tests {
+    use super::cached_table_prefix;
+
+    #[test]
+    fn a_single_long_table_reads_only_the_requested_prefix() {
+        let saved = [[1, 10, 1], [1, 11, 1], [1, 12, 1]];
+        let variants = [(saved.to_vec(), 19)];
+        let mut current = saved;
+        current[2][2] += 1;
+        let mut snapshot = Vec::new();
+        let mut indices = Vec::new();
+        let first = cached_table_prefix(
+            &variants,
+            2,
+            |i| {
+                indices.push(i);
+                current[i as usize]
+            },
+            &mut snapshot,
+        );
+        assert_eq!(first, Some(19));
+        assert_eq!(indices, [0, 1]);
+        assert!(snapshot.is_empty());
+
+        current[1][2] += 1;
+        let first = cached_table_prefix(&variants, 2, |i| current[i as usize], &mut snapshot);
+        assert_eq!(first, None);
+        assert_eq!(snapshot, current[..2]);
+    }
+
+    #[test]
+    fn multiple_variants_share_one_snapshot_and_short_tables_do_not_read() {
+        let current = [[1, 10, 3], [1, 11, 1]];
+        let variants = [
+            (vec![current[0]], 7),
+            (vec![[1, 10, 2], current[1]], 13),
+            (current.to_vec(), 21),
+            (current.to_vec(), 34),
+        ];
+        let mut snapshot = Vec::new();
+        assert_eq!(
+            cached_table_prefix(&variants[..1], 2, |_| panic!("short variant read"), &mut snapshot),
+            None,
+        );
+        let mut indices = Vec::new();
+        let first = cached_table_prefix(
+            &variants,
+            2,
+            |i| {
+                indices.push(i);
+                current[i as usize]
+            },
+            &mut snapshot,
+        );
+        assert_eq!(first, Some(21));
+        assert_eq!(indices, [0, 1]);
+        assert_eq!(snapshot, current);
     }
 }

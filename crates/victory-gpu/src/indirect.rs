@@ -222,6 +222,25 @@ fn validate_layout(
     (bytes <= u64::from(u32::MAX)).then_some(bytes)
 }
 
+/// Each list owns its budget. D3D12 buffers decay to COMMON between execute
+/// calls, so a recording can be replayed and still start from zero.
+pub(crate) fn reset_budget(
+    list: &ID3D12GraphicsCommandList,
+    budget: &ID3D12Resource,
+    zero: &ID3D12Resource,
+) {
+    // SAFETY: an open list, an unused buffer in COMMON (promoted to COPY_DEST)
+    // and a live immutable upload buffer with a zero dword.
+    unsafe {
+        list.CopyBufferRegion(budget, 0, zero, 0, 4);
+        list.ResourceBarrier(&[transition(
+            budget,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        )]);
+    }
+}
+
 /// Records, in `list`, the non-destructive clamp of up to `records` records of
 /// `kind` (PC argument numbering) `stride` bytes apart from `src` (and bounded
 /// by the 32-bit count in `count` when given) into a device-local scratch
@@ -243,7 +262,7 @@ fn record_clamp(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
     dst: &ID3D12Resource,
-    budget: u64,
+    budget: &ID3D12Resource,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
@@ -256,8 +275,10 @@ fn record_clamp(
         return false;
     };
     // SAFETY: live D3D12 buffer resources.
-    let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
-    if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
+    let (src_base, dst_gpu, budget_gpu) = unsafe {
+        (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress(), budget.GetGPUVirtualAddress())
+    };
+    if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget_gpu.is_multiple_of(4) {
         return false;
     }
     let (src_gpu, args_offset) = match src_offset
@@ -299,7 +320,7 @@ fn record_clamp(
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&[
-            uav_barrier(),
+            uav_barrier(None),
             transition(
                 dst,
                 D3D12_RESOURCE_STATE_COMMON,
@@ -313,11 +334,11 @@ fn record_clamp(
             l.SetComputeRootShaderResourceView(1, src_gpu);
             l.SetComputeRootShaderResourceView(2, count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
-            l.SetComputeRootUnorderedAccessView(4, budget);
+            l.SetComputeRootUnorderedAccessView(4, budget_gpu);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
         l.ResourceBarrier(&[
-            uav_barrier(),
+            uav_barrier(Some(budget)),
             transition(
                 dst,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -395,8 +416,13 @@ pub(crate) fn bound_before(
     }
     let (c, budget) = (clamp()?, clamps.budget()?);
     // SAFETY: live buffers.
-    let (src_base, count_base) =
-        unsafe { (src.GetGPUVirtualAddress(), count.map(|(b, _)| b.GetGPUVirtualAddress())) };
+    let (src_base, count_base, budget_gpu) = unsafe {
+        (
+            src.GetGPUVirtualAddress(),
+            count.map(|(b, _)| b.GetGPUVirtualAddress()),
+            budget.GetGPUVirtualAddress(),
+        )
+    };
     // Addresses the shader's offsets (32 bits) reach, as in `record_clamp`.
     let fits = |offset: u64, len: u64| offset.checked_add(len).is_some_and(|end| end <= u64::from(u32::MAX));
     let (src_gpu, args_offset) = if fits(src_offset, bytes) {
@@ -409,7 +435,7 @@ pub(crate) fn bound_before(
         (Some((_, off)), Some(base)) => (base.checked_add(off)?, 1, 0),
         _ => (src_gpu, 0, 0),
     };
-    if !src_gpu.is_multiple_of(4) || !count_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
+    if !src_gpu.is_multiple_of(4) || !count_gpu.is_multiple_of(4) || !budget_gpu.is_multiple_of(4) {
         return None;
     }
     let (dst, at) = clamps.clamp_room(bytes)?;
@@ -418,8 +444,7 @@ pub(crate) fn bound_before(
     let constants = [kind, stride, records, args_offset, has_count, count_offset];
     let l = &clamps.list;
     // SAFETY: an open list; our root signature and pipeline; live source,
-    // count, destination (writable: `clamp_room`) and budget buffers. The
-    // clamps write apart and charge the budget atomically: no barriers.
+    // count, destination (writable: `clamp_room`) and budget buffers.
     unsafe {
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
@@ -427,12 +452,12 @@ pub(crate) fn bound_before(
         l.SetComputeRootShaderResourceView(1, src_gpu);
         l.SetComputeRootShaderResourceView(2, count_gpu);
         l.SetComputeRootUnorderedAccessView(3, dst_gpu);
-        l.SetComputeRootUnorderedAccessView(4, budget);
+        l.SetComputeRootUnorderedAccessView(4, budget_gpu);
         l.Dispatch(records.div_ceil(64), 1, 1);
-        // Mode 7: one clamp after another, so that the budget is charged in
-        // the order of the draws as it is when each clamp precedes its draw.
+        // Clamps write disjoint argument ranges. Only the budget needs
+        // ordering here in mode 7; clamp_end transitions the argument buffers.
         if hoist_mode() == 7 {
-            l.ResourceBarrier(&[uav_barrier()]);
+            l.ResourceBarrier(&[uav_barrier(Some(budget))]);
         }
     }
     Some((dst, at))
@@ -455,13 +480,16 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
     };
 }
 
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+fn uav_barrier(resource: Option<&ID3D12Resource>) -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
             UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                pResource: std::mem::ManuallyDrop::new(None),
+                // SAFETY: borrows the live COM pointer without taking a reference.
+                pResource: resource.map_or(std::mem::ManuallyDrop::new(None), |r| unsafe {
+                    std::mem::transmute_copy(r)
+                }),
             }),
         },
     }
@@ -502,8 +530,8 @@ void main() {
 
     impl WarpHarness {
         fn new() -> Option<Self> {
-            // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
-            unsafe {
+            // SAFETY: plain DXGI WARP query and device creation.
+            let device = unsafe {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
@@ -513,7 +541,14 @@ void main() {
                 }
                 let mut device: Option<ID3D12Device> = None;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
-                let device = device?;
+                device?
+            };
+            Self::on_device(device)
+        }
+
+        fn on_device(device: ID3D12Device) -> Option<Self> {
+            // SAFETY: D3D12 test harness setup on the selected device.
+            unsafe {
                 let queue: ID3D12CommandQueue = device
                     .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                         Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -528,7 +563,7 @@ void main() {
                     .ok()?;
                 let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
                 let event = CreateEventW(None, false, false, None).ok()?;
-                let clamp = make_for(&device).expect("clamp shader must compile on WARP");
+                let clamp = make_for(&device).expect("argument clamp must compile");
                 let worker = compile_cs(&device, WORKER_CS).expect("worker shader must compile");
                 Some(Self {
                     device,
@@ -645,11 +680,10 @@ void main() {
             sig.unwrap()
         }
 
-        fn submit_and_wait(&mut self) {
+        fn execute_closed_and_wait(&mut self) {
             self.submitted += 1;
-            // SAFETY: closing, executing, waiting on fence, and resetting our list.
+            // SAFETY: the list is closed; the queue, fence and event are ours.
             unsafe {
-                self.list.Close().unwrap();
                 let cmd: ID3D12CommandList = self.list.cast().unwrap();
                 self.queue.ExecuteCommandLists(&[Some(cmd)]);
                 self.queue.Signal(&self.fence, self.submitted).unwrap();
@@ -657,6 +691,15 @@ void main() {
                     .SetEventOnCompletion(self.submitted, self.event)
                     .unwrap();
                 WaitForSingleObject(self.event, INFINITE);
+            }
+        }
+
+        fn submit_and_wait(&mut self) {
+            // SAFETY: the list is open and nothing is executing it yet.
+            unsafe { self.list.Close().unwrap() };
+            self.execute_closed_and_wait();
+            // SAFETY: the fence completed this execution before the reset.
+            unsafe {
                 self.allocator.Reset().unwrap();
                 self.list.Reset(&self.allocator, None).unwrap();
             }
@@ -708,6 +751,99 @@ void main() {
     }
 
     #[test]
+    fn local_indirect_budget_preserves_order_and_is_reset_when_a_list_replays() {
+        let harness = if std::env::var_os("VICTORY_TEST_INDIRECT_HARDWARE").is_some() {
+            WarpHarness::on_device(host().expect("a hardware device").device.clone())
+        } else {
+            WarpHarness::new()
+        };
+        let Some(mut gpu) = harness else { return };
+        let (zero, zero_data, _) = gpu.shared_buffer(4);
+        let (src, src_data, _) = gpu.shared_buffer(16);
+        let (readback, results, _) = gpu.shared_buffer(48);
+        let budget = gpu.default_uav(256);
+        let dst = gpu.default_uav(16);
+        // SAFETY: these buffers are mapped and have room for the supplied data.
+        unsafe {
+            zero_data.cast::<u32>().write(0);
+            src_data.cast::<[u32; 4]>().write([1 << 24, 4, 17, 13]);
+        }
+        reset_budget(&gpu.list, &budget, &zero);
+        for at in [0, 16, 32] {
+            assert!(record_clamp(
+                &gpu.clamp, &gpu.list, &dst, &budget, (&src, 0), None, (0, 16, 1),
+            ));
+            // SAFETY: the clamp transitions dst to INDIRECT_ARGUMENT and both
+            // resources cover this copy. Return dst to COMMON for the next clamp.
+            unsafe {
+                gpu.list.ResourceBarrier(&[transition(
+                    &dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                gpu.list.CopyBufferRegion(&readback, at, &dst, 0, 16);
+                gpu.list.ResourceBarrier(&[transition(
+                    &dst, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
+        }
+        // SAFETY: the recording is open and all referenced buffers remain live.
+        unsafe { gpu.list.Close().unwrap() };
+        for _ in 0..2 {
+            // SAFETY: there is no outstanding GPU execution, and the result buffer is mapped.
+            unsafe { std::ptr::write_bytes(results, 0xCC, 48) };
+            gpu.execute_closed_and_wait();
+            // SAFETY: the GPU fence completed all three copies before this read.
+            let actual = unsafe { results.cast::<[[u32; 4]; 3]>().read() };
+            assert_eq!(actual, [[1 << 24, 4, 17, 13], [1 << 24, 4, 17, 13], [0, 0, 17, 13]]);
+        }
+    }
+
+    #[test]
+    #[ignore = "synthetic GPU benchmark for a local D3D12 adapter"]
+    fn hardware_indirect_budget_heap_timing() {
+        let mut gpu = WarpHarness::on_device(host().expect("a hardware device").device.clone())
+            .expect("hardware test harness");
+        let (zero, zero_data, _) = gpu.shared_buffer(4);
+        let (src, src_data, _) = gpu.shared_buffer(16);
+        let (system_budget, system_data, _) = gpu.shared_buffer(256);
+        let local_budget = gpu.default_uav(256);
+        let dst = gpu.default_uav(16);
+        // SAFETY: each mapped buffer holds the initialized data.
+        unsafe {
+            zero_data.cast::<u32>().write(0);
+            src_data.cast::<[u32; 4]>().write([3, 1, 0, 0]);
+        }
+        let mut samples = [Vec::new(), Vec::new()];
+        for round in 0..11 {
+            for local in [round % 2 == 1, round % 2 == 0] {
+                let budget = if local {
+                    reset_budget(&gpu.list, &local_budget, &zero);
+                    &local_budget
+                } else {
+                    // SAFETY: no execution is pending and the word is mapped.
+                    unsafe { system_data.cast::<u32>().write(0) };
+                    &system_budget
+                };
+                for _ in 0..1024 {
+                    assert!(record_clamp(
+                        &gpu.clamp, &gpu.list, &dst, budget, (&src, 0), None, (0, 16, 1),
+                    ));
+                    done_on(&gpu.list, &dst);
+                }
+                let started = std::time::Instant::now();
+                gpu.submit_and_wait();
+                if round > 0 {
+                    samples[usize::from(local)].push(started.elapsed());
+                }
+            }
+        }
+        for (name, times) in ["system", "local"].into_iter().zip(&mut samples) {
+            times.sort_unstable();
+            let median = (times[4] + times[5]) / 2;
+            println!("{name}: {:.3} ms median, 1024 clamps", median.as_secs_f64() * 1000.0);
+        }
+    }
+
+    #[test]
     fn rejects_unaligned_or_undersized_layouts() {
         assert_eq!(validate_layout((0, 16, 4), 0, None), Some(64));
         assert_eq!(validate_layout((1, 20, 4), 64, Some(128)), Some(80));
@@ -750,7 +886,7 @@ void main() {
         let src_bytes = ARGS_OFFSET + (STRIDE as usize) * (MAX as usize) + 64;
         let (src_buf, src_ptr, _) = warp.shared_buffer(src_bytes as u64);
         let (count_buf, count_ptr, _) = warp.shared_buffer(512);
-        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (budget_buf, budget_ptr, _) = warp.shared_buffer(256);
         let (_hits_buf, hits_ptr, hits_gpu) = warp.shared_buffer(256);
         let (readback_buf, readback_ptr, _) = warp.shared_buffer((STRIDE * 8) as u64);
         let dst_buf = warp.default_uav(u64::from(STRIDE) * u64::from(MAX));
@@ -815,7 +951,7 @@ void main() {
             &warp.clamp,
             &warp.list,
             &dst_buf,
-            budget_gpu,
+            &budget_buf,
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_1 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
@@ -860,7 +996,7 @@ void main() {
             &warp.clamp,
             &warp.list,
             &dst_buf,
-            budget_gpu,
+            &budget_buf,
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_2 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
@@ -952,7 +1088,7 @@ void main() {
 
         let total_bytes = (STRIDE * RECORDS) as usize;
         let (src_buf, src_ptr, _) = warp.shared_buffer(total_bytes as u64);
-        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (budget_buf, budget_ptr, _) = warp.shared_buffer(256);
         let (readback_buf, readback_ptr, _) = warp.shared_buffer(total_bytes as u64);
         let dst_buf = warp.default_uav(total_bytes as u64);
 
@@ -983,7 +1119,7 @@ void main() {
             &warp.clamp,
             &warp.list,
             &dst_buf,
-            budget_gpu,
+            &budget_buf,
             (&src_buf, 0),
             None,
             (KIND_INDEXED, STRIDE, RECORDS),

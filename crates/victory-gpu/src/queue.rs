@@ -414,8 +414,8 @@ fn show(shown: Option<object::Ref>, over: Option<object::Ref>) {
     #[cfg(windows)]
     if let Some(over) = plane(over.as_ref())
         && let Some(host) = crate::host::host()
+        && host.present_over(plane(shown.as_ref()), over, frame).is_some()
     {
-        host.present_over(plane(shown.as_ref()), over, frame);
         return;
     }
     #[cfg(windows)]

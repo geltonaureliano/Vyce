@@ -12,10 +12,11 @@ use windows::core::{PCSTR, s};
 use crate::host::Host;
 
 const SOURCE: &str = r#"
-#define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), RootConstants(num32BitConstants=1, b0, visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
 Texture2D<float4> scene : register(t0);
 Texture2D<float4> over : register(t1);
 SamplerState smooth_ : register(s0);
+cbuffer Transfer : register(b0) { uint color_mode; };
 struct V { float4 at : SV_Position; float2 uv : TEXCOORD0; };
 [RootSignature(RS)]
 V vs(uint id : SV_VertexID) {
@@ -24,13 +25,38 @@ V vs(uint id : SV_VertexID) {
     v.at = float4(v.uv * float2(2, -2) + float2(-1, 1), 0, 1);
     return v;
 }
+float3 encode_srgb(float3 value) {
+    float3 rgb = saturate(value);
+    return lerp(12.92 * rgb, 1.055 * pow(rgb, 1.0 / 2.4) - 0.055, step(0.0031308, rgb));
+}
 [RootSignature(RS)]
 float4 ps(V v) : SV_Target {
     float4 s = scene.SampleLevel(smooth_, v.uv, 0);
     float4 o = over.SampleLevel(smooth_, v.uv, 0);
-    return float4(saturate(o.rgb + s.rgb * (1 - saturate(o.a))), 1);
+    bool blend_linear = (color_mode & 4u) != 0u;
+    if (!blend_linear) {
+        if ((color_mode & 1u) != 0u) s.rgb = encode_srgb(s.rgb);
+        if ((color_mode & 2u) != 0u) o.rgb = encode_srgb(o.rgb);
+    }
+    float3 blended = o.rgb + s.rgb * (1 - saturate(o.a));
+    return float4(blend_linear ? encode_srgb(blended) : saturate(blended), 1);
 }
 "#;
+
+/// The typed sRGB planes already accepted by the presentation path.
+pub(crate) fn is_srgb(format: DXGI_FORMAT) -> bool {
+    matches!(format, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)
+}
+
+/// Sampling a typed sRGB SRV decodes RGB to linear. Blend in linear when
+/// all present planes declare sRGB. For a mixed pair, restore the sRGB
+/// plane's transfer so the plane with unknown encoding keeps its old blend.
+fn color_mode(formats: [Option<DXGI_FORMAT>; 2]) -> u32 {
+    let srgb = formats.map(|format| format.is_some_and(is_srgb));
+    let mask = u32::from(srgb[0]) | (u32::from(srgb[1]) << 1);
+    let linear = mask != 0 && formats.iter().zip(srgb).all(|(f, srgb)| f.is_none() || srgb);
+    mask | (u32::from(linear) << 2)
+}
 
 /// Descriptors of as many frames as are ever in flight.
 const FRAMES: u32 = 16;
@@ -49,9 +75,10 @@ unsafe impl Sync for Composer {}
 
 fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
     let mut code: Option<ID3DBlob> = None;
+    let mut messages: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; the out pointer is
     // ours.
-    unsafe {
+    let compiled = unsafe {
         D3DCompile(
             SOURCE.as_ptr().cast(),
             SOURCE.len(),
@@ -63,9 +90,19 @@ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
             0,
             0,
             &mut code,
-            None,
-        )?;
+            Some(&mut messages),
+        )
+    };
+    if compiled.is_err()
+        && let Some(messages) = messages
+    {
+        // SAFETY: the blob owns this byte range until it is dropped.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(messages.GetBufferPointer().cast::<u8>(), messages.GetBufferSize())
+        };
+        tracing::warn!(diagnostics = %String::from_utf8_lossy(bytes).trim_end_matches('\0'), "presentation shader compilation failed");
     }
+    compiled?;
     code.ok_or_else(windows::core::Error::empty)
 }
 
@@ -141,6 +178,18 @@ pub(crate) fn record(
     let Some((_, Some(c))) = &*composer else {
         return false;
     };
+    record_with(host, list, c, planes, back, (width, height));
+    true
+}
+
+fn record_with(
+    host: &Host,
+    list: &ID3D12GraphicsCommandList,
+    c: &Composer,
+    planes: [Option<(&ID3D12Resource, DXGI_FORMAT)>; 2],
+    back: &ID3D12Resource,
+    (width, height): (u32, u32),
+) {
     let first = 2 * (c.next.fetch_add(1, Ordering::Relaxed) % FRAMES);
     // SAFETY: an open list; the views are made in slots no frame in flight
     // reads; live textures.
@@ -172,6 +221,7 @@ pub(crate) fn record(
         list.SetDescriptorHeaps(&[Some(c.views.clone())]);
         list.SetGraphicsRootSignature(&c.root);
         list.SetPipelineState(&c.pso);
+        list.SetGraphicsRoot32BitConstant(1, color_mode(planes.map(|p| p.map(|(_, f)| f))), 0);
         list.SetGraphicsRootDescriptorTable(
             0,
             D3D12_GPU_DESCRIPTOR_HANDLE {
@@ -195,5 +245,122 @@ pub(crate) fn record(
         }]);
         list.DrawInstanced(3, 1, 0, 0);
     }
-    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transfer_is_selected_only_for_declared_srgb_planes() {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_B8G8R8A8_UNORM_SRGB as BGRA_SRGB,
+            DXGI_FORMAT_R8G8B8A8_TYPELESS as TYPELESS,
+            DXGI_FORMAT_R8G8B8A8_UNORM as UNORM,
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB as RGBA_SRGB,
+        };
+        assert_eq!(color_mode([Some(UNORM), Some(UNORM)]), 0);
+        assert_eq!(color_mode([Some(TYPELESS), Some(UNORM)]), 0);
+        assert_eq!(color_mode([Some(RGBA_SRGB), Some(UNORM)]), 1);
+        assert_eq!(color_mode([Some(UNORM), Some(BGRA_SRGB)]), 2);
+        assert_eq!(color_mode([None, Some(BGRA_SRGB)]), 6);
+        assert_eq!(color_mode([Some(RGBA_SRGB), Some(BGRA_SRGB)]), 7);
+    }
+
+    #[test]
+    fn warp_blends_typed_srgb_planes_in_linear_light() {
+        let Some(host) = Host::new_warp() else { return };
+        let output_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let composer = make(&host, output_format).expect("compile the presentation compositor");
+        let target = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        let sampled = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        let make_target = |format| {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 1,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let mut texture = None::<ID3D12Resource>;
+            // SAFETY: our descriptors and output slot live through this call.
+            unsafe {
+                host.device.CreateCommittedResource(
+                    &heap, D3D12_HEAP_FLAG_NONE, &desc, target, None, &mut texture,
+                )
+            }
+            .expect("create a typed test texture");
+            texture.unwrap()
+        };
+        let draw = |scene_format, overlay_format| {
+            let scene = make_target(scene_format);
+            let overlay = make_target(overlay_format);
+            let back = make_target(output_format);
+            let list = host.new_list().expect("record test composition");
+            let (readback, data) = host.readback_buffer(256).expect("test pixel readback");
+            // SAFETY: the clear targets and command list are live and in render-target state.
+            unsafe {
+                list.list.ClearRenderTargetView(host.rtv(&scene, None), &[1.0, 0.0, 0.0, 1.0], None);
+                list.list.ClearRenderTargetView(host.rtv(&overlay, None), &[0.0, 0.0, 0.0, 0.5], None);
+                list.list.ResourceBarrier(&[
+                    crate::host::transition(&scene, target, sampled),
+                    crate::host::transition(&overlay, target, sampled),
+                ]);
+            }
+            record_with(&host, &list.list, &composer, [
+                Some((&scene, scene_format)),
+                Some((&overlay, overlay_format)),
+            ], &back, (1, 1));
+
+            // SAFETY: the location fields borrow live resources. The pixel
+            // uses one row in the readback buffer at the required pitch.
+            unsafe {
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &back, target, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                let source = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&back),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                let destination = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&readback),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: 0,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: output_format,
+                                Width: 1,
+                                Height: 1,
+                                Depth: 1,
+                                RowPitch: 256,
+                            },
+                        },
+                    },
+                };
+                list.list.CopyTextureRegion(&destination, 0, 0, 0, &source, None);
+            }
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: the submission finished and the referenced readback is live.
+            unsafe { data.cast::<[u8; 4]>().read() }
+        };
+        let rgba_srgb = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        let bgra_srgb = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        let linear = draw(rgba_srgb, bgra_srgb);
+        let legacy = draw(output_format, output_format);
+        let mixed = draw(rgba_srgb, output_format);
+        assert!((186..=189).contains(&linear[0]), "linear-light red: {linear:?}");
+        assert!((126..=129).contains(&legacy[0]), "legacy encoded red: {legacy:?}");
+        for pixel in [linear, legacy, mixed] {
+            assert_eq!(pixel[1..], [0, 0, 255]);
+        }
+        assert_eq!(mixed, legacy);
+    }
 }

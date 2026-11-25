@@ -50,6 +50,7 @@ struct InFlight {
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
+    pub(crate) fully_typed_casts: bool,
     /// Resizable BAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`) supported by device/OS.
     pub(crate) gpu_upload: bool,
     queue: ID3D12CommandQueue,
@@ -72,6 +73,8 @@ pub(crate) struct Host {
     presenter: Mutex<Option<Presenter>>,
     /// Device-local VRAM card buffer engine (Wave64 GPU page hashing), lazily initialized.
     card: OnceLock<Option<Mutex<crate::card::CardEngine>>>,
+    /// Immutable source for resetting each device-local indirect budget.
+    indirect_zero: OnceLock<Option<ID3D12Resource>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -348,6 +351,15 @@ impl Host {
                 )
                 .is_ok()
                 && options.DepthBoundsTestSupported.as_bool();
+            let mut options3 = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+            let fully_typed_casts = device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS3,
+                    (&raw mut options3).cast(),
+                    size_of_val(&options3) as u32,
+                )
+                .is_ok()
+                && options3.CastingFullyTypedFormatSupported.as_bool();
             let mut options16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
             let gpu_upload = !cfg!(test)
                 && std::env::var_os("VICTORY_GPU_UPLOAD").is_some_and(|v| v == "1")
@@ -383,6 +395,7 @@ impl Host {
             Ok(Host {
                 device,
                 depth_bounds_supported,
+                fully_typed_casts,
                 gpu_upload,
                 queue,
                 fence,
@@ -398,6 +411,7 @@ impl Host {
                 next_rtv: AtomicU32::new(0),
                 presenter: Mutex::new(None),
                 card: OnceLock::new(),
+                indirect_zero: OnceLock::new(),
             })
         }
     }
@@ -651,7 +665,7 @@ pub(crate) struct HostList {
     queries: Mutex<Vec<(ID3D12QueryHeap, D3D12_QUERY_TYPE, u32, bool)>>,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
-    budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    budget: OnceLock<Option<IndirectBudget>>,
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
@@ -841,6 +855,12 @@ pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
 
 /// Upload chunks handed out front to back: the chunks, the one in use and
 /// the bytes used in it.
+struct IndirectBudget {
+    buffer: ID3D12Resource,
+    /// The fallback in system memory is cleared by the CPU before submission.
+    mapped: Option<usize>,
+}
+
 #[derive(Default)]
 struct Scratch {
     chunks: Vec<(ID3D12Resource, usize, u64)>,
@@ -953,7 +973,7 @@ struct Deferred {
     /// How many of `writes` this submission has done already.
     early: usize,
     wait_marks: Vec<usize>,
-    /// Whether a step zeroes the indirect-work budget.
+    /// Whether this recording already prepares its indirect-work budget.
     budget_zeroed: bool,
 }
 
@@ -2428,27 +2448,41 @@ impl HostList {
         Some((gpu + at, (data + at as usize) as *mut u8))
     }
 
-    /// The host address of the list's indirect-work budget, zeroed at each
-    /// submission of the list from the first use after a reset on.
-    pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
+    /// The list's indirect-work budget, zeroed each time the list executes.
+    pub(crate) fn budget(&self) -> Option<&ID3D12Resource> {
+        let host = host()?;
+        let zero = host
+            .indirect_zero
+            .get_or_init(|| {
+                let (buffer, data) = host.upload_buffer(4)?;
+                // SAFETY: this newly mapped upload has room for one dword.
+                unsafe { data.cast::<u32>().write(0) };
+                Some(buffer)
+            })
+            .as_ref();
+        let budget = self
             .budget
             .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
+                if zero.is_some() && let Some(buffer) = host.uav_buffer(256) {
+                    return Some(IndirectBudget { buffer, mapped: None });
+                }
+                let (buffer, mapped) = host.shared_buffer(256)?;
+                Some(IndirectBudget { buffer, mapped: Some(mapped as usize) })
             })
             .as_ref()?;
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
+            if let Some(at) = budget.mapped {
+                // SAFETY: the list's own mapped word, written before it runs.
+                deferred.copies.push(Step::Host(Box::new(move || unsafe {
+                    (at as *mut u32).write_volatile(0);
+                })));
+            } else {
+                crate::indirect::reset_budget(&self.list, &budget.buffer, zero?);
+            }
             deferred.budget_zeroed = true;
-            let at = *data;
-            // SAFETY: the list's own mapped word, written before it runs.
-            deferred
-                .copies
-                .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
         }
-        // SAFETY: a live buffer.
-        Some(unsafe { buffer.GetGPUVirtualAddress() })
+        Some(&budget.buffer)
     }
 
     /// A device-local unordered-access buffer of at least `size` bytes for
@@ -2711,13 +2745,12 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        for (shadow, from, to) in std::mem::take(&mut self.refreshes) {
+        for (shadow, from, to) in self.refreshes.drain(..) {
             update(&shadow, from, to - from);
         }
-        let mut pieces = std::mem::take(&mut self.pieces);
-        pieces.sort_unstable_by_key(|(s, from, _)| (s.root_key(), *from));
+        self.pieces.sort_unstable_by_key(|(s, from, _)| (s.root_key(), *from));
         let mut run: Option<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = None;
-        for (shadow, from, to) in pieces {
+        for (shadow, from, to) in self.pieces.drain(..) {
             if let Some((s, _, end)) = &mut run
                 && s.root_key() == shadow.root_key()
                 && from <= *end + 4096
@@ -3375,6 +3408,42 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    observed_path: Option<PresentPath>,
+}
+
+#[derive(PartialEq, Eq)]
+struct PresentPath {
+    kind: &'static str,
+    scene: Option<DXGI_FORMAT>,
+    overlay: Option<DXGI_FORMAT>,
+    output: DXGI_FORMAT,
+}
+
+impl Presenter {
+    fn note_path(
+        &mut self,
+        kind: &'static str,
+        scene: Option<DXGI_FORMAT>,
+        overlay: Option<DXGI_FORMAT>,
+    ) {
+        let path = PresentPath { kind, scene, overlay, output: self.format };
+        if self.observed_path.as_ref() == Some(&path) {
+            return;
+        }
+        self.observed_path = Some(path);
+        let scene = scene.map_or(0, |f| f.0);
+        let overlay = overlay.map_or(0, |f| f.0);
+        let output = self.format.0;
+        if self.meter.telemetry {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "VYCE_PRESENT path={kind} scene_format={scene} overlay_format={overlay} output_format={output}"
+            );
+        } else {
+            tracing::info!(path = kind, scene, overlay, output, "presentation formats");
+        }
+    }
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -3435,6 +3504,12 @@ impl Meter {
         });
         let [plans_ms, records_ms] =
             [0, 1].map(|i| BINDLESS_US[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
+        let [ordinary, screen] = crate::pipeline::take_wait_stats();
+        let world_wait_ms = ordinary.micros as f64 / 1e3 / frames;
+        let screen_wait_ms = screen.micros as f64 / 1e3 / frames;
+        let pipeline_wait_ms = world_wait_ms + screen_wait_ms;
+        let pipeline_waits = ordinary.calls + screen.calls;
+        let pipeline_timeouts = ordinary.timeouts + screen.timeouts;
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         if self.telemetry && [fps, ms, draws, gpu, cpu, back_ms, dropped].into_iter().all(f64::is_finite) {
@@ -3446,6 +3521,13 @@ impl Meter {
                 "VYCE_TELEMETRY {{\"schema\":1,\"event\":\"frame\",\"fps\":{fps:.2},\
                  \"frame_ms\":{ms:.2},\"frames_total\":{},\"draws_per_frame\":{draws:.2},\
                  \"gpu_wait_ms\":{gpu:.2},\"cpu_prepare_ms\":{cpu:.2},\"copy_back_ms\":{back_ms:.2},\
+                 \"cpu_copy_ms\":{copy_ms:.2},\"cpu_copy_mb\":{copy_mb:.2},\"guest_write_mb\":{back_mb:.2},\
+                 \"texture_refresh_ms\":{texture_ms:.2},\"texture_refresh_mb\":{texture_mb:.2},\
+                 \"bindless_plan_ms\":{plans_ms:.2},\"bindless_record_ms\":{records_ms:.2},\
+                 \"indirect_per_frame\":{indirect:.2},\
+                 \"pipeline_wait_ms\":{pipeline_wait_ms:.2},\"pipeline_waits\":{pipeline_waits},\
+                 \"pipeline_world_wait_ms\":{world_wait_ms:.2},\"pipeline_screen_wait_ms\":{screen_wait_ms:.2},\
+                 \"pipeline_wait_timeouts\":{pipeline_timeouts},\
                  \"dropped_per_frame\":{dropped:.2},\"pipelines_building\":{}}}",
                 self.frames_total,
                 crate::pipeline::making(),
@@ -3466,7 +3548,8 @@ impl Meter {
                 "[{} {}] {fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB, bindless plans \
                  {plans_ms:.1} ms; {gpu:.1} on the GPU; {back_ms:.1} copying back {back_mb:.1} MB; \
-                 bindless records {records_ms:.1} ms), {draws:.0} draws/frame, \
+                 bindless records {records_ms:.1} ms; pipeline waits {world_wait_ms:.1} ms ordinary \
+                 {screen_wait_ms:.1} ms screen, {pipeline_timeouts}/{pipeline_waits} timed out in sample), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect",
                 crate::descriptor::host::BACKLOG[0].load(Ordering::Relaxed),
@@ -3608,6 +3691,7 @@ impl Host {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             if p.swap_chain.Present(0, DXGI_PRESENT(0)).is_ok() {
+                p.note_path("copy", Some(desc.Format), None);
                 p.meter.frame(p.hwnd);
             }
             #[cfg(feature = "diagnostics")]
@@ -3648,7 +3732,15 @@ impl Host {
             .ok()?;
             (p.width, p.height, p.format) = (width, height, format);
         }
-        let view = |d: &D3D12_RESOURCE_DESC| swap_format(d.Format);
+        // The swap-chain format normalizes copy-compatible formats. An SRV
+        // must instead preserve a declared sRGB format and its transfer.
+        let view = |d: &D3D12_RESOURCE_DESC| {
+            if crate::compose::is_srgb(d.Format) {
+                Some(d.Format)
+            } else {
+                swap_format(d.Format)
+            }
+        };
         let planes = [
             scene.and_then(|s| Some((s.0, view(&a?)?))),
             Some((over.0, view(&b)?)),
@@ -3671,7 +3763,11 @@ impl Host {
                 }
             }
             list.ResourceBarrier(&into);
-            crate::compose::record(self, list, planes, &back, (width, height, format));
+            if !crate::compose::record(self, list, planes, &back, (width, height, format)) {
+                // Discard this recording. The caller can still present the scene.
+                p.copy.close();
+                return None;
+            }
             #[cfg(feature = "diagnostics")]
             let capture = {
                 list.ResourceBarrier(&[transition(&back, target, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
@@ -3691,6 +3787,7 @@ impl Host {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             if p.swap_chain.Present(0, DXGI_PRESENT(0)).is_ok() {
+                p.note_path("compose", a.map(|d| d.Format), Some(b.Format));
                 p.meter.frame(p.hwnd);
             }
         }
@@ -3737,6 +3834,7 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                observed_path: None,
             })
         }
     }

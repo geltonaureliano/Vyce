@@ -850,6 +850,8 @@ pub(crate) struct HostTexture {
     pub(crate) slot: Option<crate::texpool::Slot>,
     /// The title's largest mips it goes without ([`over_cap`]).
     pub(crate) skip: u32,
+    /// Created with RGB9E5 in the format list for sampling packed HDR data.
+    pub(crate) shared_exponent: bool,
     /// When a list last moved it to a state shaders or draws write in, in
     /// order: of textures in the same memory, the last holds its contents.
     pub(crate) written: std::sync::atomic::AtomicU64,
@@ -880,11 +882,13 @@ fn target_at(address: u64, d: &ResourceDesc) -> Option<This> {
         .iter()
         .map(|&r| r as This)
         .filter(|&r| {
-            let o = &resource(r).desc;
+            let resource = resource(r);
+            let o = &resource.desc;
             (o.dimension, o.width, o.height, o.depth_or_array_size, o.mip_levels)
                 == (d.dimension, d.width, d.height, d.depth_or_array_size, d.mip_levels)
                 && (family(o.format) == family(d.format)
-                    || d.format == SHARED_EXPONENT && (39..=43).contains(&o.format))
+                    || d.format == SHARED_EXPONENT
+                        && resource.host.as_ref().is_some_and(|host| host.shared_exponent))
         })
         .max_by_key(|&r| {
             resource(r)
@@ -993,7 +997,7 @@ fn castable(
     ];
     let mut texture: Option<ID3D12Resource> = None;
     // SAFETY: whole descriptions.
-    unsafe {
+    let result = unsafe {
         device.CreateCommittedResource3(
             &heap,
             D3D12_HEAP_FLAG_NONE,
@@ -1004,8 +1008,14 @@ fn castable(
             Some(&formats),
             &mut texture,
         )
+    };
+    if let Err(error) = result {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(%error, format = desc.Format.0, "no RGB9E5 cast for packed HDR target");
+        });
+        return None;
     }
-    .ok()?;
     texture
 }
 
@@ -1113,6 +1123,11 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
         return None;
     }
     resource(this).host.clone()
+}
+
+#[cfg(windows)]
+pub(crate) fn has_shared_exponent_view(this: This) -> bool {
+    resource(this).host.as_ref().is_some_and(|host| host.shared_exponent)
 }
 
 #[cfg(windows)]
@@ -1415,8 +1430,8 @@ fn hand_out_resource(
         heap_flags,
         backing,
         #[cfg(windows)]
-        host: host.map(|(texture, slot, skip, common)| {
-            let state = if common {
+        host: host.map(|(texture, slot, skip, shared_exponent)| {
+            let state = if shared_exponent {
                 0
             } else {
                 crate::host::legal_state(&texture, crate::host::texture_state(state))
@@ -1431,6 +1446,7 @@ fn hand_out_resource(
                 bytes,
                 slot,
                 skip,
+                shared_exponent,
                 written: Default::default(),
                 initialized: Default::default(),
                 twin: Default::default(),

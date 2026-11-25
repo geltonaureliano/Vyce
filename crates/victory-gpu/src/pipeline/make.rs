@@ -7,10 +7,9 @@
 //! title's GPU watchdog ended the run (decision 0007, "Pipelines made off
 //! the title's threads").
 //!
-//! A first use queues the pipeline and waits for it within a budget per
-//! frame, so the cheap ones (menus, one-off passes such as a colour-grading
-//! bake) are there at once as before; past the budget a draw or dispatch
-//! whose pipeline is not ready is dropped, as an untranslated one is.
+//! First binding can start compilation. A draw promotes its pipeline and may
+//! wait within a wall-clock budget shared by recording threads. A pipeline
+//! given a substantial wait is polled later while its worker finishes.
 //!
 //! Passes over the screen (no vertex input, no depth) have workers and a
 //! longer budget of their own: the title fills its lighting tables with
@@ -18,9 +17,7 @@
 //! of pipelines they waited minutes; a run that lost them had no diffuse
 //! light at all.
 //!
-//! shortcut: the budgets (half a second of waiting per title frame, 20 s
-//! for screen passes) are guesses; another pass the title runs only once
-//! and whose pipeline takes longer is lost.
+//! A one-off pass with a pipeline that misses its budget can still be lost.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -38,12 +35,14 @@ pub(crate) struct Pending {
     made: OnceLock<Option<HostPipeline>>,
     /// Its worker was lost to it: it will not be made.
     lost: AtomicBool,
+    /// Recording already gave this in-flight job time to finish.
+    wait_expired: AtomicBool,
     /// A pass over the screen (see [`GraphicsState::screen_pass`]).
     screen: bool,
-    /// What identifies it across runs (shader containers and state), and
-    /// whether a draw has used it yet.
+    /// What identifies it across runs (shader containers and state).
     key: String,
-    used: AtomicBool,
+    /// Persist once a real draw requested it and the worker made it.
+    prewarm: AtomicU8,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -67,18 +66,34 @@ impl Pending {
             queue_state: AtomicU8::new(NEW),
             made: OnceLock::new(),
             lost: AtomicBool::new(false),
+            wait_expired: AtomicBool::new(false),
             key: key.finalize().to_hex()[..32].to_owned(),
-            used: AtomicBool::new(false),
+            prewarm: AtomicU8::new(0),
         }
     }
 
     fn make(&self) {
         // Not `get_or_init`: a worker lost in it would leave it locked.
         let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+        let compiled = made.is_some();
         let _ = self.made.set(made);
         wake_waiters();
+        if compiled {
+            self.mark_prewarm(COMPILED);
+        }
+    }
+
+    fn mark_prewarm(&self, flag: u8) {
+        if self.prewarm.load(Ordering::Relaxed) & flag == 0
+            && self.prewarm.fetch_or(flag, Ordering::AcqRel) == ((WANTED | COMPILED) ^ flag)
+        {
+            super::library::note_used(&self.key);
+        }
     }
 }
+
+const WANTED: u8 = 1;
+const COMPILED: u8 = 2;
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
 /// not translate, else "refused" or "being made"; `None` if it has one.
@@ -86,6 +101,7 @@ impl Pending {
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
+        None if p.lost.load(Ordering::Acquire) => Some("compiler worker lost".into()),
         None => Some("being made".into()),
         Some(None) => {
             let failed: Vec<String> = p
@@ -103,20 +119,98 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
     }
 }
 
-/// Signalled whenever a worker has made a pipeline.
-static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
+#[derive(Default)]
+pub(crate) struct WaitStats {
+    pub(crate) micros: u64,
+    pub(crate) calls: u64,
+    pub(crate) timeouts: u64,
+}
+
+/// Time during which at least one recorder is waiting, by presentation.
+/// Overlapping waiters spend the same interval only once.
+#[derive(Default)]
+struct WaitWindow {
+    frame: Option<u64>,
+    limit: Duration,
+    spent: Duration,
+    active_since: Option<Instant>,
+    waiters: usize,
+}
+
+impl WaitWindow {
+    fn remaining(&self, now: Instant) -> Duration {
+        let active = self.active_since.map_or(Duration::ZERO, |start| now - start);
+        self.limit.saturating_sub(self.spent + active)
+    }
+
+    fn enter(&mut self, frame: u64, now: Instant, limit: Duration) -> Option<Instant> {
+        if self.frame.is_some_and(|current| frame < current) {
+            return None;
+        }
+        if self.frame != Some(frame) {
+            *self = Self { frame: Some(frame), limit, ..Self::default() };
+        }
+        let remaining = self.remaining(now);
+        if remaining.is_zero() {
+            return None;
+        }
+        self.active_since.get_or_insert(now);
+        self.waiters += 1;
+        Some(now + remaining)
+    }
+
+    fn leave(&mut self, frame: u64, now: Instant) {
+        if self.frame == Some(frame) {
+            self.waiters -= 1;
+            if self.waiters == 0 {
+                self.spent += now - self.active_since.take().expect("active waiter");
+            }
+        }
+    }
+}
+
+struct WaitState {
+    windows: [WaitWindow; 2],
+    stats: [WaitStats; 2],
+}
+
+/// Signalled whenever a worker has made a pipeline or been lost.
+static DONE: std::sync::LazyLock<(Mutex<WaitState>, Condvar)> = std::sync::LazyLock::new(|| (
+    Mutex::new(WaitState { windows: Default::default(), stats: Default::default() }),
+    Condvar::new(),
+));
+
+/// Completed waits for ordinary and screen passes. Times on different
+/// threads sum in telemetry even though their budget is shared.
+pub(crate) fn take_wait_stats() -> [WaitStats; 2] {
+    let mut held = DONE.0.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::take(&mut held.stats)
+}
 
 fn wake_waiters() {
-    let (lock, done) = &DONE;
+    let (lock, done) = &*DONE;
     let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
     done.notify_all();
 }
 
-/// Waiting allowed per title frame, over all threads.
-const BUDGET: Duration = Duration::from_millis(500);
-
-/// The same for passes over the screen (below the title's 30 s watchdog).
+const STARTUP_BUDGET: Duration = Duration::from_millis(500);
+const ORDINARY_BUDGET: Duration = Duration::from_millis(32);
+const STREAMING_BUDGET: Duration = Duration::from_millis(12);
+const BACKLOG: u64 = 32;
+/// Screen passes include one-off lighting bakes.
 const SCREEN_BUDGET: Duration = Duration::from_secs(20);
+
+fn budget(screen: bool, frame: u64, queued: u64) -> Duration {
+    if screen {
+        SCREEN_BUDGET
+    } else if queued >= BACKLOG {
+        STREAMING_BUDGET
+    } else if frame == 0 {
+        STARTUP_BUDGET
+    } else {
+        ORDINARY_BUDGET
+    }
+}
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -129,20 +223,24 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    p.mark_prewarm(WANTED);
     if p.made.get().is_none() {
-        start(p, REQUESTED);
-        if p.lost.load(Ordering::Acquire) {
-            return None;
-        }
-        // Also with a world's worth queued: passes the title runs only once
-        // set up what later ones loop over.
-        wait(p, crate::frame::current());
+        start(p, REQUESTED, false);
+        wait(p);
     }
-    let made = p.made.get()?.as_ref();
-    if made.is_some() && !p.used.swap(true, Ordering::Relaxed) {
-        super::library::note_used(&p.key);
+    peek(p)
+}
+
+pub(crate) fn peek(p: &Pending) -> Option<&HostPipeline> {
+    p.made.get()?.as_ref()
+}
+
+/// Let the first bind overlap compilation with recording. Limit speculative
+/// ordinary work to a short queue. Actual draws can always promote it.
+pub(crate) fn bound(p: &Arc<Pending>) {
+    if !p.shaders.is_empty() {
+        start(p, EARLY, true);
     }
-    made
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
@@ -150,32 +248,60 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 pub(crate) fn early(p: &Arc<Pending>) {
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p, EARLY);
+        start(p, EARLY, false);
     }
 }
 
-/// Waits for `p` while frame `frame` has budget of its kind left.
-fn wait(p: &Pending, frame: u64) {
-    static FRAME: [AtomicU64; 2] = [const { AtomicU64::new(u64::MAX) }; 2];
-    static WAITED_US: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
-    let kind = usize::from(p.screen);
-    let budget = [BUDGET, SCREEN_BUDGET][kind];
-    let waited = &WAITED_US[kind];
-    if FRAME[kind].swap(frame, Ordering::Relaxed) != frame {
-        waited.store(0, Ordering::Relaxed);
+/// Only a presentation event opens a fresh budget. A wait admitted before the
+/// rollover keeps its original deadline, but never spends the new budget.
+fn wait(p: &Pending) {
+    if p.lost.load(Ordering::Acquire) || p.wait_expired.load(Ordering::Relaxed) {
+        return;
     }
-    let left = budget.saturating_sub(Duration::from_micros(waited.load(Ordering::Relaxed)));
-    let started = Instant::now();
-    let (lock, done) = &DONE;
+    let kind = usize::from(p.screen);
+    let (lock, done) = &*DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() && !p.lost.load(Ordering::Acquire) {
-        let rest = left.saturating_sub(started.elapsed());
-        if rest.is_zero() {
+    if p.made.get().is_some()
+        || p.lost.load(Ordering::Acquire)
+        || p.wait_expired.load(Ordering::Relaxed)
+    {
+        return;
+    }
+    let frame = crate::queue::presented();
+    let limit = budget(p.screen, frame, waiting());
+    let started = Instant::now();
+    let window = &mut held.windows[kind];
+    let Some(deadline) = window.enter(frame, started, limit) else { return };
+
+    let mut timed_out = false;
+    let mut blocked = false;
+    loop {
+        if p.made.get().is_some() || p.lost.load(Ordering::Acquire) {
             break;
         }
+        let now = Instant::now();
+        let rest = deadline.saturating_duration_since(now);
+        if rest.is_zero() {
+            timed_out = blocked;
+            break;
+        }
+        blocked = true;
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
-    waited.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    let ended = Instant::now();
+    held.windows[kind].leave(frame, ended);
+    if blocked {
+        let stats = &mut held.stats[kind];
+        stats.micros += (ended - started).as_micros() as u64;
+        stats.calls += 1;
+        stats.timeouts += u64::from(timed_out);
+    }
+    let grace = if p.screen { SCREEN_BUDGET } else { STREAMING_BUDGET };
+    // A caller that only received the tail of a shared window is still
+    // eligible for a meaningful first-use wait in another frame.
+    if timed_out && deadline - started >= grace / 2 {
+        p.wait_expired.store(true, Ordering::Relaxed);
+    }
 }
 
 const NEW: u8 = 0;
@@ -262,7 +388,7 @@ static POOLS: [Pool; 2] = [const { Pool::new() }; 2];
 
 /// Queue a prewarm job or promote a job needed by a draw. Claims and
 /// promotions are serialized by the pool's queue lock.
-fn start(p: &Arc<Pending>, priority: u8) {
+fn start(p: &Arc<Pending>, priority: u8, speculative: bool) {
     if p.queue_state.load(Ordering::Relaxed) >= priority {
         return;
     }
@@ -286,6 +412,9 @@ fn start(p: &Arc<Pending>, priority: u8) {
         p.lost.store(true, Ordering::Release);
         drop(queue);
         wake_waiters();
+        return;
+    }
+    if speculative && queue.early.len() + queue.requested.len() >= BACKLOG as usize {
         return;
     }
     if let Some(new) = queue.push(p, priority) {
@@ -428,8 +557,49 @@ mod tests {
         let p = Pending::new(Vec::new(), None);
         p.lost.store(true, Ordering::Release);
         let start = Instant::now();
-        wait(&p, u64::MAX - 1);
-        assert!(start.elapsed() < BUDGET, "a lost worker cannot finish");
+        wait(&p);
+        assert!(start.elapsed() < STARTUP_BUDGET, "a lost worker cannot finish");
+    }
+
+    #[test]
+    fn overlapping_recorders_share_a_deadline_and_leave_unused_time() {
+        let ms = Duration::from_millis;
+        let now = Instant::now();
+        let mut window = WaitWindow::default();
+        assert_eq!(window.enter(6, now, ms(32)), Some(now + ms(32)));
+        assert_eq!(window.enter(6, now + ms(4), ms(32)), Some(now + ms(32)));
+        assert_eq!(window.enter(6, now + ms(5), ms(32)), Some(now + ms(32)));
+        window.leave(6, now + ms(6));
+        window.leave(6, now + ms(8));
+        window.leave(6, now + ms(10));
+        // Ten milliseconds were shared, independent of three blocked threads.
+        assert_eq!(window.remaining(now + ms(50)), ms(22));
+        assert_eq!(window.enter(6, now + ms(50), ms(32)), Some(now + ms(72)));
+        window.leave(6, now + ms(72));
+        assert_eq!(window.enter(6, now + ms(73), ms(32)), None);
+    }
+
+    #[test]
+    fn pressure_changes_the_next_window_and_stale_waiters_cannot_reset_it() {
+        let ms = Duration::from_millis;
+        let now = Instant::now();
+        let mut window = WaitWindow::default();
+        assert_eq!(window.enter(3, now, ms(32)), Some(now + ms(32)));
+        assert_eq!(window.enter(3, now + ms(5), ms(12)), Some(now + ms(32)));
+        assert_eq!(window.enter(4, now + ms(9), ms(12)), Some(now + ms(21)));
+        window.leave(3, now + ms(10));
+        assert_eq!(window.enter(3, now + ms(11), ms(32)), None);
+        assert_eq!(window.remaining(now + ms(12)), ms(9));
+        window.leave(4, now + ms(12));
+        assert_eq!(window.remaining(now + ms(30)), ms(9));
+    }
+
+    #[test]
+    fn loading_and_screen_passes_keep_their_own_wait_budget() {
+        assert_eq!(budget(false, 0, BACKLOG - 1), STARTUP_BUDGET);
+        assert_eq!(budget(false, 1, BACKLOG - 1), ORDINARY_BUDGET);
+        assert_eq!(budget(false, 1, BACKLOG), STREAMING_BUDGET);
+        assert_eq!(budget(true, 1, BACKLOG), SCREEN_BUDGET);
     }
 
     #[test]

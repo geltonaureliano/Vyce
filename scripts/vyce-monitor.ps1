@@ -126,7 +126,10 @@ $header.Controls.Add($durationLabel, 1, 1)
 $root.Controls.Add($header, 0, 0)
 
 $mainMetrics = (New-MetricRow @('FPS', 'Tempo por quadro', 'Draw calls / quadro', 'Quadros apresentados') 1 21 @{}).Values
-$workMetrics = (New-MetricRow @('Preparo na CPU', 'Espera pela GPU', 'Cópia de volta', 'Descartes / quadro', 'Pipelines em criação') 2 15 @{}).Values
+$work = New-MetricRow @('Preparo na CPU', 'Espera pela GPU', 'Cópia de volta', 'Descartes / quadro', 'Pipelines em criação') 2 15 @{
+    'Pipelines em criação' = 'Espera CPU —'
+}
+$workMetrics = $work.Values
 $resources = New-MetricRow @('RAM do sistema', 'RAM do jogo', 'CPU do sistema', 'CPU do jogo', 'Threads do jogo') 3 14 @{
     'RAM do sistema' = '— disponíveis'
     'RAM do jogo' = 'Memória residente'
@@ -419,6 +422,8 @@ function Update-Monitor {
     $workMetrics['Cópia de volta'].Text = Format-Metric $frame.copy_back_ms '0.0' ' ms'
     $workMetrics['Descartes / quadro'].Text = Format-Metric $frame.dropped_per_frame '0.0'
     $workMetrics['Pipelines em criação'].Text = Format-Metric $frame.pipelines_building 'N0'
+    $pipelineWait = Format-Metric $frame.pipeline_wait_ms '0.0' ' ms/quadro'
+    $work.Details['Pipelines em criação'].Text = "Espera CPU $pipelineWait"
 
     if (!$alive) {
         $activityLabel.Text = 'Sessão encerrada'

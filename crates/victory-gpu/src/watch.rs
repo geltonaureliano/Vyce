@@ -104,6 +104,15 @@ struct Journal {
     found: Vec<usize>,
 }
 
+impl Journal {
+    fn pages(&self, first: usize, last: usize) -> Vec<(usize, u64)> {
+        self.written
+            .range(first..last)
+            .map(|(&page, &when)| (page, when))
+            .collect()
+    }
+}
+
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
@@ -116,6 +125,27 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    observe_writes(start, end, guarded, Journal::pages)
+}
+
+/// Records writes and returns only their generation. Copy-back already knows
+/// which pages it synchronized, so it does not need a snapshot of the journal.
+pub(crate) fn copy_epoch(start: usize, end: usize, known_guarded: bool) -> Option<u64> {
+    let epoch_only = |_: &Journal, _: usize, _: usize| ();
+    if known_guarded {
+        observe_guarded_writes(start, end, epoch_only)
+    } else {
+        observe_writes(start, end, true, epoch_only)
+    }
+    .map(|(now, ())| now)
+}
+
+fn observe_writes<T>(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    report: impl FnOnce(&Journal, usize, usize) -> T,
+) -> Option<(u64, T)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -154,23 +184,30 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
+    let Journal { written, found, .. } = j;
+    // The kernel reports 4 KiB addresses. Adjacent hits in the same journal
+    // page mark the same generation and only need one insertion.
+    let pages = found[..count]
+        .chunk_by(|a, b| *a / PAGE == *b / PAGE)
+        .map(|hits| hits[0] / PAGE);
+    for page in pages.chain(guarded) {
+        written.insert(page, now);
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    Some((now, report(j, first, last)))
 }
 
 /// Same as [`writes`] for memory already known to be guarded `MEM_MAPPED`
 /// view memory: skips the `GetWriteWatch` syscall (which always fails on
 /// mapped views).
 pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    observe_guarded_writes(start, end, Journal::pages)
+}
+
+fn observe_guarded_writes<T>(
+    start: usize,
+    end: usize,
+    report: impl FnOnce(&Journal, usize, usize) -> T,
+) -> Option<(u64, T)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -188,13 +225,7 @@ pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<(u64, Vec<(usiz
     for page in guarded {
         j.written.insert(page, now);
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    Some((now, report(&j, first, last)))
 }
 
 /// Guarded blocks of view memory.
@@ -994,16 +1025,20 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        let (_, before) = writes(start, end, false).expect("watched");
-        assert!(before.is_empty());
+        let (initial, before) = writes(start, end, false).expect("watched");
+        // Windows can reuse an address already present in the journal.
+        assert!(before.iter().all(|&(_, when)| when < initial));
         // SAFETY: committed pages of ours.
-        unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
-        let (now, after) = writes(start, end, false).expect("watched");
-        assert_eq!(after, [(p / PAGE + 1, now)]);
+        unsafe {
+            ((p + PAGE + 8) as *mut u8).write(1);
+            ((p + PAGE + KERNEL_PAGE + 8) as *mut u8).write(2);
+            ((p + 2 * PAGE + 8) as *mut u8).write(3);
+        }
+        let now = copy_epoch(start, end, false).expect("watched");
         // Another asker after the kernel's bit was cleared still sees it.
-        let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
+        let (later, again) = writes(p + PAGE, p + 3 * PAGE, false).expect("watched");
         assert!(later > now);
-        assert_eq!(again, [(p / PAGE + 1, now)]);
+        assert_eq!(again, [(p / PAGE + 1, now), (p / PAGE + 2, now)]);
         let mut plain = vec![0u8; PAGE];
         assert!(
             writes(
@@ -1015,6 +1050,20 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn copy_epoch_preserves_guarded_writes_for_later_askers() {
+        let (guarded, other) = two_views();
+        let (start, end) = (guarded + BLOCK, guarded + 2 * BLOCK);
+        copy_epoch(guarded, end, true).expect("guard the mapped views");
+        // SAFETY: a write in the second view; the guard handler opens it.
+        unsafe { ((other + BLOCK + 8) as *mut u8).write(1) };
+        let now = copy_epoch(guarded, end, true).expect("record the alias write");
+        let (later, pages) = writes_guarded(start, end).expect("read the overlapping history");
+        assert!(later > now);
+        assert_eq!(pages, [(start / PAGE, now)]);
+        drop_views(&[guarded, other]);
     }
 
     /// A kernel read into a guarded view block fails; opened first, it

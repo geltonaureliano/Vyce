@@ -2374,15 +2374,27 @@ fn buffer_uav(
     Some(Some(shadow.buffer.clone()))
 }
 
+/// Formats with identical storage that differ only in their RGB transfer.
+fn srgb_pair(resource: u32, view: u32) -> bool {
+    const BLOCKS: [(u32, u32); 4] = [(72, 71), (75, 74), (78, 77), (99, 98)];
+    crate::resource::SRGB.iter().chain(&BLOCKS).any(|&(srgb, linear)| {
+        (resource, view) == (linear, srgb) || (resource, view) == (srgb, linear)
+    })
+}
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
-/// resource's permission, of typed depth, and in another format than a
-/// typed resource's. A view of a typed texture in another format of its
-/// family takes the texture's format.
-/// shortcut: such a view (sRGB of UNORM, say) reads without its
-/// conversion; cast with castable formats if colors come out wrong.
-fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
+/// resource's permission or of typed depth. Keep explicit sRGB/UNORM views
+/// when the adapter supports fully typed casting. Other typed casts still
+/// use the resource's own format unless its creation enabled RGB9E5.
+fn fits(
+    host: &Host,
+    texture: &ID3D12Resource,
+    mut format: Option<&mut DXGI_FORMAT>,
+    unordered: bool,
+    shared_exponent: bool,
+) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
@@ -2420,7 +2432,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         && family(own) == 39
         && d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0
     {
-        return !unordered;
+        return shared_exponent && !unordered;
     }
     // A packed 16-bit target made R8G8B8A8_UNORM on this GPU
     // (`resource::target_format`): views name the format it has.
@@ -2436,6 +2448,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     if let Some(format) = format
         && !typeless
+        && (unordered || !srgb_pair(own, view) || !host.fully_typed_casts)
     {
         *format = d.Format;
     }
@@ -2510,7 +2523,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let resource = *resource as crate::object::This;
             if let Some(texture) = crate::resource::host_resource(resource) {
                 let mut desc = desc.as_ref().map(srv_desc);
-                if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
+                let rgb9 = desc.as_ref().is_some_and(|d| d.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)
+                    && crate::resource::has_shared_exponent_view(resource);
+                if !fits(host, texture, desc.as_mut().map(|d| &mut d.Format), false, rgb9) {
                     return None;
                 }
                 let skip = crate::resource::skipped_mips(resource);
@@ -2550,7 +2565,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 return crate::twin::view(twin, desc.as_ref(), at).map(Some);
             }
             let mut desc = desc.as_ref().map(uav_desc);
-            if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+            if !fits(host, texture, desc.as_mut().map(|d| &mut d.Format), true, false) {
                 return None;
             }
             // SAFETY: a live texture and a slot of our heap.
@@ -2843,6 +2858,55 @@ mod tests {
         0x4059,
         [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
     );
+
+    #[test]
+    fn color_views_preserve_srgb_and_require_a_real_rgb9e5_alias() {
+        let Some(host) = host() else { return };
+        let make_texture = |format, flags| {
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: the descriptions are small, typed 2D textures; out pointer is ours.
+            unsafe {
+                host.device.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: 4,
+                        Height: 4,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: format,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Flags: flags,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut texture,
+                )
+            }.expect("test texture");
+            texture.unwrap()
+        };
+
+        let rgba = make_texture(DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
+        let mut srgb = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        assert!(fits(host, &rgba, Some(&mut srgb), false, false));
+        let expected = if host.fully_typed_casts {
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+        } else {
+            DXGI_FORMAT_R8G8B8A8_UNORM
+        };
+        assert_eq!(srgb, expected);
+        assert!(srgb_pair(98, 99));
+        assert!(!srgb_pair(28, 30));
+
+        let packed = make_texture(DXGI_FORMAT_R32_UINT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        let mut rgb9 = DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+        assert!(!fits(host, &packed, Some(&mut rgb9), false, false));
+    }
 
     #[repr(C)]
     struct ExtendedHeapDesc {
