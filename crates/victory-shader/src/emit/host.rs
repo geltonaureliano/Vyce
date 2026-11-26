@@ -174,6 +174,7 @@ impl Host {
             super::Target {
                 lanes_min: o.WaveLaneCountMin,
                 lanes_max: o.WaveLaneCountMax,
+                exact_views: false,
             }
         } else {
             super::Target::ANY
