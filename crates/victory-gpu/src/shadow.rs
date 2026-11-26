@@ -24,6 +24,8 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+pub(crate) mod pass;
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
@@ -346,7 +348,7 @@ impl Shadow {
                 if let Some((dirty_start, dirty_end)) = dirty_span {
                     let dirty_len = dirty_end - dirty_start;
                     if mode != 1 {
-                        crate::watch::writing(title_addr + dirty_start, dirty_len);
+                        crate::watch::opening(title_addr + dirty_start, dirty_len);
                     }
                     crate::host::write_mapped(
                         (title_addr + dirty_start) as *mut u8,
@@ -410,6 +412,19 @@ impl Shadow {
         let shadow = Shadow::new(buffer, data, gpu, start, len, Some(card));
         shadow.watched.store(NOT_WATCHED, Ordering::Relaxed);
         Arc::new(shadow)
+    }
+
+    /// A copy of `len` bytes of plain memory at `start`, in `host`'s memory,
+    /// and where its bytes are.
+    #[cfg(test)]
+    pub(crate) fn for_test(h: &crate::host::Host, start: usize, len: u64) -> (Arc<Self>, usize) {
+        let (buffer, data) = h.shared_buffer(len).unwrap();
+        // SAFETY: a live buffer and its mapping.
+        let gpu = unsafe {
+            std::ptr::copy_nonoverlapping(start as *const u8, data, len as usize);
+            buffer.GetGPUVirtualAddress()
+        };
+        (Arc::new(Shadow::new(buffer, data, gpu, start as u64, len, None)), data as usize)
     }
 
     #[cfg(test)]
@@ -613,7 +628,7 @@ impl Shadow {
                         {
                             let dirty_len = dirty_end - dirty_start;
                             if mode != 1 {
-                                crate::watch::writing(start + at + dirty_start, dirty_len);
+                                crate::watch::opening(start + at + dirty_start, dirty_len);
                             }
                             crate::host::write_mapped(
                                 (start + at + dirty_start) as *mut u8,
@@ -797,6 +812,9 @@ impl Shadow {
             if self.sparse.is_none() {
                 self.watched.store(NOT_WATCHED, Ordering::Relaxed);
             }
+        }
+        if pass::is_early() {
+            return 0;
         }
         // shortcut: memory that cannot be watched (unmapped, mostly) is copied
         // once a frame.
@@ -2160,7 +2178,7 @@ impl Shadow {
                 }
                 if let Some((dirty_start, dirty_end)) = merge_gpu_writes_mut(&mut buf[..n], host, old) {
                     let dirty_len = dirty_end - dirty_start;
-                    crate::watch::writing(at + dirty_start, dirty_len);
+                    crate::watch::opening(at + dirty_start, dirty_len);
                     crate::host::write_mapped(
                         (at + dirty_start) as *mut u8,
                         buf[dirty_start..].as_ptr(),
