@@ -109,7 +109,8 @@ function Show-Panel {
 }
 
 # A plain window for where the panel itself does not open: the numbers of the
-# last sample, the loading, and the warnings and errors as they are.
+# last sample, the loading, and the warnings and errors as they are. `Why`
+# is told at its foot.
 function Show-PlainPanel([string]$Why) {
     $back = [Drawing.Color]::FromArgb(16, 20, 29)
     $ink = [Drawing.Color]::FromArgb(233, 240, 250)
@@ -141,12 +142,22 @@ function Show-PlainPanel([string]$Why) {
     $note.Dock = 'Bottom'
     $note.Height = 48
     $note.Padding = [Windows.Forms.Padding]::new(12, 4, 12, 4)
-    $note.Text = "O painel completo não abriu: $Why"
+    $note.Text = $Why
     $form.Controls.AddRange(@($list, $numbers, $note))
     $state = @{ At = -1L; Part = ''; Frame = $null; FrameAt = $null; Load = $null; Warnings = 0; Errors = 0; Decoder = [Text.Encoding]::UTF8.GetDecoder() }
     $game = Get-Process -Id $GamePid -ErrorAction SilentlyContinue
     $culture = [Globalization.CultureInfo]::GetCultureInfo('pt-BR')
     $say = { param($Value, $Format) if ($null -eq $Value) { '—' } else { ([double]$Value).ToString($Format, $culture) } }
+    # "2026-11-26T04:45:56.672679Z  WARN victory_gpu::x: text" as "01:45:56  AVISO  text".
+    $tidy = {
+        param([string]$Line)
+        if ($Line -match '^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?Z\s+(WARN|ERROR)\s+[\w:]+:\s(.*)$') {
+            $utc = [DateTime]::SpecifyKind([DateTime]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture), 'Utc')
+            $word = if ($Matches[3] -eq 'WARN') { 'AVISO' } else { 'ERRO' }
+            return $utc.ToLocalTime().ToString('HH:mm:ss') + "  $word  " + $Matches[4]
+        }
+        $Line
+    }
 
     $read = {
         $file = $null
@@ -175,8 +186,8 @@ function Show-PlainPanel([string]$Why) {
                 elseif ($line.StartsWith('VYCE_LOADING {', [StringComparison]::Ordinal)) { $load = $line }
                 elseif (-not $line.StartsWith('VYCE_', [StringComparison]::Ordinal)) {
                     $line = ($line -replace '\x1b\[[0-9;]*m', '').Trim()
-                    if ($line -match '^(\S+\s+)?(ERROR|FATAL)\b|^VIctory: |panicked') { $state.Errors++; $new.Add($line) }
-                    elseif ($line -match '^(\S+\s+)?WARN\b') { $state.Warnings++; $new.Add($line) }
+                    if ($line -match '^(\S+\s+)?(ERROR|FATAL)\b|^VIctory: |panicked') { $state.Errors++; $new.Add((& $tidy $line)) }
+                    elseif ($line -match '^(\S+\s+)?WARN\b') { $state.Warnings++; $new.Add((& $tidy $line)) }
                 }
             }
             if ($frame) {
@@ -217,7 +228,7 @@ function Show-PlainPanel([string]$Why) {
             $text += "$(& $say $f.fps '0.0') FPS, $(& $say $f.frame_ms '0.0') ms por quadro, há $age s"
             if ($alive -and $age -ge 4) { $text += "O jogo não apresentou quadros há $age s." }
             $text += "GPU $(& $say $f.gpu_wait_ms '0.0') ms, preparo $(& $say $f.cpu_prepare_ms '0.0') ms, cópia de volta $(& $say $f.copy_back_ms '0.0') ms"
-            $text += "Desenhos $(& $say $f.draws_per_frame 'N0'), descartados $(& $say $f.dropped_per_frame 'N0'), pipelines na fila $(& $say $f.pipelines_building 'N0'), vídeo $(& $say $f.vram_mb 'N0') MB"
+            $text += "Desenhos $(& $say $f.draws_per_frame 'N0'), descartados $(& $say $f.dropped_per_frame 'N0'), pipelines na fila $(& $say $f.pipelines_building 'N0'), VRAM $(& $say $f.vram_mb 'N0') de $(& $say $f.vram_budget_mb 'N0') MB"
         } else { $text += 'Aguardando o primeiro quadro.' }
         if ($alive -and $state.Load -and $null -ne $state.Load.percent) {
             $text += "Carregando: $(& $say ([Math]::Floor([double]$state.Load.percent)) '0') %, faltam $(& $say $state.Load.left_s '0') s"
@@ -243,11 +254,16 @@ function Show-PlainPanel([string]$Why) {
 }
 
 $problem = $null
-try {
-    Import-Panel
-    Show-Panel
-} catch {
-    $problem = $_.Exception.Message
-    [Console]::Error.WriteLine("painel: $_")
+# VYCE_PANEL=simples opens the plain window, as a way around the panel.
+if ($env:VYCE_PANEL -eq 'simples') {
+    $problem = 'Painel simples, pedido por VYCE_PANEL=simples.'
+} else {
+    try {
+        Import-Panel
+        Show-Panel
+    } catch {
+        $problem = "O painel completo não abriu: $($_.Exception.Message)"
+        [Console]::Error.WriteLine("painel: $_")
+    }
 }
 if ($problem) { Show-PlainPanel $problem }

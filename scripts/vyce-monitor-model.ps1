@@ -51,6 +51,13 @@ namespace Vyce.Monitor
             return v.ToString(v >= 99.95 ? "N0" : "0.0", Pt) + " ms";
         }
 
+        /// A count per frame: 3.898, 25,6, 0,4.
+        public static string PerFrame(double v)
+        {
+            if (!Known(v)) return Nothing;
+            return v.ToString(v >= 99.95 ? "N0" : "0.#", Pt);
+        }
+
         public static string Share(double v)
         {
             return Known(v) ? (100 * v).ToString("0", Pt) + " %" : Nothing;
@@ -158,6 +165,8 @@ namespace Vyce.Monitor
             else if (Word("true")) value = true;
             else if (Word("false")) value = false;
             else if (Word("null")) value = null;
+            // What Rust prints for numbers that are none: unknown, not a broken line.
+            else if (Word("NaN") || Word("inf") || Word("-inf")) value = double.NaN;
             else value = Number();
             depth--;
             return value;
@@ -370,8 +379,11 @@ namespace Vyce.Monitor
     {
         public DateTime At;
         public Level Level;
-        /// Hidden unless everything is asked for.
+        /// Lines that repeat or tell little: hidden unless everything is
+        /// asked for or a filter looks for them.
         public bool Noise;
+        /// A VYCE_ line of numbers: only with everything.
+        public bool Report;
         public string Text;
     }
 
@@ -585,8 +597,11 @@ namespace Vyce.Monitor
         public readonly string Why;
         /// Seconds without one more after which the next starts another row.
         public readonly double Gap;
+        /// Whether its text tells how many there were; else a row of several
+        /// gets "(n vezes)".
+        public readonly bool Tells;
 
-        public Kind(string id, Mark mark, string label, Func<Row, string> text, string why = null, double gap = 20)
+        public Kind(string id, Mark mark, string label, Func<Row, string> text, string why = null, double gap = 20, bool tells = false)
         {
             Id = id;
             Mark = mark;
@@ -594,6 +609,7 @@ namespace Vyce.Monitor
             Text = text;
             Why = why;
             Gap = gap;
+            Tells = tells;
         }
     }
 
@@ -643,7 +659,8 @@ namespace Vyce.Monitor
         public string Text()
         {
             string prefix = Kind.Mark == Mark.Warn ? "Aviso: " : Kind.Mark == Mark.Error ? "ERRO: " : "";
-            return prefix + Kind.Text(this);
+            string text = prefix + Kind.Text(this);
+            return Kind.Tells || Count < 2 ? text : text + " (" + Say.Count(Count) + " vezes)";
         }
     }
 
@@ -843,6 +860,24 @@ namespace Vyce.Monitor
             p.Back /= frames;
             p.PipelineWait /= frames;
             p.Busy = busy ? p.Busy / frames : double.NaN;
+            return p.Fit();
+        }
+
+        /// Of numbers known otherwise (medians, say); null without a frame time.
+        public static Parts From(double ms, double gpu, double prepare, double back, double busy, double pipelineWait)
+        {
+            if (!(ms > 0)) return null;
+            Parts p = new Parts
+            {
+                Ms = ms, Gpu = Sample.OrZero(gpu), Prepare = Sample.OrZero(prepare), Back = Sample.OrZero(back),
+                Busy = busy, PipelineWait = Sample.OrZero(pipelineWait),
+            };
+            return p.Fit();
+        }
+
+        Parts Fit()
+        {
+            Parts p = this;
             // Parts that overlap can add up to more than the frame.
             double sum = p.Gpu + p.Prepare + p.Back;
             if (sum > p.Ms)
@@ -969,52 +1004,56 @@ namespace Vyce.Monitor
         public static readonly Kind Mapped = new Kind("mapped", Mark.Info, "jogo na memória",
             r => "Jogo carregado na memória");
         public static readonly Kind Library = new Kind("title-dll", Mark.Info, "bibliotecas do jogo",
-            r => Of(r, "Biblioteca do jogo carregada: " + r.Note, "bibliotecas do jogo carregadas"));
+            r => Of(r, "Biblioteca do jogo carregada: " + r.Note, "bibliotecas do jogo carregadas"), tells: true);
         public static readonly Kind Bound = new Kind("bound", Mark.Info, "funções ligadas",
             r => "Funções do console ligadas, nenhuma faltando");
         public static readonly Kind Missing = new Kind("missing", Mark.Warn, "funções do console que faltam",
             r => Of(r, "falta uma função do console: " + r.Note, "funções do console faltam (a última: " + r.Note + ")"),
-            "Se o jogo chamar uma delas, ele para.");
+            "Se o jogo chamar uma delas, ele para.", tells: true);
         public static readonly Kind Files = new Kind("file", Mark.Info, "arquivos do jogo abertos",
-            r => r.Count == 1 ? "Arquivo do jogo aberto: " + r.Note : "Arquivos do jogo abertos: " + N(r) + " (o último: " + r.Note + ")");
+            r => r.Count == 1 ? "Arquivo do jogo aberto: " + r.Note : "Arquivos do jogo abertos: " + N(r) + " (o último: " + r.Note + ")", tells: true);
         public static readonly Kind FileFailed = new Kind("file-failed", Mark.Error, "arquivos do jogo que não abriram",
             r => Of(r, "um arquivo do jogo não abriu: " + r.Note, "arquivos do jogo não abriram (o último: " + r.Note + ")"),
-            "Confira se os arquivos do jogo estão completos e se o disco responde.");
+            "Confira se os arquivos do jogo estão completos e se o disco responde.", tells: true);
         public static readonly Kind ReadFailed = new Kind("read-failed", Mark.Error, "leituras do jogo que falharam",
             r => Of(r, "uma leitura do jogo falhou: " + r.Note, "leituras do jogo falharam (a última: " + r.Note + ")"),
-            "Uma parte do jogo não carregou. Confira os arquivos e o disco.");
+            "Uma parte do jogo não carregou. Confira os arquivos e o disco.", tells: true);
         public static readonly Kind Pad = new Kind("pad", Mark.Info, "controles",
-            r => r.Note);
+            r => r.Note, tells: true);
         public static readonly Kind Sound = new Kind("sound", Mark.Info, "áudio",
-            r => "Áudio do jogo pronto");
+            r => "Áudio do jogo pronto", tells: true);
         public static readonly Kind Net = new Kind("net", Mark.Info, "rede",
             r => Of(r, "O jogo tentou usar a rede; foi bloqueado", "vezes o jogo tentou usar a rede; foi bloqueado"),
-            "O jogo roda sem internet. Nada foi enviado.");
+            "O jogo roda sem internet. Nada foi enviado.", tells: true);
         public static readonly Kind Said = new Kind("said", Mark.Info, "mensagens do jogo",
-            r => Of(r, "O jogo avisou: " + r.Note, "mensagens do jogo (a última: " + r.Note + ")"));
-        public static readonly Kind Tuned = new Kind("tuned", Mark.Info, "ajustes",
-            r => "Ajuste ligado: " + r.Note);
+            r => Of(r, "O jogo avisou: " + r.Note, "mensagens do jogo (a última: " + r.Note + ")"), tells: true);
+
+        /// A setting of the environment the runtime tells it follows: one row each.
+        public static Kind Tuned(string setting)
+        {
+            return ByReason("tuned", setting, (id, text) => new Kind(id, Mark.Info, "ajustes", r => "Ajuste ligado: " + text));
+        }
 
         // Stages.
-        public static readonly Kind Start = new Kind("stage-start", Mark.Stage, "etapas", r => "Iniciando o jogo", null, 0);
-        public static readonly Kind Idle = new Kind("stage-idle", Mark.Stage, "etapas", r => "No menu ou em um vídeo", null, 0);
-        public static readonly Kind Load = new Kind("stage-load", Mark.Stage, "etapas", r => "Carregando o mundo", null, 0);
-        public static readonly Kind Again = new Kind("stage-again", Mark.Stage, "etapas", r => "Carregando outro lugar", null, 0);
+        public static readonly Kind Start = new Kind("stage-start", Mark.Stage, "etapas", r => "Iniciando o jogo", null, 0, tells: true);
+        public static readonly Kind Idle = new Kind("stage-idle", Mark.Stage, "etapas", r => "No menu ou em um vídeo", null, 0, tells: true);
+        public static readonly Kind Load = new Kind("stage-load", Mark.Stage, "etapas", r => "Carregando o mundo", null, 0, tells: true);
+        public static readonly Kind Again = new Kind("stage-again", Mark.Stage, "etapas", r => "Carregando outro lugar", null, 0, tells: true);
         public static readonly Kind World = new Kind("stage-world", Mark.Stage, "etapas",
-            r => "No mundo" + (Say.Known(r.A) ? " (carregou em " + Say.Long(r.A) + ")" : ""), null, 0);
+            r => "No mundo" + (Say.Known(r.A) ? " (carregou em " + Say.Long(r.A) + ")" : ""), null, 0, tells: true);
         public static readonly Kind LoadDone = new Kind("load-done", Mark.Good, "carregamentos",
-            r => r.Note + " em " + Say.Long(r.A) + (r.B > 0 ? ", " + Say.Size(r.B) + " lidos do disco" : ""), null, 0);
+            r => r.Note + " em " + Say.Long(r.A) + (r.B > 0 ? ", " + Say.Size(r.B) + " lidos do disco" : ""), null, 0, tells: true);
         public static readonly Kind LoadLost = new Kind("load-lost", Mark.Warn, "progresso do carregamento",
             r => "o progresso do carregamento não pôde ser lido ou guardado (" + r.Note + ")");
         public static readonly Kind Closing = new Kind("closing", Mark.Stage, "encerramento",
-            r => "Janela do jogo fechada; encerrando");
+            r => "Janela do jogo fechada; encerrando", tells: true);
         public static readonly Kind Ending = new Kind("ending", Mark.Info, "encerramento",
-            r => r.Note, null, 0);
-        public static readonly Kind Ended = new Kind("ended", Mark.Stage, "fim", r => "Jogo encerrado: " + r.Note, null, 0);
+            r => r.Note, null, 0, tells: true);
+        public static readonly Kind Ended = new Kind("ended", Mark.Stage, "fim", r => "Jogo encerrado: " + r.Note, null, 0, tells: true);
         public static readonly Kind EndedBadly = new Kind("ended-badly", Mark.Error, "fim com erro", r => "jogo encerrado: " + r.Note,
-            "Use Copiar resumo para mandar o que aconteceu.", 0);
+            "Use Copiar resumo para mandar o que aconteceu.", 0, tells: true);
         public static readonly Kind Relaunch = new Kind("relaunch", Mark.Stage, "reinícios",
-            r => "O jogo reiniciou em outro processo (" + r.Note + ")", null, 0);
+            r => "O jogo reiniciou em outro processo (" + r.Note + ")", null, 0, tells: true);
         public static readonly Kind Exits = new Kind("exits", Mark.Info, "saídas pedidas pelo jogo",
             r => "O jogo pediu para sair (código " + r.Note + ")");
 
@@ -1038,34 +1077,34 @@ namespace Vyce.Monitor
         public static readonly Kind FirstFrame = new Kind("first-frame", Mark.Good, "primeiro quadro",
             r => "Primeiro quadro na tela");
         public static readonly Kind NoPicture = new Kind("no-picture", Mark.Error, "imagem não mostrada",
-            r => Of(r, "a imagem não pôde ser mostrada: " + r.Note, "vezes a imagem não pôde ser mostrada: " + r.Note));
+            r => Of(r, "a imagem não pôde ser mostrada: " + r.Note, "vezes a imagem não pôde ser mostrada: " + r.Note), tells: true);
         public static readonly Kind VideoMemory = new Kind("video-memory", Mark.Info, "memória de vídeo",
             r => "Memória de vídeo: " + r.Note + (r.Count > 1 ? " (" + N(r) + " medidas)" : ""),
-            "Medida pelo Vyce depois que o jogo cria as imagens dele, e depois a cada minuto.", 90);
+            "Medida pelo Vyce depois que o jogo cria as imagens dele, e depois a cada minuto.", 90, tells: true);
         public static readonly Kind GpuTop = new Kind("gpu-top", Mark.Info, "GPU",
-            r => "O que mais pesa na GPU: " + r.Note, null, double.MaxValue);
+            r => "O que mais pesa na GPU: " + r.Note, null, double.MaxValue, tells: true);
 
         // Shaders and pipelines.
         const string WhatShader = "Shader é o programa que pinta um material ou um efeito. ";
         const string WhatPipeline = "Pipeline é um shader já pronto para a placa usar. ";
         public static readonly Kind Shader = new Kind("shader", Mark.Info, "shaders traduzidos",
-            r => "Shaders traduzidos: " + N(r), WhatShader + "Os que já estavam no cache contam aqui e custam pouco.", 120);
+            r => "Shaders traduzidos: " + N(r), WhatShader + "Os que já estavam no cache contam aqui e custam pouco.", 120, tells: true);
         public static readonly Kind Pipeline = new Kind("pipeline", Mark.Info, "pipelines criados",
             r => "Pipelines criados: " + N(r) + (r.B > 0 ? " (" + Say.Count(r.B) + (r.B == 1 ? " recusado)" : " recusados)") : ""),
-            WhatPipeline + "Enquanto faltam, os objetos que os usam não aparecem.", 120);
+            WhatPipeline + "Enquanto faltam, os objetos que os usam não aparecem.", 120, tells: true);
         public static readonly Kind Refused = new Kind("refused", Mark.Warn, "pipelines recusados pelo driver",
             r => Of(r, "1 pipeline recusado pelo driver (" + r.Note + ")", "pipelines recusados pelo driver (" + r.Note + ")"),
-            WhatPipeline + "O driver não aceitou estes. " + Drops);
+            WhatPipeline + "O driver não aceitou estes. " + Drops, tells: true);
         public static readonly Kind NoPipeline = new Kind("no-pipeline", Mark.Warn, "pipelines não feitos",
-            r => Of(r, "pipeline não feito: " + r.Note, "pipelines não feitos (" + r.Note + ")"), Drops);
+            r => Of(r, "pipeline não feito: " + r.Note, "pipelines não feitos (" + r.Note + ")"), Drops, tells: true);
         public static readonly Kind Crashed = new Kind("crashed", Mark.Error, "falhas do compilador do driver",
             r => Of(r, "o compilador do driver falhou em um pipeline (ele fica de fora)",
                 "pipelines em que o compilador do driver falhou (ficam de fora)"),
             WhatPipeline + "O compilador do driver de vídeo quebrou ao fazer estes. " + Drops
-                + " A lista fica guardada por driver e eles não são tentados de novo.");
+                + " A lista fica guardada por driver e eles não são tentados de novo.", tells: true);
         public static readonly Kind Endless = new Kind("endless", Mark.Error, "pipelines que o driver não termina",
             r => Of(r, "o compilador do driver não termina um pipeline (fica de fora na próxima vez)",
-                "pipelines que o compilador do driver não termina (ficam de fora na próxima vez)"), Drops);
+                "pipelines que o compilador do driver não termina (ficam de fora na próxima vez)"), Drops, tells: true);
         public static readonly Kind LeftOut = new Kind("left-out", Mark.Warn, "pipelines deixados de fora",
             r => Say.Count(r.A) + " pipelines deixados de fora: o driver já falhou neles antes", Drops);
         public static readonly Kind LibraryLoaded = new Kind("library-loaded", Mark.Info, "pipelines lidos do disco",
@@ -1076,12 +1115,12 @@ namespace Vyce.Monitor
         public static readonly Kind LibraryNew = new Kind("library-new", Mark.Info, "sem pipelines guardados",
             r => "Ainda não há pipelines guardados; serão feitos agora");
         public static readonly Kind LibrarySaved = new Kind("library-saved", Mark.Info, "pipelines guardados no disco",
-            r => "Pipelines guardados no disco: " + Bytes(r.A));
+            r => "Pipelines guardados no disco: " + Bytes(r.A), null, 600);
         public static readonly Kind LibraryLost = new Kind("library-lost", Mark.Warn, "pipelines não guardados",
             r => "os pipelines não puderam ser guardados no disco (" + r.Note + ")", "Serão feitos de novo na próxima vez. Veja se há espaço no disco.");
         public static readonly Kind Ready = new Kind("ready", Mark.Good, "pipelines prontos",
             r => "Pipelines em dia: " + Say.Count(r.B) + " vindos do disco, " + Say.Count(r.A) + " feitos agora",
-            "Nenhum pipeline esperando neste momento. Os do disco já existiam de outras partidas.");
+            "Nenhum pipeline esperando neste momento. Os do disco já existiam de outras partidas.", 300);
         public static readonly Kind Early = new Kind("early", Mark.Info, "pipelines conhecidos",
             r => "Pipelines conhecidos de antes: " + Say.Count(r.A));
 
@@ -1089,7 +1128,7 @@ namespace Vyce.Monitor
         public static Kind Untranslated(string reason)
         {
             return ByReason("untranslated", reason, (id, text) => new Kind(id, Mark.Warn, "shaders não traduzidos (" + text + ")",
-                r => Of(r, "1 shader não traduzido (" + text + ")", "shaders não traduzidos (" + text + ")"), WhatShader + Drops));
+                r => Of(r, "1 shader não traduzido (" + text + ")", "shaders não traduzidos (" + text + ")"), WhatShader + Drops, tells: true));
         }
 
         // Limits of the card.
@@ -1100,54 +1139,67 @@ namespace Vyce.Monitor
                 : "a placa guarda menos descritores do que os shaders esperam",
             "Descritor é o endereço de uma textura ou de um buffer. Se faltarem, texturas podem sair erradas.");
         public static readonly Kind Slots = new Kind("slots", Mark.Warn, "falta de espaço para descritores",
-            r => Of(r, "faltou espaço para descritores; um desenho ficou sem", "vezes faltou espaço para descritores; desenhos ficaram sem"), Drops);
+            r => Of(r, "faltou espaço para descritores; um desenho ficou sem", "vezes faltou espaço para descritores; desenhos ficaram sem"), Drops, tells: true);
         public static readonly Kind PastHeap = new Kind("past-heap", Mark.Warn, "descritores além do limite",
-            r => Of(r, "1 descritor além do limite da placa", "descritores além do limite da placa"), Drops);
+            r => Of(r, "1 descritor além do limite da placa", "descritores além do limite da placa"), Drops, tells: true);
         public static readonly Kind Views = new Kind("views", Mark.Warn, "visões recusadas",
-            r => Of(r, "1 visão de textura ou buffer que a placa não aceita", "visões de textura ou buffer que a placa não aceita"), Drops);
+            r => Of(r, "1 visão de textura ou buffer que a placa não aceita", "visões de textura ou buffer que a placa não aceita"), Drops, tells: true);
         public static readonly Kind Stencil = new Kind("stencil", Mark.Warn, "estêncil",
             r => "a placa não grava estêncil pelo shader; cópias de profundidade vão sem ele", "Sombras e recortes podem sair diferentes.");
-        public static readonly Kind Limit = new Kind("limit", Mark.Warn, "limites da placa",
-            r => "a placa não tem: " + r.Note);
+
+        /// What the card lacks: one row each.
+        public static Kind Limit(string what)
+        {
+            return ByReason("limit", what, (id, text) => new Kind(id, Mark.Warn, "limites da placa (" + text + ")",
+                r => "a placa não tem: " + text));
+        }
 
         // Work that does not run.
-        public static readonly Kind Dispatch = new Kind("dispatch", Mark.Warn, "trabalhos de computação descartados",
-            r => Of(r, "1 trabalho de computação descartado (" + r.Note + ")", "trabalhos de computação descartados (" + r.Note + ")"), Drops);
+        public static Kind Dispatch(string why)
+        {
+            return ByReason("dispatch", why, (id, text) => new Kind(id, Mark.Warn, "trabalhos de computação descartados (" + text + ")",
+                r => Of(r, "1 trabalho de computação descartado (" + text + ")", "trabalhos de computação descartados (" + text + ")"),
+                Drops, tells: true));
+        }
         public static readonly Kind Indirect = new Kind("indirect", Mark.Warn, "desenhos indiretos descartados",
             r => Of(r, "1 tipo de desenho indireto descartado", "tipos de desenho indireto descartados"),
-            "Desenho indireto é o que a própria GPU decide. " + Drops);
+            "Desenho indireto é o que a própria GPU decide. " + Drops, tells: true);
         public static readonly Kind NotDone = new Kind("not-done", Mark.Warn, "funções do console ainda não feitas",
             r => Of(r, "função do console ainda não feita: " + r.Note, "funções do console ainda não feitas (a última: " + r.Note + ")"),
-            "Quase sempre sem efeito. Se algo não funcionar no jogo, estas são as primeiras suspeitas.");
+            "Quase sempre sem efeito. Se algo não funcionar no jogo, estas são as primeiras suspeitas.", tells: true);
         public static readonly Kind Unimplemented = new Kind("unimplemented", Mark.Error, "funções que não existem no Vyce",
             r => Of(r, "o jogo chamou uma função que não existe no Vyce: " + r.Note,
                 "chamadas a funções que não existem no Vyce (a última: " + r.Note + ")"),
-            "O jogo para quando isso acontece.");
+            "O jogo para quando isso acontece.", tells: true);
         public static readonly Kind Dll = new Kind("dll", Mark.Warn, "bibliotecas recusadas",
             r => Of(r, "biblioteca do Windows recusada ao jogo: " + r.Note, "bibliotecas do Windows recusadas ao jogo (a última: " + r.Note + ")"),
-            "É uma proteção do Vyce e costuma ser normal.");
+            "É uma proteção do Vyce e costuma ser normal.", tells: true);
         public static readonly Kind DllLost = new Kind("dll-lost", Mark.Error, "bibliotecas do jogo que não abriram",
             r => "uma biblioteca do jogo não abriu: " + r.Note);
 
         // Time.
         public static readonly Kind Slow = new Kind("slow", Mark.Warn, "envios lentos à GPU",
             r => Of(r, "a GPU levou " + Say.Ms(r.A) + " em um envio", "envios lentos à GPU (o pior levou " + Say.Ms(r.A) + ")"),
-            "A GPU passou de 250 ms em um envio só: o jogo engasga. Perto de 2 s o Windows reinicia o driver de vídeo.", 30);
-        public static readonly Kind Waited = new Kind("waited", Mark.Warn, "esperas sem resposta da GPU",
-            r => Of(r, "uma espera pela GPU não terminou (" + r.Note + ")", "esperas pela GPU não terminaram (" + r.Note + ")"));
+            "A GPU passou de 250 ms em um envio só: o jogo engasga. Perto de 2 s o Windows reinicia o driver de vídeo.", 30, tells: true);
+        public static Kind Waited(string what)
+        {
+            return ByReason("waited", what, (id, text) => new Kind(id, Mark.Warn, "esperas sem resposta da GPU (" + text + ")",
+                r => Of(r, "uma espera pela GPU não terminou (" + text + ")", "esperas pela GPU não terminaram (" + text + ")"),
+                tells: true));
+        }
 
         // Memory.
         public static readonly Kind InPlace = new Kind("in-place", Mark.Info, "memória usada direto pela GPU",
-            r => "Memória do jogo usada direto pela GPU: " + Say.Count(r.A) + (r.A == 1 ? " área" : " áreas"), null, 60);
+            r => "Memória do jogo usada direto pela GPU: " + Say.Count(r.A) + (r.A == 1 ? " área" : " áreas"), null, 60, tells: true);
         public static readonly Kind Copied = new Kind("copied", Mark.Info, "memória copiada para a GPU",
-            r => "Memória do jogo copiada para a GPU: " + Say.Count(r.A) + (r.A == 1 ? " área" : " áreas"), null, 60);
+            r => "Memória do jogo copiada para a GPU: " + Say.Count(r.A) + (r.A == 1 ? " área" : " áreas"), null, 60, tells: true);
         public static readonly Kind OnCard = new Kind("on-card", Mark.Info, "buffers na placa",
-            r => Of(r, "1 buffer grande passou para a memória da placa", "buffers grandes passaram para a memória da placa"));
+            r => Of(r, "1 buffer grande passou para a memória da placa", "buffers grandes passaram para a memória da placa"), tells: true);
         public static readonly Kind NoCard = new Kind("no-card", Mark.Warn, "buffers fora da placa",
             r => "os buffers grandes ficam na RAM: o recurso da placa não abriu");
         public static readonly Kind NoMemory = new Kind("no-memory", Mark.Error, "falta de memória",
             r => Of(r, "faltou memória: " + r.Note, "vezes faltou memória (a última: " + r.Note + ")"),
-            "Feche outros programas. Se for a memória da placa, diminua o limite de texturas.");
+            "Feche outros programas. Se for a memória da placa, diminua o limite de texturas.", tells: true);
         public static readonly Kind Commit = new Kind("commit", Mark.Error, "memória do Windows esgotada",
             r => "acabou a memória do Windows (RAM e arquivo de paginação)",
             "Aumente o arquivo de paginação ou libere espaço no disco em que ele fica.");
@@ -1155,18 +1207,18 @@ namespace Vyce.Monitor
         // Ends.
         public static readonly Kind GpuGone = new Kind("gpu-gone", Mark.Error, "placa de vídeo parou",
             r => "a placa de vídeo parou de responder" + (r.Note != null ? " (" + r.Note + ")" : ""),
-            "O Windows reiniciou o driver de vídeo e o jogo não tem como continuar.");
+            "O Windows reiniciou o driver de vídeo e o jogo não tem como continuar.", tells: true);
         public static readonly Kind Crash = new Kind("crash", Mark.Error, "travamentos",
-            r => "o jogo travou: " + r.Note, "O registro completo, com a lista de chamadas, está abaixo e no arquivo de log.");
+            r => "o jogo travou: " + r.Note, "O registro completo, com a lista de chamadas, está abaixo e no arquivo de log.", tells: true);
         public static readonly Kind FirstChance = new Kind("first-chance", Mark.Warn, "exceções internas",
             r => Of(r, "exceção interna: " + r.Note, "exceções internas (a última: " + r.Note + ")"),
-            "Pode ser tratada pelo próprio jogo. Se ele travar em seguida, foi esta.");
+            "Pode ser tratada pelo próprio jogo. Se ele travar em seguida, foi esta.", tells: true);
         public static readonly Kind Aborted = new Kind("aborted", Mark.Error, "o jogo abortou",
-            r => "o jogo se encerrou por um erro interno dele");
+            r => "o jogo se encerrou por um erro interno dele", tells: true);
         public static readonly Kind Panic = new Kind("panic", Mark.Error, "falhas internas do Vyce",
-            r => "falha interna do Vyce: " + r.Note);
+            r => "falha interna do Vyce: " + r.Note, tells: true);
         public static readonly Kind Fatal = new Kind("fatal", Mark.Error, "erros ao iniciar",
-            r => r.Note);
+            r => r.Note, tells: true);
 
         static readonly Dictionary<string, Kind> Reasons = new Dictionary<string, Kind>(StringComparer.Ordinal);
 
@@ -1191,7 +1243,7 @@ namespace Vyce.Monitor
         {
             Mark mark = level == Level.Error ? Mark.Error : Mark.Warn;
             return ByReason(mark == Mark.Error ? "error" : "warn", Lines.Shape(message), (id, shape) => new Kind(id, mark, shape,
-                r => r.Note + (r.Count > 1 ? " (" + N(r) + " vezes)" : ""), "Mensagem do Vyce, em inglês, sem tradução no painel.", 60));
+                r => r.Note + (r.Count > 1 ? " (" + N(r) + " vezes)" : ""), "Mensagem do Vyce, em inglês, sem tradução no painel.", 60, tells: true));
         }
 
         /// Why a shader does not translate.
@@ -1251,6 +1303,8 @@ namespace Vyce.Monitor
         /// When the process started, if known.
         public DateTime Started = DateTime.MinValue;
         public DateTime FirstAt = DateTime.MinValue, LastLineAt = DateTime.MinValue;
+        /// The first time the runtime stamped a line with.
+        public DateTime FirstStamp = DateTime.MinValue;
         /// The process the title went on in.
         public int Relaunched;
         readonly Guess guess = new Guess();
@@ -1313,6 +1367,7 @@ namespace Vyce.Monitor
             if (sample != null && stamp < sample.At && (sample.At - stamp).TotalSeconds < 5 && reckoned) sample.At = stamp;
             reckoned = false;
             if (stamp > clock) clock = stamp;
+            if (FirstStamp == DateTime.MinValue) FirstStamp = stamp;
         }
 
         bool reckoned;
@@ -1363,7 +1418,7 @@ namespace Vyce.Monitor
             else if (name == "VYCE_GPU") OnGpu(rest, at, text);
             else if (name == "VYCE_PRESENT") OnPresent(rest, at, text);
             if (FirstAt == DateTime.MinValue) FirstAt = at;
-            Log.Add(new LogLine { At = at, Level = Level.Debug, Noise = name != "VYCE_PRESENT", Text = text });
+            Log.Add(new LogLine { At = at, Level = Level.Debug, Noise = name != "VYCE_PRESENT", Report = name != "VYCE_PRESENT", Text = text });
         }
 
         DateTime OnTelemetry(string rest, bool live, DateTime now, DateTime last)
@@ -1798,11 +1853,11 @@ namespace Vyce.Monitor
                 return false;
             }
             if (Is("the host takes no stencil")) { Put(Kinds.Stencil); return false; }
-            if (Is("the host GPU has no depth bounds")) { Put(Kinds.Limit, "teste de limites de profundidade"); return false; }
-            if (Is("the host cannot read 32-bit textures")) { Put(Kinds.Limit, "leitura de cores em formato compartilhado"); return false; }
+            if (Is("the host GPU has no depth bounds")) { Put(Kinds.Limit("teste de limites de profundidade")); return false; }
+            if (Is("the host cannot read 32-bit textures")) { Put(Kinds.Limit("leitura de cores em formato compartilhado")); return false; }
             if (Is("slow host submission")) { Put(Kinds.Slow).Most(V("ms")); return false; }
-            if (Is("a dispatch without a host pipeline")) { Put(Kinds.Dispatch, "sem pipeline"); return false; }
-            if (Is("a dispatch writing through a null")) { Put(Kinds.Dispatch, "sem destino"); return false; }
+            if (Is("a dispatch without a host pipeline")) { Put(Kinds.Dispatch("sem pipeline")); return false; }
+            if (Is("a dispatch writing through a null")) { Put(Kinds.Dispatch("sem destino")); return false; }
             if (Is("method not implemented")) { Put(Kinds.NotDone, F("object") + " " + F("slot")); return false; }
             if (Is("runtime method not implemented")) { Put(Kinds.NotDone, "runtime " + F("slot")); return false; }
             if (Is("runtime API area not implemented")) { Put(Kinds.NotDone, "área do runtime"); return false; }
@@ -1820,10 +1875,10 @@ namespace Vyce.Monitor
                 return false;
             }
             if (Is("dstorage: BCPack requests fail")) { Put(Kinds.ReadFailed, "texturas compactadas do console"); return false; }
-            if (Is("host submission not waited for")) { Put(Kinds.Waited, "envio"); return false; }
-            if (Is("host fence wait failed")) { Put(Kinds.Waited, "cerca"); return false; }
-            if (Is("host async")) { Put(Kinds.Waited, "envio adiantado"); return false; }
-            if (Is("a wait was never met")) { Put(Kinds.Waited, "fila parada"); return false; }
+            if (Is("host submission not waited for")) { Put(Kinds.Waited("envio")); return false; }
+            if (Is("host fence wait failed")) { Put(Kinds.Waited("cerca")); return false; }
+            if (Is("host async")) { Put(Kinds.Waited("envio adiantado")); return false; }
+            if (Is("a wait was never met")) { Put(Kinds.Waited("fila parada")); return false; }
             if (Is("VRAM card buffer engine unavailable")) { Put(Kinds.NoCard); return false; }
             if (Is("no upload buffer") || Is("no readback buffer") || Is("no shared buffer") || Is("no unordered-access buffer")
                 || Is("no host texture") || Is("no memory for copies") || Is("no sparse buffer")
@@ -1860,7 +1915,7 @@ namespace Vyce.Monitor
                 Put(Kinds.LoadLost, Short(F("error")));
                 return false;
             }
-            if (Is("VICTORY_") || Is("VYCE_")) { Put(Kinds.Tuned, Say.Cut(said, 90)); return false; }
+            if (Is("VICTORY_") || Is("VYCE_")) { Put(Kinds.Tuned(Say.Cut(said, 90))); return false; }
             string message = Lines.Message(said);
             if (message.Length == 0) message = said;
             Put(Kinds.Other(level, message), Say.Cut(message, 140));
@@ -2154,12 +2209,20 @@ namespace Vyce.Monitor
                 Seen[where] = n + 1;
                 if (n >= 5) return;
             }
+            Tell(where + ": " + e);
+        }
+
+        /// A line in the launcher's .monitor.log, beside the logs.
+        public static void Tell(string text)
+        {
             try
             {
-                // The launcher keeps this beside the logs (.monitor.log).
-                Console.Error.WriteLine(DateTime.Now.ToString("HH:mm:ss") + " painel, " + where + ": " + e);
+                Console.Error.WriteLine(DateTime.Now.ToString("HH:mm:ss") + " painel, " + text);
             }
             catch (IOException)
+            {
+            }
+            catch (ObjectDisposedException)
             {
             }
         }
@@ -2199,6 +2262,7 @@ namespace Vyce.Monitor
 
         void Run()
         {
+            System.Diagnostics.Stopwatch took = System.Diagnostics.Stopwatch.StartNew();
             while (!stop)
             {
                 bool more = false;
@@ -2214,7 +2278,14 @@ namespace Vyce.Monitor
                     }
                 }
                 if (more) continue;
-                CaughtUp = true;
+                if (!CaughtUp)
+                {
+                    CaughtUp = true;
+                    int lines;
+                    lock (session.Sync) lines = session.LinesRead;
+                    Faults.Tell("log lido em " + took.ElapsedMilliseconds + " ms (" + lines + " linhas, "
+                        + Say.Size((tails[0].Length + tails[1].Length) / 1048576.0) + ")");
+                }
                 wake.WaitOne(250);
             }
         }
@@ -2252,11 +2323,17 @@ namespace Vyce.Monitor
             Pid = pid;
             handle = OpenProcess(Synchronize | QueryLimited, false, pid);
             Opened = handle != IntPtr.Zero;
+            // One out of our reach (run as administrator) is taken to run:
+            // its end is told by its log alone.
+            Hidden = !Opened && Marshal.GetLastWin32Error() == 5;
         }
+
+        /// A process that is there but cannot be opened.
+        public readonly bool Hidden;
 
         public bool Alive
         {
-            get { return handle != IntPtr.Zero && WaitForSingleObject(handle, 0) == 258; }
+            get { return Hidden || handle != IntPtr.Zero && WaitForSingleObject(handle, 0) == 258; }
         }
 
         public bool ExitCode(out uint code)
@@ -2362,6 +2439,8 @@ namespace Vyce.Monitor
         public double Average = double.NaN, Least = double.NaN;
         public Parts Parts;
         public string Verdict = "", GpuTop;
+        /// The numbers of how work goes to the GPU, in a line and in full.
+        public string Extras = "", ExtrasTip = "";
         public Band Band = new Band();
         public Tile[] Tiles = new Tile[0];
         public int Warnings, Errors;
@@ -2399,7 +2478,11 @@ namespace Vyce.Monitor
                 State = end != null && end.Bad ? "Jogo encerrado com erro" : "Jogo encerrado";
                 StateMark = end != null && end.Bad ? Mark.Error : Mark.Info;
             }
-            DateTime from = s.Started > DateTime.MinValue ? s.Started : s.FirstAt, to = Alive || end == null ? now : end.At;
+            // From the process's start; from the log's first line if that is
+            // older (the title went on in another process).
+            DateTime from = s.Started, to = Alive || end == null ? now : end.At;
+            DateTime first = s.FirstStamp > DateTime.MinValue ? s.FirstStamp : s.FirstAt;
+            if (first > DateTime.MinValue && (from == DateTime.MinValue || first < from.AddSeconds(-5))) from = first;
             if (from > DateTime.MinValue && to > from) Lasted = Say.Span((to - from).TotalSeconds);
             List<string> facts = new List<string>();
             if (s.Adapter != null) facts.Add(s.Adapter + (s.Driver == null ? "" : ", driver " + s.Driver));
@@ -2443,6 +2526,90 @@ namespace Vyce.Monitor
                 lately.Add(s.Samples[k]);
             Parts = Parts.Of(lately);
             if (Parts != null) Verdict = Parts.Verdict();
+            More(lately);
+        }
+
+        /// The mean per frame of a number over `samples`; NaN if none has it.
+        public static double Mean(IList<Sample> samples, string name)
+        {
+            double sum = 0, frames = 0;
+            foreach (Sample s in samples)
+            {
+                double v = s[name];
+                if (!Say.Known(v)) continue;
+                double n = Math.Max(1, s.Frames);
+                sum += n * v;
+                frames += n;
+            }
+            return frames > 0 ? sum / frames : double.NaN;
+        }
+
+        /// Of the waits that had to wait, by why; telemetry of newer builds.
+        static readonly string[,] Drains =
+        {
+            { "drains_execute", "antes de preparar um envio" }, { "drains_signal", "sinal de uma fila" },
+            { "drains_work", "outro trabalho da fila" }, { "drains_held", "fila presa numa espera" },
+            { "drains_present", "apresentação" }, { "drains_fence", "o jogo esperando uma cerca" },
+            { "drains_list", "lista reaberta" },
+        };
+
+        /// How a frame's work goes to the GPU, for those who look further:
+        /// the numbers newer builds add, each only if the build tells it.
+        void More(IList<Sample> lately)
+        {
+            Func<string, double> mean = name => Mean(lately, name);
+            List<string> line = new List<string>(), tip = new List<string>();
+            double sent = mean("submissions_per_frame"), ecl = mean("ecl_calls"), unwaited = mean("unwaited_per_frame");
+            if (Say.Known(sent))
+            {
+                line.Add(Say.PerFrame(sent) + " envios à GPU" + (Say.Known(ecl) ? ", " + Say.PerFrame(ecl) + " ECL" : ""));
+                tip.Add("Envios à GPU: " + Say.PerFrame(sent) + (Say.Known(unwaited) ? " (" + Say.PerFrame(unwaited) + " sem esperar por ela)" : ""));
+            }
+            if (Say.Known(ecl)) tip.Add("Chamadas ExecuteCommandLists ao driver: " + Say.PerFrame(ecl));
+            double drained = double.NaN;
+            List<string> why = new List<string>();
+            for (int k = 0; k < Drains.GetLength(0); k++)
+            {
+                double v = mean(Drains[k, 0]);
+                if (!Say.Known(v)) continue;
+                drained = Sample.OrZero(drained) + v;
+                if (v >= 0.05) why.Add(Drains[k, 1] + " " + Say.PerFrame(v));
+            }
+            if (Say.Known(drained))
+            {
+                line.Add(Say.PerFrame(drained) + " esperas pela GPU");
+                tip.Add("Vezes que o Vyce parou até a GPU acabar: " + Say.PerFrame(drained) + (why.Count > 0 ? " (" + string.Join(", ", why.ToArray()) + ")" : ""));
+            }
+            double late = mean("late_signals");
+            if (Say.Known(late))
+            {
+                line.Add(Say.PerFrame(late) + " sinais adiados");
+                tip.Add("Sinais do jogo deixados para depois do envio em curso, sem parar: " + Say.PerFrame(late));
+            }
+            double syncs = mean("syncs_per_frame");
+            if (!Say.Known(syncs)) syncs = mean("syncs");
+            if (Say.Known(syncs))
+            {
+                line.Add(Say.PerFrame(syncs) + " syncs");
+                tip.Add("Syncs do jogo (esperas e limpezas de cache dentro da GPU): " + Say.PerFrame(syncs));
+            }
+            double indirect = mean("indirect_draws_per_frame"), computed = mean("indirect_dispatches_per_frame");
+            if (indirect >= 0.05)
+            {
+                line.Add(Say.PerFrame(indirect) + " desenhos indiretos");
+                tip.Add("Desenhos indiretos que rodaram (já contados nos desenhos): " + Say.PerFrame(indirect)
+                    + (Say.Known(computed) ? ", e " + Say.PerFrame(computed) + " de computação" : ""));
+            }
+            double outside = mean("left_out_per_frame");
+            if (outside >= 0.05)
+            {
+                line.Add(Say.PerFrame(outside) + " deixados de fora");
+                tip.Add("Desenhos deixados de fora de propósito, porque o driver falhou nos pipelines deles: " + Say.PerFrame(outside));
+            }
+            double idle = mean("gpu_idle_ms");
+            if (Say.Known(idle)) tip.Add("A GPU ficou parada entre os envios: " + Say.Ms(idle));
+            Extras = line.Count == 0 ? "" : "Por quadro: " + string.Join("  ·  ", line.ToArray());
+            ExtrasTip = tip.Count == 0 ? "" : "Por quadro, em média nos últimos segundos:\n" + string.Join("\n", tip.ToArray());
         }
 
         static string StageName(string stage)
@@ -2468,6 +2635,12 @@ namespace Vyce.Monitor
                 b.Mark = end != null && end.Bad ? Mark.Error : Mark.Info;
                 return b;
             }
+            if (s.Hints.WindowClosed)
+            {
+                b.Title = "Encerrando o jogo";
+                b.Detail = "A janela do jogo foi fechada; o Vyce guarda o que precisa e fecha.";
+                return b;
+            }
             LoadReport r = s.Load;
             if (r == null)
             {
@@ -2479,7 +2652,11 @@ namespace Vyce.Monitor
             b.Title = StageName(stage);
             if (quiet > 10)
             {
-                b.Detail = "Sem notícias do carregamento " + Say.Ago(quiet) + ".";
+                // The runtime tells its loading once a second, frames or not:
+                // a log with nothing new at all is a process that stands still.
+                double silent = s.LastLineAt > DateTime.MinValue ? (now - s.LastLineAt).TotalSeconds : quiet;
+                b.Detail = silent > 10 ? "O Vyce não escreve nada no log " + Say.Ago(silent) + ". O jogo pode estar parado."
+                    : "Sem notícias do carregamento " + Say.Ago(quiet) + ".";
                 b.Mark = Mark.Warn;
                 return b;
             }
@@ -2586,8 +2763,15 @@ namespace Vyce.Monitor
             double draws = v("draws_per_frame"), dropped = v("dropped_per_frame");
             double indirect = last == null ? double.NaN : last.Indirect, making = v("pipelines_building");
 
-            Tile video = new Tile("VRAM", Pair(vram, budget), Say.Known(shared) ? "+ " + Say.Size(shared) + " da RAM" : "",
+            // What fills it, as far as the build tells.
+            double textures = v("host_tex_mb"), targets = v("targets_mb"), unused = v("targets_unused_mb");
+            Tile video = new Tile("VRAM", Pair(vram, budget),
+                Say.Known(textures) ? "texturas " + Say.Size(textures) : Say.Known(shared) ? "+ " + Say.Size(shared) + " da RAM" : "",
                 "Memória da placa usada pelo jogo e o limite que o Windows dá a ele.\nCheia, as texturas perdem qualidade e o jogo engasga."
+                + (Say.Known(textures) ? "\nTexturas: " + Say.Size(textures) : "")
+                + (Say.Known(targets) ? "\nImagens em que o jogo desenha: " + Say.Size(targets)
+                    + (unused > 0 ? " (" + Say.Size(unused) + " sem uso agora)" : "") : "")
+                + (Say.Known(card) ? "\nBuffers do jogo: " + Say.Size(card) : "")
                 + (Say.Known(shared) ? "\nA placa também usa " + Say.Size(shared) + " da RAM." : ""));
             if (budget > 0 && Say.Known(vram))
             {
@@ -2625,8 +2809,10 @@ namespace Vyce.Monitor
                     + (Say.Known(v("unwaited_per_frame")) ? ", " + Say.Number(v("unwaited_per_frame"), "0.0") + " sem espera" : "") : "")
                 + (last != null ? "\nQuadros apresentados até aqui: " + Say.Count(last.Total) : ""));
 
+            double outside = v("left_out_per_frame");
             Tile lost = new Tile("Descartados", Say.Count(dropped), Say.Known(indirect) ? "+ " + Say.Count(indirect) + " indiretos" : "por quadro",
-                "Desenhos que não apareceram em cada quadro: o pipeline deles ainda não existe ou a placa o recusa.\nOs indiretos são grupos que a própria GPU decidiria.");
+                "Desenhos que não apareceram em cada quadro: o pipeline deles ainda não existe ou a placa o recusa.\nOs indiretos são grupos que a própria GPU decidiria."
+                + (Say.Known(outside) ? "\nFora estes, " + Say.PerFrame(outside) + " deixados de fora de propósito: o driver falhou nos pipelines deles." : ""));
             double all = Sample.OrZero(draws) + Sample.OrZero(dropped) + Sample.OrZero(indirect);
             if (Sample.OrZero(dropped) + Sample.OrZero(indirect) > 0.05 * all && all > 0) lost.Mark = Mark.Warn;
 
@@ -2636,10 +2822,10 @@ namespace Vyce.Monitor
                 + (Say.Known(v("pipeline_wait_ms")) ? "\nEspera por eles: " + Say.Ms(v("pipeline_wait_ms")) + " por quadro." : ""));
             if (making >= 8) make.Mark = Mark.Warn;
 
+            string engine = Fields(last, "card_");
             Tile buffers = new Tile("Buffers na VRAM", Say.Size(card), "dados do jogo",
                 "Dados do jogo mantidos na memória da placa em vez da RAM."
-                + (Say.Known(v("host_tex_mb")) ? "\nTexturas na placa: " + Say.Size(v("host_tex_mb")) + "." : "")
-                + Fields(last, "card_"));
+                + (engine == "" ? "" : "\nNúmeros da telemetria para eles:" + engine));
             return new[] { video, ram, cpu, texture, drawn, lost, make, buffers };
         }
 
@@ -2751,7 +2937,10 @@ namespace Vyce.Monitor
             Part(parts, "preparo na CPU", prepare, part);
             Part(parts, "cópia de volta", back, part);
             Part(parts, "resto", ms - gpu - prepare - back, v => part(Math.Max(0, v)));
-            t.AppendLine("  " + string.Join("; ", parts.ToArray()) + ". " + shot.Verdict + ".");
+            // The sentence of these medians, not of the last seconds.
+            Parts whole = Parts.From(ms, gpu, prepare, back, of("gpu_busy_ms"), of("pipeline_wait_ms"));
+            t.AppendLine("  " + string.Join("; ", parts.ToArray()) + ". " + (whole == null ? shot.Verdict : whole.Verdict()) + ".");
+            if (shot.Extras != "") t.AppendLine("  " + shot.Extras.Replace("  ·  ", "; ") + " (últimos segundos)");
             parts.Clear();
             Part(parts, "cópias", of("cpu_copy_ms"), v => Say.Ms(v) + " " + Say.Size(of("cpu_copy_mb")));
             Part(parts, "texturas", of("texture_refresh_ms"), v => Say.Ms(v) + " " + Say.Size(of("texture_refresh_mb")));
@@ -2776,6 +2965,7 @@ namespace Vyce.Monitor
             Part(parts, "compartilhada", of("shared_mb"), Say.Size);
             Part(parts, "buffers na placa", of("card_mb"), Say.Size);
             Part(parts, "texturas na placa", of("host_tex_mb"), Say.Size);
+            Part(parts, "imagens de desenho", of("targets_mb"), Say.Size);
             Part(parts, "limite de textura", s.TextureCap, v => Say.Number(v, "0"));
             if (parts.Count > 0) t.AppendLine("  " + string.Join("; ", parts.ToArray()));
             if (s.GpuTop != null) t.AppendLine("  Mais pesado na GPU: " + s.GpuTop);
@@ -2796,7 +2986,10 @@ namespace Vyce.Monitor
             "cpu_copy_ms", "cpu_copy_mb", "texture_refresh_ms", "texture_refresh_mb", "bindless_plan_ms", "snapshot_ms",
             "steps_ms", "submit_ms", "pipeline_wait_ms", "draws_per_frame", "dropped_per_frame", "indirect_per_frame",
             "indirect_dropped_per_frame", "submissions_per_frame", "unwaited_per_frame", "pipelines_building", "vram_mb",
-            "vram_budget_mb", "shared_mb", "card_mb", "host_tex_mb", "t_s", "tex_cap",
+            "vram_budget_mb", "shared_mb", "card_mb", "host_tex_mb", "t_s", "tex_cap", "targets_mb",
+            "ecl_calls", "late_signals", "syncs", "syncs_per_frame", "indirect_draws_per_frame", "indirect_dispatches_per_frame",
+            "left_out_per_frame", "drains_execute", "drains_signal", "drains_work", "drains_held", "drains_present",
+            "drains_fence", "drains_list", "out_w", "out_h", "scene_w", "scene_h", "planes",
         }, StringComparer.Ordinal);
 
         static void Counts(StringBuilder t, Session s, Mark mark, string title)

@@ -692,8 +692,8 @@ namespace Vyce.Monitor
         /// one leaves the lower half out.
         public static int Wanted(int window, bool brief)
         {
-            if (Tall(window)) return Look.Px(150 + 8 + 74 + 8 + 92 + 8 + 70);
-            return Look.Px(brief ? 118 + 6 + 66 : 118 + 6 + 66 + 6 + 84 + 6 + 64);
+            if (Tall(window)) return Look.Px(150 + 8 + 74 + 8 + 110 + 8 + 70);
+            return Look.Px(brief ? 118 + 6 + 66 : 118 + 6 + 66 + 6 + 102 + 6 + 64);
         }
 
         static bool Tall(int window)
@@ -720,7 +720,8 @@ namespace Vyce.Monitor
                 tiles = new Rectangle[0];
                 return;
             }
-            h = Look.Px(tall ? 92 : 84);
+            // Four lines: the sentence, the bar, its parts and how work goes to the GPU.
+            h = Look.Px(tall ? 110 : 102);
             frame = new Rectangle(0, y, width, h);
             y += h + gap;
             h = Look.Px(tall ? 70 : 64);
@@ -765,7 +766,7 @@ namespace Vyce.Monitor
             for (int k = 0; k < tiles.Length && k < shot.Tiles.Length; k++)
             {
                 Tile tile = shot.Tiles[k];
-                Part(tile.Caption, tiles[k], g, (to, r) => Tile(to, r, tile));
+                Part(tile == null ? "número" : tile.Caption, tiles[k], g, (to, r) => Tile(to, r, tile));
             }
         }
 
@@ -811,32 +812,32 @@ namespace Vyce.Monitor
                 : "30 já é fluido para este jogo; abaixo de 10 fica difícil de jogar."));
         }
 
-        static double Ceiling(double v)
-        {
-            foreach (double step in new double[] { 2, 5, 10, 15, 20, 30, 40, 60, 80, 120, 160, 240, 360, 500 })
-                if (v <= step) return step;
-            return Math.Ceiling(v / 500) * 500;
-        }
+        static readonly double[] Steps = { 2, 5, 10, 20, 30, 60, 120, 240, 500, 1000 };
+        /// Rates the graph marks if there is room, in this order: slow below 5,
+        /// smooth from 30.
+        static readonly double[] Marks = { 5, 30, 10, 1, 60, 2, 20, 120, 240, 500 };
 
-        /// The top of the axis: the highest rate but for short peaks.
+        /// The top of the axis: the highest rate there was, rounded up.
         double AxisTop()
         {
-            List<KeyValuePair<double, double>> rates = new List<KeyValuePair<double, double>>();
-            double all = 0;
+            double most = 0;
             foreach (Sample s in shot.Recent)
-            {
-                double seconds = Math.Min(10, s.Frames * s.Ms / 1000);
-                rates.Add(new KeyValuePair<double, double>(s.Fps, seconds));
-                all += seconds;
-            }
-            rates.Sort((a, b) => a.Key.CompareTo(b.Key));
-            double passed = 0;
-            foreach (KeyValuePair<double, double> rate in rates)
-            {
-                passed += rate.Value;
-                if (passed >= 0.96 * all) return Ceiling(Math.Max(2, rate.Key * 1.1));
-            }
-            return 30;
+                if (s.Fps > most) most = s.Fps;
+            foreach (double step in Steps)
+                if (most <= step) return step;
+            return Math.Ceiling(most / 1000) * 1000;
+        }
+
+        /// Of the plot's height: 1, 10 and 100 lie evenly apart, so a few frames
+        /// a second stand out under a menu's hundreds.
+        static double Rise(double fps, double top)
+        {
+            return Math.Min(1, Math.Log(1 + Math.Max(0, fps)) / Math.Log(1 + top));
+        }
+
+        float Y(double fps, double top)
+        {
+            return (float)(plot.Bottom - plot.Height * Rise(fps, top));
         }
 
         float X(DateTime at)
@@ -852,19 +853,27 @@ namespace Vyce.Monitor
             int line = Look.Px(18);
             Draw.Text(g, "FPS nos últimos 2 minutos", Look.Strong, Look.Soft, new Rectangle(inner.X, inner.Y, inner.Width, line));
             double top = AxisTop();
-            string[] marks = { Say.Number(top, "0"), Say.Number(top / 2, top / 2 == Math.Floor(top / 2) ? "0" : "0.0"), "0" };
-            int gutter = 0;
-            foreach (string mark in marks) gutter = Math.Max(gutter, Draw.Width(g, mark, Look.Small));
-            gutter += Look.Px(8);
+            int gutter = Draw.Width(g, Say.Number(top, "0"), Look.Small) + Look.Px(8);
             plot = new Rectangle(inner.X + gutter, inner.Y + line + Look.Px(8),
                 inner.Width - gutter - Look.Px(4), inner.Height - 2 * line - Look.Px(8));
+            // Lines at round rates, the telling ones first, never crowded.
+            List<double> marks = new List<double> { top, 0 };
+            foreach (double rate in Marks)
+            {
+                if (rate >= top) continue;
+                float y = Y(rate, top);
+                bool room = true;
+                foreach (double mark in marks)
+                    room &= Math.Abs(Y(mark, top) - y) >= Look.Px(mark == 0 ? 12 : 13);
+                if (room) marks.Add(rate);
+            }
             using (Pen grid = new Pen(Look.Line))
             {
-                for (int k = 0; k < 3; k++)
+                foreach (double mark in marks)
                 {
-                    int y = plot.Y + k * plot.Height / 2;
+                    int y = (int)Math.Round(Y(mark, top));
                     g.DrawLine(grid, plot.X, y, plot.Right, y);
-                    Draw.Right(g, marks[k], Look.Small, Look.Faint, new Rectangle(inner.X, y - Look.Px(8), gutter - Look.Px(8), Look.Px(16)));
+                    Draw.Right(g, Say.Number(mark, "0"), Look.Small, Look.Faint, new Rectangle(inner.X, y - Look.Px(8), gutter - Look.Px(8), Look.Px(16)));
                 }
             }
             int foot = inner.Bottom - line + Look.Px(3);
@@ -891,7 +900,7 @@ namespace Vyce.Monitor
                     Hole(g, before, s.At);
                     points.Clear();
                 }
-                end = new PointF(X(s.At), (float)(plot.Bottom - plot.Height * Math.Min(1, s.Fps / top)));
+                end = new PointF(X(s.At), Y(s.Fps, top));
                 points.Add(end);
                 before = s.At;
             }
@@ -950,7 +959,7 @@ namespace Vyce.Monitor
         {
             Sample s = Nearest();
             if (s == null) return;
-            float x = X(s.At), y = (float)(plot.Bottom - plot.Height * Math.Min(1, s.Fps / top));
+            float x = X(s.At), y = Y(s.Fps, top);
             using (Pen pen = new Pen(Look.Faint)) g.DrawLine(pen, x, plot.Y, x, plot.Bottom);
             float dot = Look.Px(8);
             Draw.Fill(g, new RectangleF(x - dot / 2, y - dot / 2, dot, dot), 8, Look.Ink);
@@ -998,6 +1007,10 @@ namespace Vyce.Monitor
             Add(gpu, "A GPU trabalha ", p.Busy, v => Say.Ms(v) + " por quadro (" + Say.Share(Math.Min(1, v / p.Ms)) + ")");
             Add(gpu, "Envios por quadro: ", V("submissions_per_frame"), v => Say.Number(v, "0.0"));
             Add(gpu, "Envios sem espera: ", V("unwaited_per_frame"), v => Say.Number(v, "0.0"));
+            Add(gpu, "A GPU fica parada entre os envios: ", V("gpu_idle_ms"), Say.Ms);
+            Add(gpu, "Espera antes de preparar um envio: ", V("wait_execute_ms"), Say.Ms);
+            Add(gpu, "Espera na apresentação: ", V("wait_present_ms"), Say.Ms);
+            Add(gpu, "Espera do jogo por uma cerca: ", V("wait_fence_ms"), Say.Ms);
             if (shot.GpuTop != null) gpu.Add("Mais pesado: " + shot.GpuTop);
             List<string> prepare = new List<string>();
             Add(prepare, "Cópias de memória: ", V("cpu_copy_ms"), v => Say.Ms(v) + ", " + Say.Size(V("cpu_copy_mb")));
@@ -1040,7 +1053,7 @@ namespace Vyce.Monitor
                 Draw.Text(g, "Aparece com o primeiro quadro.", Look.Body, Look.Faint, new Rectangle(inner.X, inner.Y + line + Look.Px(6), inner.Width, line));
                 return;
             }
-            Draw.Text(g, shot.Verdict, Look.Head, shot.Alive ? Look.Ink : Look.Soft, title);
+            Draw.Text(g, shot.Verdict, Look.Head, shot.Alive && !shot.Stale ? Look.Ink : Look.Soft, title);
             Piece[] pieces = Pieces(p);
             Rectangle bar = new Rectangle(inner.X, inner.Y + line + Look.Px(4), inner.Width, Look.Px(20));
             float x = bar.X, gap = Math.Max(2, 2 * Look.Scale);
@@ -1062,7 +1075,7 @@ namespace Vyce.Monitor
                 x += width;
             }
             // Names and times, in the order of the bar.
-            int at = inner.X, y = inner.Bottom - Look.Px(18), swatch = Look.Px(10);
+            int at = inner.X, y = bar.Bottom + Look.Px(6), swatch = Look.Px(10);
             foreach (Piece piece in pieces)
             {
                 string time = Say.Ms(piece.Ms);
@@ -1080,6 +1093,10 @@ namespace Vyce.Monitor
                 if (at + Draw.Width(g, busy, Look.Body) <= inner.Right)
                     Draw.Right(g, busy, Look.Body, Look.Soft, new Rectangle(at, y, inner.Right - at, Look.Px(18)));
             }
+            if (shot.Extras == "") return;
+            Rectangle more = new Rectangle(inner.X, y + Look.Px(20), inner.Width, Look.Px(16));
+            Draw.Text(g, shot.Extras, Look.Small, Look.Faint, more);
+            Tip(new Rectangle(more.X, more.Y, Math.Min(more.Width, Draw.Width(g, shot.Extras, Look.Small)), more.Height), shot.ExtrasTip);
         }
 
         void Tile(Graphics g, Rectangle r, Tile tile)
@@ -1160,16 +1177,15 @@ namespace Vyce.Monitor
         public int Update()
         {
             Row first = View.Count > 0 ? View[0] : null;
-            List<Row> rows = session.Journal.Rows;
-            int before = View.Count;
-            List<Row> old = new List<Row>(View);
+            List<Row> old = first == null ? null : new List<Row>(View);
             View.Clear();
-            foreach (Row row in rows)
+            foreach (Row row in session.Journal.Rows)
                 if (row.Kind.Mark >= Least || Least == Mark.Warn && row.Kind.Mark == Mark.Stage) View.Add(row);
             if (first == null || View.Count > 0 && View[0] == first) return 0;
             // How many went away at the front.
+            HashSet<Row> kept = new HashSet<Row>(View);
             int removed = 0;
-            while (removed < before && !View.Contains(old[removed])) removed++;
+            while (removed < old.Count && !kept.Contains(old[removed])) removed++;
             return removed;
         }
 
@@ -1246,7 +1262,7 @@ namespace Vyce.Monitor
 
         bool Wanted(LogLine line)
         {
-            if (line.Noise && !all) return false;
+            if (!all && (line.Report || line.Noise && words.Length == 0)) return false;
             foreach (string word in words)
                 if (line.Text.IndexOf(word, StringComparison.OrdinalIgnoreCase) < 0) return false;
             return true;

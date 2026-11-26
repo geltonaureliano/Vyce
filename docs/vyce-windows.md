@@ -108,20 +108,31 @@ tirar o foco do jogo. A parte de cima mostra o momento:
 
 - o FPS, o tempo de cada quadro, há quanto tempo veio a última medida e um
   gráfico dos últimos 2 minutos. Sem quadro novo por 4 s, o número fica
-  cinza e o painel diz há quanto tempo o jogo não apresenta nada;
+  cinza e o painel diz há quanto tempo o jogo não apresenta nada. No
+  gráfico, 1, 10 e 100 FPS ficam à mesma distância, para poucos quadros por
+  segundo não sumirem ao lado das centenas de um menu;
 - a faixa de carregamento: etapa, porcentagem, tempo que falta e o que o
   carregamento espera (o disco ou pipelines), das linhas VYCE_LOADING. Sem
-  essas linhas, a etapa é deduzida dos quadros, sem porcentagem;
+  essas linhas, a etapa é deduzida dos quadros, sem porcentagem. Se o log
+  inteiro para por 10 s, a faixa avisa que o jogo pode estar parado;
 - para onde vai o tempo do quadro: GPU, preparo na CPU, cópia de volta e o
   resto, numa barra, com uma frase sobre quem segura o quadro. O mouse
-  sobre cada parte mostra os detalhes;
-- VRAM usada e o limite, RAM, processador, limite de textura, desenhos e
-  descartados por quadro, pipelines na fila e buffers na VRAM.
+  sobre cada parte mostra os detalhes. Embaixo, os números de como o
+  trabalho chega à GPU que a build informar: envios e chamadas
+  ExecuteCommandLists, esperas pela GPU, sinais adiados, syncs, desenhos
+  indiretos e desenhos deixados de fora;
+- VRAM usada e o limite (e quanto vai em texturas e nas imagens em que o
+  jogo desenha, se a build informar), RAM, processador, limite de textura,
+  desenhos e descartados por quadro, pipelines na fila e buffers na VRAM.
+
+Campos de VYCE_TELEMETRY que a build não tem ficam de fora; os que o painel
+não conhece aparecem, com o nome de origem, em Copiar resumo.
 
 Embaixo, Resumo lista os eventos em português, com as repetições juntas e
 contadas: etapas, avisos e erros. Um clique em um evento mostra o que ele
 quer dizer e as linhas do log de onde veio. Técnico mostra o log limpo, com
-filtro; Mostrar tudo inclui as linhas repetitivas e as de telemetria.
+filtro; o filtro também acha as linhas repetitivas, e Mostrar tudo inclui
+essas linhas e as de telemetria.
 Copiar resumo põe na área de transferência um texto curto para colar numa
 conversa: placa, versão, medianas do último minuto, avisos por tipo e os
 últimos erros. Quando o jogo termina, o painel diz como (janela fechada,
@@ -137,7 +148,10 @@ Use -NoDebugWindow para abrir só o jogo. Fechar o painel mantém a sessão
 do jogo aberta. VYCE_PANEL_BOUNDS=x,y,largura,altura abre o painel nesse
 lugar. A parte do painel escrita em C# é compilada na primeira vez e
 guardada na pasta temporária; depois o painel abre em cerca de um segundo.
-Se ela não compilar, abre um painel simples com os números e os avisos.
+Se ela não compilar, abre um painel simples com os números e os avisos;
+VYCE_PANEL=simples abre esse painel de propósito. O arquivo .monitor.log ao
+lado dos logs guarda as falhas do próprio painel e quanto tempo ele levou
+para ler o log na abertura.
 
 Os dois registros continuam em Vyce-data\logs. Nas builds com telemetria,
 o arquivo de erros também recebe uma linha VYCE_TELEMETRY por amostra para
