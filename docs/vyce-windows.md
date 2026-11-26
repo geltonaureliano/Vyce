@@ -101,6 +101,8 @@ VYCE_TELEMETRY são por quadro, exceto os de memória:
 | submit_ms | Entrega das listas à fila (parte da espera pela GPU nas submissões esperadas) |
 | prewarm_ms | Cópias adiantadas enquanto a submissão anterior roda (fora do preparo) |
 | vram_mb, vram_budget_mb, shared_mb, card_mb | Memória de vídeo usada e o limite do Windows, memória compartilhada, buffers na VRAM |
+| host_tex_mb, targets_mb, targets_unused_mb | Texturas na VRAM; entre elas, as que a GPU desenha ou escreve (alvos); e os alvos que o jogo criou e nada usou ainda, que não ocupam VRAM |
+| tex_cap, tex_remade | Maior lado, em texels, das texturas transmitidas criadas agora (0: sem limite), e quantas foram refeitas maiores |
 
 O relógio da GPU acrescenta duas listas curtas a cada submissão. Ele só
 existe quando a telemetria está ligada.
@@ -108,7 +110,19 @@ existe quando a telemetria está ligada.
 Para comparar sem mudar de binário, defina no processo que chama o launcher
 VICTORY_ASYNC_SUBMIT=0 (submissões esperadas, como antes),
 VICTORY_STRETCH=0 (sem a memória do jogo usada no lugar por uma segunda
-vista) ou VICTORY_PLAN_REUSE=0 (plano de descritores anterior).
+vista) ou VICTORY_PLAN_REUSE=0 (plano de descritores anterior). Para as
+texturas: VICTORY_LAZY_TEXTURES=0 (todos os alvos criados de uma vez),
+VICTORY_TEXTURE_CAPS=0 (limites de tamanho anteriores),
+VICTORY_TEXTURE_UPGRADE_MB=0 (nenhuma refeita maior),
+VICTORY_TEXTURE_SHARE=0 (uma cópia para cada nível visto),
+VICTORY_TEXTURE_SWEEP=0 (cópias sem uso mantidas),
+VICTORY_TEXTURE_RECHECK=0 (conferências contadas sem o tamanho) e
+VICTORY_INDIRECT_POOL=0 (cada lista guarda os buffers de desenho indireto).
+
+Com a telemetria, o arquivo de erros recebe também uma linha "video memory"
+quando o jogo termina de criar os alvos e a cada minuto: a VRAM por classe
+(alvos usados, alvos nunca usados, texturas transmitidas e seus heaps), o
+limite de tamanho em vigor e quantas texturas ele corta.
 
 Para abrir o painel de uma sessão já em execução sem reiniciar o jogo,
 execute scripts\vyce-monitor.ps1 e passe -GamePid, -StdoutLog e -StderrLog.

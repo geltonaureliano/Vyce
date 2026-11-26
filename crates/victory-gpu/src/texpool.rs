@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use windows::Win32::Graphics::Direct3D12::*;
 
 /// Textures larger than this have memory of their own.
@@ -39,8 +40,20 @@ pub(crate) struct Slot {
     index: u32,
 }
 
+/// Bytes of the slots of textures taken.
+static TAKEN: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes of the textures' heaps no texture has.
+pub(crate) fn spare_bytes() -> u64 {
+    let heaps = crate::memstat::BUFFERS[4][0].load(Ordering::Relaxed);
+    heaps.saturating_sub(TAKEN.load(Ordering::Relaxed))
+}
+
 impl Drop for Slot {
     fn drop(&mut self) {
+        if !self.size.1 {
+            TAKEN.fetch_sub(self.size.0, Ordering::Relaxed);
+        }
         let retired = {
             let mut slabs = SLABS.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(s) = slabs.get_mut(&self.size).and_then(|v| v.get_mut(self.heap)) {
@@ -92,9 +105,13 @@ fn slot(size: (u64, bool), make: impl FnOnce(u64) -> Option<Memory>) -> Option<(
     if s.memory.is_none() {
         s.memory = Some(make(bytes)?);
     }
+    let memory = s.memory.clone()?;
     let index = s.free.pop()?;
     debug_assert!(index < s.slots);
-    Some((Slot { size, heap: at, index }, s.memory.clone()?))
+    if !size.1 {
+        TAKEN.fetch_add(size.0, Ordering::Relaxed);
+    }
+    Some((Slot { size, heap: at, index }, memory))
 }
 
 /// Upload memory for `bytes`: a buffer, where the CPU writes it from its

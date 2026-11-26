@@ -62,11 +62,15 @@ pub mod shader_cache;
 mod shadow;
 pub mod signature;
 #[cfg(windows)]
+mod spare;
+#[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
 mod compose;
 #[cfg(windows)]
 mod twin;
+#[cfg(windows)]
+mod texcap;
 #[cfg(windows)]
 mod texpool;
 #[cfg(windows)]

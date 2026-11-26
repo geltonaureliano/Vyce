@@ -849,6 +849,9 @@ mod tests {
         let copy = Arc::new(HostTexture {
             slot: None,
             skip: 0,
+            target: false,
+            used: Default::default(),
+            short: Default::default(),
             written: Default::default(),
             initialized: Default::default(),
             shared_exponent: false,

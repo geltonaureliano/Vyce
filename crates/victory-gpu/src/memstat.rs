@@ -20,6 +20,36 @@ pub(crate) static HOST_TEXTURES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HOST_TEXTURE_COUNT: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PLACED_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Of the textures the host renders to or writes (target, depth, unordered
+/// access): the host copies made (bytes, how many), and the title's textures
+/// nothing has used yet (the bytes of title memory they are, how many).
+pub(crate) static TARGETS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+pub(crate) static UNMADE: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Bytes of host textures let go that a submission may still read: freed
+/// some seconds later (`host::retire`), counted as used by the driver until
+/// then.
+pub(crate) static LEAVING: AtomicU64 = AtomicU64::new(0);
+
+/// Counts `bytes` as [`LEAVING`] until dropped.
+#[cfg(windows)]
+pub(crate) struct Leaving(u64);
+
+#[cfg(windows)]
+impl Leaving {
+    pub(crate) fn new(bytes: u64) -> Leaving {
+        add(&LEAVING, bytes);
+        Leaving(bytes)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Leaving {
+    fn drop(&mut self) {
+        sub(&LEAVING, self.0);
+    }
+}
+
 pub(crate) fn add(counter: &AtomicU64, bytes: u64) {
     counter.fetch_add(bytes, Relaxed);
 }
@@ -122,6 +152,15 @@ pub fn report() -> String {
             let _ = write!(line, ", {name} {} MiB ({})", mib(b[0].load(Relaxed)), b[1].load(Relaxed));
         }
         let _ = write!(line, ", {} lists", LISTS.load(Relaxed));
+        let _ = write!(
+            line,
+            ", targets {} MiB ({}), never used {} MiB ({}), textures leaving {} MiB",
+            mib(TARGETS[0].load(Relaxed)),
+            TARGETS[1].load(Relaxed),
+            mib(UNMADE[0].load(Relaxed)),
+            UNMADE[1].load(Relaxed),
+            mib(LEAVING.load(Relaxed)),
+        );
     }
     #[cfg(windows)]
     {

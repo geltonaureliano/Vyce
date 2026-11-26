@@ -786,10 +786,13 @@ pub(crate) struct HostList {
     queries: Mutex<Vec<(ID3D12QueryHeap, D3D12_QUERY_TYPE, u32, bool)>>,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
-    budget: OnceLock<Option<IndirectBudget>>,
-    /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
-    /// grown to the largest indirect execution recorded on the list.
-    indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    budget: Mutex<Option<IndirectBudget>>,
+    /// Device-local scratch buffers for clamped indirect arguments
+    /// (`indirect`): the last one, grown to the largest indirect execution
+    /// recorded on the list, is in use.
+    indirect_args: Mutex<Vec<crate::spare::Buffer>>,
+    /// Whether it may hold something of a recording ([`HostList::let_go`]).
+    holds: std::sync::atomic::AtomicBool,
     /// Host fence value signalled by the last submission that ran this list.
     last_fence: std::sync::atomic::AtomicU64,
     /// Dispatches and buffer copies recorded since the reset: what may have
@@ -819,6 +822,7 @@ pub(crate) fn warn_depth_bounds() {
 /// whether it has the clamps' root signature, pipeline and budget bound.
 #[derive(Default)]
 struct ClampChunks {
+    /// Kept between recordings only if they are not pooled ([`crate::spare`]).
     all: Vec<(ID3D12Resource, D3D12_RESOURCE_STATES)>,
     used: usize,
     at: u64,
@@ -975,6 +979,11 @@ pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
         let _ = unsafe { object.SetName(&windows::core::HSTRING::from(text())) };
     }
 }
+
+/// Bytes of a buffer for hoisted clamped indirect arguments, and of a list's
+/// indirect-work budget.
+const CLAMP_CHUNK: u64 = 256 << 10;
+const BUDGET: u64 = 256;
 
 /// Upload chunks handed out front to back: the chunks, the one in use and
 /// the bytes used in it.
@@ -1225,8 +1234,9 @@ impl Host {
                 clamp_chunks: Mutex::default(),
                 pipelines: Mutex::default(),
                 queries: Mutex::default(),
-                budget: OnceLock::new(),
+                budget: Mutex::default(),
                 indirect_args: Mutex::default(),
+                holds: std::sync::atomic::AtomicBool::new(true),
                 last_fence: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -1411,6 +1421,9 @@ impl Host {
             self.prewarm(runs);
         }
         self.drain_in_flight_locked();
+        // The slots that waited for a texture's host copy, before the lists
+        // that may read them run; nothing runs now.
+        crate::descriptor::make_waiting();
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -2157,6 +2170,49 @@ impl HostList {
         drop(kept);
     }
 
+    /// Whether the list may hold something of its last recording.
+    pub(crate) fn holds(&self) -> bool {
+        self.holds.load(Ordering::Acquire)
+    }
+
+    /// Lets go of what the list's recording needed: only after its last
+    /// submission finished, and not to be run again.
+    pub(crate) fn let_go(&self) {
+        self.release_kept();
+        *self.deferred() = Deferred::default();
+        self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.scratch.lock().unwrap_or_else(|e| e.into_inner()).give_back();
+        let mut given = crate::spare::Given::default();
+        {
+            let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+            chunks.used = 0;
+            chunks.at = 0;
+            chunks.barrier = false;
+            chunks.bound = false;
+            if crate::spare::on() {
+                given.chunks.extend(chunks.all.drain(..).map(|(b, _)| (b, CLAMP_CHUNK)));
+            }
+        }
+        {
+            let mut args = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+            // Its largest stays with the list if they are not pooled.
+            let keep = usize::from(!crate::spare::on()).min(args.len());
+            let n = args.len() - keep;
+            let old: Vec<_> = args.drain(..n).collect();
+            if crate::spare::on() {
+                given.arguments = old;
+            }
+        }
+        if crate::spare::on() {
+            let mut budget = self.budget.lock().unwrap_or_else(|e| e.into_inner());
+            let pooled = budget.take_if(|b| b.mapped.is_none());
+            given.budgets.extend(pooled.map(|b| (b.buffer, BUDGET)));
+            drop(budget);
+            crate::spare::give(given);
+        }
+        self.holds.store(false, Ordering::Release);
+    }
+
     /// Only after the list's last submission finished.
     pub(crate) fn reset(&self) {
         let fence = self.last_fence.load(Ordering::Acquire);
@@ -2165,26 +2221,14 @@ impl HostList {
         {
             h.wait_fence(fence);
         }
-        self.release_kept();
-        *self.deferred() = Deferred::default();
+        self.let_go();
         *self.work.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         self.writes.store(0, Ordering::Relaxed);
-        {
-            let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
-            chunks.used = 0;
-            chunks.at = 0;
-            chunks.barrier = false;
-            chunks.bound = false;
-        }
-        self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.queries.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        {
-            let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-            scratch.give_back();
-        }
+        self.holds.store(true, Ordering::Release);
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -2252,6 +2296,7 @@ impl HostList {
         )],
     ) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = D3D12_RESOURCE_STATE_COPY_DEST.0 as u32;
+        let now = crate::resource::now_ms();
         let mut pre_barriers = Vec::new();
         for (_, copy) in uploads {
             let real = copy.state.swap(COPY_DEST, Ordering::Relaxed);
@@ -2267,6 +2312,7 @@ impl HostList {
         let post_barriers: Vec<D3D12_RESOURCE_BARRIER> = states
             .values()
             .filter_map(|(first, last, copy)| {
+                copy.used.store(now, Ordering::Relaxed);
                 let real = copy.state.swap(*last, Ordering::Relaxed);
                 (real != *first).then(|| {
                     transition(
@@ -2548,21 +2594,26 @@ impl HostList {
     /// buffers, writable by shaders from here on in the list: the buffer and
     /// the offset. None for more than a buffer holds.
     pub(crate) fn clamp_room(&self, bytes: u64) -> Option<(ID3D12Resource, u64)> {
-        const CHUNK: u64 = 256 << 10;
         let bytes = bytes.next_multiple_of(16);
-        if bytes > CHUNK {
+        if bytes > CLAMP_CHUNK {
             return None;
         }
         let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
-        if chunks.used > 0 && chunks.at + bytes <= CHUNK {
+        if chunks.used > 0 && chunks.at + bytes <= CLAMP_CHUNK {
             let at = chunks.at;
             chunks.at += bytes;
             return Some((chunks.all[chunks.used - 1].0.clone(), at));
         }
         // The next buffer, writable.
         if chunks.used == chunks.all.len() {
-            let buffer = host()?.uav_buffer(CHUNK)?;
-            name(&buffer, || "hoisted indirect arguments".to_string());
+            let buffer = match crate::spare::chunk() {
+                Some((buffer, _)) => buffer,
+                None => {
+                    let buffer = host()?.uav_buffer(CLAMP_CHUNK)?;
+                    name(&buffer, || "hoisted indirect arguments".to_string());
+                    buffer
+                }
+            };
             chunks.all.push((buffer, D3D12_RESOURCE_STATE_COMMON));
         }
         let i = chunks.used;
@@ -2758,7 +2809,7 @@ impl HostList {
     }
 
     /// The list's indirect-work budget, zeroed each time the list executes.
-    pub(crate) fn budget(&self) -> Option<&ID3D12Resource> {
+    pub(crate) fn budget(&self) -> Option<ID3D12Resource> {
         let host = host()?;
         let zero = host
             .indirect_zero
@@ -2769,16 +2820,21 @@ impl HostList {
                 Some(buffer)
             })
             .as_ref();
-        let budget = self
-            .budget
-            .get_or_init(|| {
-                if zero.is_some() && let Some(buffer) = host.uav_buffer(256) {
+        let make = || {
+            if zero.is_some() {
+                let spare = crate::spare::budget().map(|(buffer, _)| buffer);
+                if let Some(buffer) = spare.or_else(|| host.uav_buffer(BUDGET)) {
                     return Some(IndirectBudget { buffer, mapped: None });
                 }
-                let (buffer, mapped) = host.shared_buffer(256)?;
-                Some(IndirectBudget { buffer, mapped: Some(mapped as usize) })
-            })
-            .as_ref()?;
+            }
+            let (buffer, mapped) = host.shared_buffer(BUDGET)?;
+            Some(IndirectBudget { buffer, mapped: Some(mapped as usize) })
+        };
+        let mut held = self.budget.lock().unwrap_or_else(|e| e.into_inner());
+        if held.is_none() {
+            *held = make();
+        }
+        let budget = held.as_ref()?;
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
             if let Some(at) = budget.mapped {
@@ -2791,34 +2847,36 @@ impl HostList {
             }
             deferred.budget_zeroed = true;
         }
-        Some(&budget.buffer)
+        Some(budget.buffer.clone())
     }
 
     /// A device-local unordered-access buffer of at least `size` bytes for
-    /// clamped indirect arguments, reused across executions and resets of the
-    /// list. Smaller buffers replaced mid-list stay alive until
+    /// clamped indirect arguments, reused across executions of the list.
+    /// Smaller buffers replaced mid-list stay alive until
     /// [`HostList::reset`].
     pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
         let needed = size.max(64 << 10);
-        let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((buffer, cap)) = &*slot
+        let mut all = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((buffer, cap)) = all.last()
             && *cap >= needed
         {
             return Some(buffer.clone());
         }
-        let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
-        let alloc = prev
-            .saturating_mul(2)
-            .max(needed)
-            .next_multiple_of(64 << 10);
-        let buffer = host()?.uav_buffer(alloc)?;
-        name(&buffer, || format!("indirect arguments {alloc:#x}"));
-        let old = slot.replace((buffer.clone(), alloc));
-        drop(slot);
-        if let Some((old_buf, _)) = old {
-            self.keep(&old_buf);
-        }
-        Some(buffer)
+        let prev = all.last().map_or(0, |(_, cap)| *cap);
+        let made = match crate::spare::arguments(needed) {
+            Some(spare) => spare,
+            None => {
+                let alloc = prev
+                    .saturating_mul(2)
+                    .max(needed)
+                    .next_multiple_of(64 << 10);
+                let buffer = host()?.uav_buffer(alloc)?;
+                name(&buffer, || format!("indirect arguments {alloc:#x}"));
+                (buffer, alloc)
+            }
+        };
+        all.push(made.clone());
+        Some(made.0)
     }
 
     /// Keeps `object` alive until the list is reset.
@@ -3870,6 +3928,9 @@ impl Meter {
         let count = |what| crate::telemetry::take(what) as f64 / frames;
         let time = |what| crate::telemetry::take(what) as f64 / 1e3 / frames;
         let prewarm_ms = PREWARM_US.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+        if self.telemetry {
+            crate::texcap::note();
+        }
         if self.telemetry && [fps, ms, draws, gpu, cpu, back_ms, dropped].into_iter().all(f64::is_finite) {
             // Keep one complete sample together with respect to other stderr writers.
             // A closed or unavailable monitor output must not interrupt rendering.
@@ -3892,6 +3953,8 @@ impl Meter {
                  \"snapshot_ms\":{:.2},\"steps_ms\":{:.2},\"card_record_ms\":{:.2},\"submit_ms\":{:.2},\
                  \"prewarm_ms\":{prewarm_ms:.2},\"vram_mb\":{},\"vram_budget_mb\":{},\
                  \"shared_mb\":{},\"card_mb\":{},\
+                 \"host_tex_mb\":{},\"targets_mb\":{},\"targets_unused_mb\":{},\
+                 \"tex_cap\":{},\"tex_remade\":{},\
                  \"dropped_per_frame\":{dropped:.2},\"pipelines_building\":{}}}",
                 self.frames_total,
                 count(Count::Submissions),
@@ -3907,6 +3970,11 @@ impl Meter {
                 local.1 >> 20,
                 shared.0 >> 20,
                 crate::card::bytes() >> 20,
+                crate::memstat::HOST_TEXTURES.load(Ordering::Relaxed) >> 20,
+                crate::memstat::TARGETS[0].load(Ordering::Relaxed) >> 20,
+                crate::memstat::UNMADE[0].load(Ordering::Relaxed) >> 20,
+                crate::texcap::in_force(),
+                crate::texcap::BETTER.swap(0, Ordering::Relaxed),
                 crate::pipeline::making(),
             );
         }

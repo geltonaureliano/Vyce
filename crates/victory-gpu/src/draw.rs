@@ -109,6 +109,9 @@ pub(crate) struct State {
     /// Of them, large ones by table: the records it was made from and the
     /// first dynamic slot. A shader that reads less of one takes the same.
     large_tables: std::collections::HashMap<u64, Vec<(Vec<[u32; 3]>, u32)>>,
+    /// Entries of fresh tables (by their first dynamic slot) left null for a
+    /// texture nothing had used yet ([`State::fill_holes`]).
+    holes: std::collections::HashMap<u32, Vec<u32>>,
     /// What [`State::tables`] made for the stage being bound: root slot, byte
     /// offset of its fresh table. Kept to reuse its storage across draws.
     made: Vec<(u8, u32)>,
@@ -526,6 +529,7 @@ impl State {
         self.fresh_tables.clear();
         self.fresh_records.clear();
         self.large_tables.clear();
+        self.holes.clear();
         if self.topology != 0 {
             self.set_topology(list, self.topology);
         }
@@ -724,7 +728,7 @@ impl State {
                         Some(View::Shader(r, _)) | Some(View::Unordered(r, ..)) => r,
                         _ => continue,
                     };
-                    let Some(t) = crate::resource::host_resource(r as This) else { continue };
+                    let Some(t) = crate::resource::host_made(r as This) else { continue };
                     // SAFETY: a live resource.
                     let d = unsafe { t.GetDesc() };
                     tracing::info!(
@@ -1378,6 +1382,7 @@ impl State {
                 && let Some(variants) = self.large_tables.get(&table)
                 && let Some(first) = cached_table_prefix(variants, needed, read_record, &mut records)
             {
+                self.fill_holes(host, table, first, needed, &entries);
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     match crate::descriptor::view(handle) {
@@ -1413,6 +1418,7 @@ impl State {
                         .all(|(k, r)| *r == word(k as u32))
             });
             if let Some(&Fresh { first, .. }) = same {
+                self.fill_holes(host, table, first, n, &entries);
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     match crate::descriptor::view(handle) {
@@ -1445,6 +1451,11 @@ impl State {
             }
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
+            // The textures the shader reads are in use from here on.
+            for u in &entries {
+                crate::descriptor::use_texture(table + u64::from(u.table_offset_dwords) * 4);
+            }
+            let mut holes = Vec::new();
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -1460,7 +1471,9 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        if host.make_at(index, &view, used.is_some()) {
+                            holes.push(k);
+                        }
                         if let Some(u) = used {
                             readable(list, u, &view);
                         }
@@ -1476,10 +1489,39 @@ impl State {
                     }
                 }
             }
+            if !holes.is_empty() {
+                self.holes.insert(first, holes);
+            }
             made.push((slot, first * 32));
         }
         self.made = made;
         true
+    }
+
+    /// Of the fresh table of `table` at dynamic slot `first`, made for an
+    /// earlier draw of the list: the entries below `n` left null because
+    /// nothing had used their texture are made if `entries` read them, or
+    /// something has used the texture since.
+    fn fill_holes(
+        &mut self,
+        host: &crate::descriptor::host::HostHeap,
+        table: u64,
+        first: u32,
+        n: u32,
+        entries: &[&UsedResource],
+    ) {
+        let Some(holes) = self.holes.get_mut(&first) else {
+            return;
+        };
+        holes.retain(|&k| {
+            let used = entries.iter().any(|u| u.table_offset_dwords / 8 == k);
+            k >= n
+                || crate::descriptor::view(table + u64::from(k) * 32)
+                    .is_some_and(|view| host.make_at(first + k, &view, used))
+        });
+        if holes.is_empty() {
+            self.holes.remove(&first);
+        }
     }
 
     /// The first draws, at debug level: what they bind and read
@@ -1495,7 +1537,7 @@ impl State {
         let targets: Vec<String> = self
             .targets
             .iter()
-            .filter_map(|&t| crate::resource::host_resource(t as This))
+            .filter_map(|&t| crate::resource::host_made(t as This))
             .map(|t| {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
@@ -2101,7 +2143,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
 #[cfg(feature = "diagnostics")]
 fn describe(view: Option<&View>) -> String {
     let texture = |r: This| {
-        crate::resource::host_resource(r).map(|t| {
+        crate::resource::host_made(r).map(|t| {
             // SAFETY: a live resource.
             let d = unsafe { t.GetDesc() };
             format!(
@@ -2209,6 +2251,60 @@ mod group_limit_tests {
         assert!(!super::dispatch_fits(65_536, 1, 1));
         assert!(!super::dispatch_fits(1, u32::MAX, 1));
         assert!(!super::dispatch_fits(1, 1, 65_536));
+    }
+}
+
+#[cfg(test)]
+mod hole_tests {
+    use super::*;
+
+    /// A table made for an earlier draw, with an entry left null for a texture
+    /// nothing had used: a draw that reads it makes it, one that does not
+    /// leaves it, and entries past what is known to be the same are left.
+    #[test]
+    fn a_later_draw_makes_the_entries_it_reads() {
+        if crate::host::host().is_none() || !crate::resource::lazy_targets() {
+            return;
+        }
+        let Some(host) = crate::descriptor::host::HostHeap::new(false, 4) else {
+            return;
+        };
+        let null = std::ptr::null();
+        let target = || crate::resource::test_texture(1024, 512, 28, 4, 0);
+        let (a, b, c) = (target(), target(), target());
+        let table = [0u64; 3 * 4];
+        let at = |k: u64| table.as_ptr() as u64 + 32 * k;
+        for (k, t) in [a, b, c].into_iter().enumerate() {
+            crate::descriptor::create_srv(null, t, std::ptr::null(), at(k as u64));
+        }
+        let mut state = State::default();
+        state.holes.insert(4, vec![0, 1, 2]);
+        let entry = |k: u32| UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 8 * k,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        };
+        let waits = || [a, b, c].map(crate::resource::waits);
+        state.fill_holes(&host, at(0), 4, 2, &[&entry(1)]);
+        assert_eq!(waits(), [true, false, true]);
+        assert_eq!(state.holes[&4], [0, 2]);
+        // Another's use of a texture is enough.
+        assert!(crate::resource::host_copy(c).is_some());
+        state.fill_holes(&host, at(0), 4, 2, &[]);
+        assert_eq!(state.holes[&4], [0, 2], "past the part known");
+        state.fill_holes(&host, at(0), 4, 3, &[]);
+        assert_eq!(state.holes[&4], [0]);
+        state.fill_holes(&host, at(0), 4, 3, &[&entry(0)]);
+        assert!(state.holes.is_empty());
+        assert_eq!(waits(), [false; 3]);
+        for t in [a, b, c] {
+            assert_eq!(crate::object::slot::<extern "system" fn(This) -> u32>(t, 0x10)(t), 0);
+        }
     }
 }
 

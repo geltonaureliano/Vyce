@@ -333,6 +333,135 @@ impl View {
             View::Sampler(_) | View::ConsoleSampler(_) => false,
         }
     }
+
+    /// The texture object the view is of, if that texture has no host copy
+    /// yet (`crate::resource::waits`).
+    #[cfg(windows)]
+    fn waiting_texture(&self) -> Option<usize> {
+        match *self {
+            View::Shader(r, _) | View::Unordered(r, _, _) if crate::resource::waits(r as This) => {
+                Some(r)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Host slots (heap's number, slot) left null because the texture they view
+/// had no host copy, by texture. A title texture the host writes gets its
+/// host copy on first use (`resource.rs` `Hosted`), and the title writes each
+/// texture's views into its view heap when it creates the texture: making
+/// those host slots would make every host copy at once. They are made when
+/// the texture is: shaders that index the heap read slots no draw makes
+/// again.
+///
+/// From github.com/fxceless/victory-fork (commit 578d459).
+#[cfg(windows)]
+static WAITING: std::sync::Mutex<std::collections::BTreeMap<usize, Vec<(u64, u32)>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Textures given their host copy since [`make_waiting`] last ran, those to
+/// be given it, and whether there are any.
+#[cfg(windows)]
+#[allow(clippy::type_complexity)]
+static MADE_LATE: std::sync::Mutex<(Vec<usize>, Vec<usize>)> =
+    std::sync::Mutex::new((Vec::new(), Vec::new()));
+#[cfg(windows)]
+static LATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(windows)]
+fn late(note: impl FnOnce(&mut (Vec<usize>, Vec<usize>))) {
+    note(&mut MADE_LATE.lock().unwrap_or_else(|e| e.into_inner()));
+    LATE.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Title texture `resource` was given its host copy.
+#[cfg(windows)]
+pub(crate) fn texture_made(resource: usize) {
+    late(|(made, _)| made.push(resource));
+}
+
+/// Host slot `slot` of heap number `heap` is to show texture `resource`,
+/// which has no host copy: it waits for one.
+#[cfg(windows)]
+pub(crate) fn wait_for(resource: usize, heap: u64, slot: u32) {
+    /// A texture with more slots waiting than this is in use for all we know
+    /// (its views are being copied about): its host copy is made.
+    const MOST: usize = 256;
+    let many = {
+        let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+        let slots = waiting.entry(resource).or_default();
+        let new = !slots.contains(&(heap, slot));
+        if new {
+            slots.push((heap, slot));
+        }
+        new && slots.len().is_multiple_of(MOST)
+    };
+    if many {
+        // By the thread that submits: this one may hold locks.
+        late(|(_, wanted)| wanted.push(resource));
+    } else if !crate::resource::waits(resource as This) {
+        // Made by another thread since the slot was looked at: that may have
+        // been taken by `make_waiting` before this slot was noted.
+        texture_made(resource);
+    }
+}
+
+/// A shader of a draw or dispatch reads the descriptor at `handle`: the
+/// texture object it is a view of is in use.
+#[cfg(windows)]
+pub(crate) fn use_texture(handle: u64) {
+    if let Some(texture) = view(handle).and_then(|v| v.waiting_texture()) {
+        let _ = crate::resource::host_copy(texture as This);
+    }
+}
+
+/// Makes the host slots that waited for a texture's host copy, for the
+/// textures made since the last call. Called before a submission runs and
+/// with none running, by the thread that submits: slots are read when a list
+/// runs.
+#[cfg(windows)]
+pub(crate) fn make_waiting() {
+    use std::sync::atomic::Ordering;
+    if !LATE.load(Ordering::Acquire) || !LATE.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let list = || MADE_LATE.lock().unwrap_or_else(|e| e.into_inner());
+    // While a texture waits it is not freed: `forget` takes it out, under
+    // the lock held here, before it is.
+    let wanted = std::mem::take(&mut list().1);
+    for resource in wanted {
+        let waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+        if waiting.contains_key(&resource) {
+            // Makes it, and notes it made.
+            let _ = crate::resource::host_copy(resource as This);
+        }
+    }
+    let made = std::mem::take(&mut list().0);
+    // A slot the title writes meanwhile is made by it after this: `mirror`
+    // takes the same lock once the title's record is there.
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let hosts: Vec<(u64, &Heap, &host::HostHeap)> = heaps
+        .iter()
+        .filter_map(|&(start, _, at)| {
+            // SAFETY: registered heaps stay alive until `Heap::drop`, which
+            // takes the lock held here.
+            let heap = unsafe { &*(at as *const Heap) };
+            // Not while it is made and its slots are noted waiting.
+            let _pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+            Some((start, heap, heap.host.get()?.as_deref()?))
+        })
+        .collect();
+    for resource in made {
+        let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+        for (number, slot) in waiting.remove(&resource).into_iter().flatten() {
+            let Some((start, heap, host)) = hosts.iter().find(|h| h.2.number() == number) else {
+                continue;
+            };
+            let step = u64::from(increment(heap.desc.kind).unwrap_or(0));
+            host.make_waiting(slot, start + u64::from(slot) * step, resource);
+        }
+    }
 }
 
 /// Every distinct view in use; a descriptor holds a tag, an index into it
@@ -411,6 +540,8 @@ fn record(handle: u64, view: View) {
 
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
+    #[cfg(windows)]
+    WAITING.lock().unwrap_or_else(|e| e.into_inner()).remove(&resource);
     let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;

@@ -274,6 +274,32 @@ fn hoist(this: This) {
 #[cfg(windows)]
 static PARTED: std::sync::Mutex<Vec<Submitted>> = std::sync::Mutex::new(Vec::new());
 
+/// Once in a while: the parted lists that have run and wait to be reused let
+/// go of what their recordings held, as they would when reused. Hundreds do,
+/// most of them for long.
+#[cfg(windows)]
+pub(crate) fn sweep() {
+    if !crate::spare::on() {
+        return;
+    }
+    // Held here, a list is not taken for reuse ([`spare`]): a few at a time.
+    const AT_ONCE: usize = 8;
+    const MOST: usize = 256;
+    for _ in 0..MOST / AT_ONCE {
+        let idle: Vec<Arc<crate::host::HostList>> = {
+            let parted = PARTED.lock().unwrap_or_else(|e| e.into_inner());
+            let idle = parted.iter().filter(|l| Arc::strong_count(&l.0) == 1 && l.0.holds());
+            idle.take(AT_ONCE).map(|l| l.0.clone()).collect()
+        };
+        if idle.is_empty() {
+            break;
+        }
+        for list in idle {
+            list.let_go();
+        }
+    }
+}
+
 /// A host list to record into, open: one that has run, or a new one.
 #[cfg(windows)]
 fn spare() -> Option<Arc<crate::host::HostList>> {
@@ -506,6 +532,9 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             if b.flags & BEGIN_ONLY != 0 {
                 return None;
             }
+            if !crate::resource::barrier_meets(b.first, (b.second >> 32) as u32, b.last as u32) {
+                return None;
+            }
             // shortcut: whole resources, from the state the list tracked
             // (`HostList::transition`); subresources are not told apart.
             let wanted = crate::host::texture_state(b.last as u32);
@@ -518,19 +547,19 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
                 last: u64::from(crate::host::legal_state(texture, wanted)),
             })
         }
-        1 => Some(Barrier {
-            first: if b.first.is_null() {
-                b.first
-            } else {
-                host(b.first)?
-            },
-            second: if b.second == 0 {
-                0
-            } else {
-                host(b.second as This)? as u64
-            },
-            ..*b
-        }),
+        // A texture nothing has used yet shares no memory: its place is left
+        // empty, which stands for any.
+        1 => {
+            let host = |r: This| match r {
+                r if r.is_null() || crate::resource::waits(r) => Some(std::ptr::null()),
+                r => host(r),
+            };
+            Some(Barrier {
+                first: host(b.first)?,
+                second: host(b.second as This)? as u64,
+                ..*b
+            })
+        }
         2 => Some(Barrier {
             first: if b.first.is_null() {
                 b.first
@@ -2140,6 +2169,43 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    /// A list gives back what its recording held once, when it is reset or
+    /// as it waits to be reused.
+    #[cfg(windows)]
+    #[test]
+    fn lists_let_go_of_what_their_recording_held() {
+        let Some(host) = crate::host::host() else { return };
+        let list = host.new_list().unwrap();
+        assert!(list.holds());
+        let texture = crate::resource::test_texture(1024, 512, 28, 1, 0);
+        ensure_state(&list, texture, COPY_DEST);
+        let copy = crate::resource::host_copy(texture).unwrap();
+        assert_eq!(Arc::strong_count(&copy), 3, "the texture's, the list's and ours");
+        let (chunk, at) = list.clamp_room(100).unwrap();
+        let (same, after) = list.clamp_room(100).unwrap();
+        assert!(chunk == same && (at, after) == (0, 112));
+        assert!(list.budget().is_some() && list.indirect_scratch(100).is_some());
+        let first = list.indirect_scratch(100).unwrap();
+        assert!(first == list.indirect_scratch(1 << 16).unwrap());
+        assert!(first != list.indirect_scratch(1 << 20).unwrap(), "a larger one");
+        list.clamp_end();
+        list.close();
+        host.execute(&[&list]);
+        list.let_go();
+        assert!(!list.holds());
+        assert_eq!(Arc::strong_count(&copy), 2);
+        // As before: reset, recorded and run again, with buffers of others.
+        list.reset();
+        assert!(list.holds());
+        assert!(list.clamp_room(100).is_some() && list.budget().is_some());
+        list.clamp_end();
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: a plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(texture, 0x10)(texture), 0);
     }
 
     #[test]

@@ -457,6 +457,9 @@ function Update-Monitor {
     if ($null -ne $frame.vram_mb) {
         $counts += "  ·  VRAM $(Format-Metric $frame.vram_mb 'N0') de $(Format-Metric $frame.vram_budget_mb 'N0' ' MB')"
     }
+    if ($null -ne $frame.tex_cap) {
+        $counts += if ($frame.tex_cap -gt 0) { "  ·  Texturas até $($frame.tex_cap) px" } else { '  ·  Texturas sem limite' }
+    }
     $footer.Text = $counts
 }
 

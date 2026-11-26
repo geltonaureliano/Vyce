@@ -255,7 +255,7 @@ pub(crate) fn bound(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    record_clamp(c, &list.list, &dst, &budget, src, count, spec).then_some(dst)
 }
 
 fn record_clamp(
@@ -461,7 +461,7 @@ pub(crate) fn bound_before(
         // Clamps write disjoint argument ranges. Only the budget needs
         // ordering here in mode 7; clamp_end transitions the argument buffers.
         if hoist_mode() == 7 {
-            l.ResourceBarrier(&[uav_barrier(Some(budget))]);
+            l.ResourceBarrier(&[uav_barrier(Some(&budget))]);
         }
     }
     Some((dst, at))
