@@ -157,6 +157,8 @@ unsafe impl Sync for Line {}
 thread_local! {
     /// This thread is landing a flight.
     static LANDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// This is the landing thread ([`land_all`]).
+    static BEHIND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl Line {
@@ -282,10 +284,14 @@ impl Line {
     }
 
     /// Waits until the flight with fence value `target` has landed. The time
-    /// counts for `why`.
+    /// counts for `why`, and the wait among those of its kind
+    /// ([`crate::telemetry::drains_of`]).
     pub(crate) fn wait(&self, target: u64, why: Count) {
         if target == 0 || self.landed.load(Ordering::Acquire) >= target {
             return;
+        }
+        if let Some(kind) = crate::telemetry::drains_of(why) {
+            crate::telemetry::count(kind, 1);
         }
         let began = Instant::now();
         let mut standing = Duration::ZERO;
@@ -305,17 +311,21 @@ impl Line {
         crate::telemetry::count(why, began.elapsed().as_micros() as u64);
     }
 
-    /// Waits until everything in flight has landed.
+    /// Waits until everything in flight at the call has landed: not for what
+    /// other threads send meanwhile, which a thread that keeps submitting
+    /// would make a wait without end. Inside a landing it returns at once:
+    /// nothing behind the flight being landed can land before it.
     pub(crate) fn drain(&self, why: Count) {
-        loop {
-            let newest = {
-                let s = self.state();
-                s.flights.back().map(|f| f.fence).or(s.landing.as_ref().map(|l| l.fence))
-            };
-            match newest {
-                Some(target) => self.wait(target, why),
-                None => return,
-            }
+        if LANDING.get() {
+            return;
+        }
+        let newest = {
+            let s = self.state();
+            s.flights.back().map(|f| f.fence).or(s.landing.as_ref().map(|l| l.fence))
+        };
+        if let Some(target) = newest {
+            // Flights land in the order of their values.
+            self.wait(target, why);
         }
     }
 
@@ -328,6 +338,8 @@ impl Line {
                 && let Err(e) = self.fence.SetEventOnCompletion(target, HANDLE::default())
             {
                 tracing::warn!(error = %e, "host fence wait failed");
+                // Not a loop at full speed around a wait that fails.
+                std::thread::sleep(Duration::from_millis(1));
             }
         }
     }
@@ -350,6 +362,13 @@ impl Line {
         impl Drop for Here {
             fn drop(&mut self) {
                 LANDING.set(false);
+                // A landing that did not end leaves its signals and values
+                // undone: whoever waits for them would wait for good.
+                if std::thread::panicking() {
+                    crate::host::fail(format_args!(
+                        "landing a host submission panicked: what it was to tell the title never comes"
+                    ));
+                }
             }
         }
         let _one = self.landing.lock().unwrap_or_else(|e| e.into_inner());
@@ -402,6 +421,10 @@ impl Line {
             crate::host::finished(last);
             // Values written into fences' memory.
             crate::fence::wake();
+            crate::telemetry::count(Count::Landed, count as u64);
+            if !BEHIND.get() {
+                crate::telemetry::count(Count::LandedHere, count as u64);
+            }
         }
         count
     }
@@ -413,6 +436,7 @@ impl Line {
 /// (`crate::timeline`). Ends with its line (tests').
 fn land_all(line: &Weak<Line>) {
     crate::pool::urgent();
+    BEHIND.set(true);
     loop {
         let Some(line) = line.upgrade() else { return };
         let next = {
@@ -429,7 +453,7 @@ fn land_all(line: &Weak<Line>) {
         };
         let Some(target) = next else { continue };
         line.reached(target);
-        crate::telemetry::count(Count::Landed, line.land() as u64);
+        line.land();
     }
 }
 
@@ -778,6 +802,100 @@ mod tests {
         });
         line.drain(Count::WaitList);
         assert_eq!((memory[0].load(Ordering::Acquire), completed(f)), (N, N));
+    }
+
+    /// A drain waits for what was in flight when it began, not for what is
+    /// sent afterwards: behind a second gate a later flight stays in the
+    /// air, and the drain returns all the same. On WARP and on the machine's
+    /// own GPU.
+    #[test]
+    fn a_drain_does_not_wait_for_flights_sent_after_it_began() {
+        if let Some((host, memory)) = host() {
+            drain_alone(host, memory);
+        }
+        if late_signal()
+            && let Some(host) = Host::new_hardware()
+        {
+            drain_alone(host.overlapping(), Box::leak(Box::default()));
+        }
+    }
+
+    fn drain_alone(host: &'static Host, memory: Memory) {
+        let line = host.line();
+        let first_gate = Gate(host.gate());
+        host.execute_title(&[list(host, &[], &[(at(memory, 0), 1)])]);
+        let drained = Arc::new(AtomicBool::new(false));
+        let drainer = {
+            let (line, drained) = (line.clone(), drained.clone());
+            std::thread::spawn(move || {
+                line.drain(Count::WaitFence);
+                drained.store(true, Ordering::Release);
+            })
+        };
+        // The drain has taken its target and stands at the host GPU.
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!drained.load(Ordering::Acquire), "drained before the host GPU ran");
+        // (A submission of the title's would wait for the first to land
+        // before it is prepared.)
+        let second_gate = Gate(host.gate());
+        host.send_behind(&list(host, &[], &[(at(memory, 1), 2)]));
+        first_gate.open();
+        until(|| drained.load(Ordering::Acquire));
+        drainer.join().unwrap();
+        assert_eq!(memory[0].load(Ordering::Acquire), 1, "the first flight landed");
+        assert!(line.busy() && memory[1].load(Ordering::Acquire) == 0, "the second is still in the air");
+        second_gate.open();
+        line.drain(Count::WaitFence);
+        assert_eq!(read(memory)[..2], [1, 2]);
+    }
+
+    /// Inside a landing (a list it lets go of, say) a drain cannot wait for
+    /// what lies behind the flight being landed: it returns at once.
+    #[test]
+    fn a_drain_inside_a_landing_returns_at_once() {
+        let Some((host, memory)) = host() else { return };
+        let line = host.line();
+        let gate = Gate(host.gate());
+        host.execute_title(&[list(host, &[], &[(at(memory, 0), 1)])]);
+        LANDING.set(true);
+        let started = Instant::now();
+        line.drain(Count::WaitList);
+        LANDING.set(false);
+        assert!(started.elapsed() < Duration::from_secs(5) && line.busy());
+        gate.open();
+        line.drain(Count::WaitList);
+        assert_eq!(memory[0].load(Ordering::Acquire), 1);
+    }
+
+    /// Work of a queue that needs everything finished, behind a flight, runs
+    /// on the thread that submits it once that flight has landed, and finds
+    /// what the flight left: the queue's thread lands it itself if it has to
+    /// (it holds no lock the landing needs).
+    #[test]
+    fn work_behind_a_flight_runs_once_it_has_landed() {
+        let Some((host, memory)) = host() else { return };
+        let line = host.line();
+        let gate = Gate(host.gate());
+        let queue = Timeline::on(line);
+        queue.submit(submission(host, vec![list(host, &[], &[(at(memory, 0), 6)])]));
+        until(|| queue.idle());
+        let seen = Arc::new(AtomicU64::new(0));
+        let worker = {
+            let (queue, seen) = (queue.clone(), seen.clone());
+            std::thread::spawn(move || {
+                queue.submit(Op::Work(Box::new(move || {
+                    seen.store(1 + memory[0].load(Ordering::Acquire), Ordering::Release);
+                })));
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(seen.load(Ordering::Acquire), 0, "ran under the host GPU");
+        gate.open();
+        // (Another test's thread may be the one that runs it.)
+        until(|| seen.load(Ordering::Acquire) != 0);
+        assert_eq!(seen.load(Ordering::Acquire), 7, "ran before the value it follows");
+        worker.join().unwrap();
+        until(|| queue.idle() && !line.busy());
     }
 
     /// Shaders' writes go into title memory when their flight lands, before

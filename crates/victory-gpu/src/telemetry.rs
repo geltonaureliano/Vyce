@@ -77,7 +77,8 @@ pub(crate) enum Count {
     LateSignals,
     /// ... waits met by one ahead in the host queue, ...
     LateWaits,
-    /// ... and submissions finished on the landing thread.
+    /// ... and submissions not waited for that landed (were finished once
+    /// the host GPU had run them), on any thread.
     Landed,
     /// Lists given to the host queue, and the calls that gave them.
     HostLists,
@@ -117,9 +118,43 @@ pub(crate) enum Count {
     /// nothing to open.
     Openings,
     OpeningsIdle,
+    /// How many of the waits above had to wait, by the same reasons.
+    DrainsExecute,
+    DrainsSignal,
+    DrainsWork,
+    DrainsHeld,
+    DrainsPresent,
+    DrainsFence,
+    DrainsList,
+    /// Submissions landed by a thread that needed them sooner than the
+    /// landing thread got to them.
+    LandedHere,
+    /// Askings of the kernel's write watch, their time, and refreshes
+    /// answered by a submission's asking ahead instead
+    /// (`crate::watch::ask_ahead`).
+    WatchAsks,
+    WatchTime,
+    WatchAhead,
+    /// Title buffer copies that went on where the one before ended, made one
+    /// with it.
+    CopiesJoined,
 }
 
-const COUNTS: usize = Count::OpeningsIdle as usize + 1;
+const COUNTS: usize = Count::CopiesJoined as usize + 1;
+
+/// The count of waits of the kind a wait's time is counted as.
+pub(crate) fn drains_of(why: Count) -> Option<Count> {
+    Some(match why {
+        Count::WaitExecute => Count::DrainsExecute,
+        Count::WaitSignal => Count::DrainsSignal,
+        Count::WaitWork => Count::DrainsWork,
+        Count::WaitHeld => Count::DrainsHeld,
+        Count::WaitPresent => Count::DrainsPresent,
+        Count::WaitFence => Count::DrainsFence,
+        Count::WaitList => Count::DrainsList,
+        _ => return None,
+    })
+}
 static TOTALS: [AtomicU64; COUNTS] = [const { AtomicU64::new(0) }; COUNTS];
 
 /// What the sample shows the highest value of, not a sum.
@@ -182,6 +217,18 @@ const MORE: &[(&str, Count, f64)] = &[
     ("parallel_calls", Count::Parallel, 1.0),
     ("openings", Count::Openings, 1.0),
     ("openings_idle", Count::OpeningsIdle, 1.0),
+    ("drains_execute", Count::DrainsExecute, 1.0),
+    ("drains_signal", Count::DrainsSignal, 1.0),
+    ("drains_work", Count::DrainsWork, 1.0),
+    ("drains_held", Count::DrainsHeld, 1.0),
+    ("drains_present", Count::DrainsPresent, 1.0),
+    ("drains_fence", Count::DrainsFence, 1.0),
+    ("drains_list", Count::DrainsList, 1.0),
+    ("landed_here", Count::LandedHere, 1.0),
+    ("watch_asks", Count::WatchAsks, 1.0),
+    ("watch_ms", Count::WatchTime, 1e3),
+    ("watch_ahead", Count::WatchAhead, 1.0),
+    ("copies_joined", Count::CopiesJoined, 1.0),
 ];
 
 const MORE_GAUGES: [(&str, Gauge); GAUGES] = [

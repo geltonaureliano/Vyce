@@ -102,6 +102,10 @@ struct Journal {
     written: BTreeMap<usize, u64>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
+    /// Page ranges asked about ahead of a group of refreshes
+    /// ([`ask_ahead`]): until it is done, [`writes`] answers for a range
+    /// inside one from the journal, without another kernel call.
+    ahead: Vec<(usize, usize)>,
 }
 
 impl Journal {
@@ -117,6 +121,7 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
+    ahead: Vec::new(),
 });
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -125,37 +130,136 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    observe_writes(start, end, guarded, Journal::pages)
+    observe_writes(start, end, guarded, true, Journal::pages)
 }
 
 /// Records writes and returns only their generation. Copy-back already knows
 /// which pages it synchronized, so it does not need a snapshot of the journal.
+/// Always asks the kernel: what it finds written are our own writes too,
+/// which must not count as the title's later.
 pub(crate) fn copy_epoch(start: usize, end: usize, known_guarded: bool) -> Option<u64> {
     let epoch_only = |_: &Journal, _: usize, _: usize| ();
     if known_guarded {
         observe_guarded_writes(start, end, epoch_only)
     } else {
-        observe_writes(start, end, true, epoch_only)
+        observe_writes(start, end, true, false, epoch_only)
     }
     .map(|(now, ())| now)
 }
 
-fn observe_writes<T>(
-    start: usize,
-    end: usize,
-    guarded: bool,
-    report: impl FnOnce(&Journal, usize, usize) -> T,
-) -> Option<(u64, T)> {
+/// Whether a group of refreshes asks the kernel once for all of their
+/// write-watched memory ([`ask_ahead`]; `VYCE_ASK_AHEAD=0`: each refresh
+/// asks for its own range, as before).
+pub(crate) fn ask_ahead_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VYCE_ASK_AHEAD").is_none_or(|v| v != "0"))
+}
+
+/// Ranges of one group closer than this (in pages) are asked about
+/// together: walking the pages between them costs less than another kernel
+/// call (one that resets written pages costs tens of microseconds whatever
+/// the range).
+const AHEAD_GAP: usize = (8 << 20) / PAGE;
+/// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
+const AHEAD_MOST: usize = (1 << 30) / PAGE;
+
+/// Until dropped, refreshes of what [`ask_ahead`] asked are answered from
+/// the journal.
+pub(crate) struct Ahead(());
+
+impl Drop for Ahead {
+    fn drop(&mut self) {
+        JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).ahead.clear();
+    }
+}
+
+/// Asks the kernel about many ranges `(start, end)` of write-watched memory
+/// at once, before the [`writes`] of each: ranges close together are one
+/// asking (halved where one fails: across two reservations, or into memory
+/// that is not write-watched), and until the result is dropped `writes`
+/// answers for them from the journal. A range alone is left to `writes`.
+///
+/// No less right than an asking per range, as long as nothing of ours
+/// writes title memory meanwhile (refreshes write their copies): the
+/// journal keeps what each asking found for every asker, and a page the
+/// title writes after this asking is still written for the kernel, so the
+/// next asking finds it. What changes: such a write is seen by the next
+/// group of refreshes, not by this one. `ASK_ONCE`/`ask_ahead` of
+/// github.com/avatarmanz/VIctory-7900XTX (0a43566, from fxceless's
+/// 578d459), here for a group of refreshes rather than a whole submission.
+pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) -> Option<Ahead> {
+    if !ask_ahead_on() {
+        return None;
+    }
+    let mut pieces: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|r| r.0 < r.1)
+        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .collect();
+    if pieces.len() < 2 {
+        return None;
+    }
+    pieces.sort_unstable();
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    // Another group's asking stands (one thread refreshes at a time).
+    if !j.ahead.is_empty() {
+        return None;
+    }
+    let (mut asked, mut written) = (Vec::new(), Vec::new());
+    let mut i = 0;
+    while i < pieces.len() {
+        let first = pieces[i].0;
+        let mut last = pieces[i].1;
+        let mut k = i + 1;
+        while k < pieces.len() && pieces[k].0 <= last + AHEAD_GAP && last.max(pieces[k].1) - first <= AHEAD_MOST {
+            last = last.max(pieces[k].1);
+            k += 1;
+        }
+        ask_run(&mut j, &pieces[i..k], &mut asked, &mut written);
+        i = k;
+    }
+    if asked.is_empty() {
+        return None;
+    }
+    j.asked += 1;
+    let now = j.asked;
+    for page in written {
+        j.written.insert(page, now);
+    }
+    j.ahead = asked;
+    Some(Ahead(()))
+}
+
+/// One kernel asking for `pieces` (page ranges in order); by halves if it
+/// fails. A piece alone is left to [`writes`]. Adds what was asked to
+/// `asked` and the pages found written to `written`.
+fn ask_run(j: &mut Journal, pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: &mut Vec<usize>) {
+    if pieces.len() < 2 {
+        return;
+    }
+    let first = pieces[0].0;
+    let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
+    if let Some(count) = kernel_written(j, first, last) {
+        written.extend(j.found[..count].chunk_by(|a, b| *a / PAGE == *b / PAGE).map(|hits| hits[0] / PAGE));
+        asked.push((first, last));
+        return;
+    }
+    let (a, b) = pieces.split_at(pieces.len() / 2);
+    ask_run(j, a, asked, written);
+    ask_run(j, b, asked, written);
+}
+
+/// Asks the kernel which 4 KiB pages of the pages `[first, last)` were
+/// written since it was last asked (and forgets that): how many it put into
+/// `j.found`, `None` if the range is not write-watched memory of one
+/// reservation. Under the journal's lock.
+fn kernel_written(j: &mut Journal, first: usize, last: usize) -> Option<usize> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
-    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
+    let asking = crate::telemetry::start();
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
         GetWriteWatch(
@@ -167,8 +271,33 @@ fn observe_writes<T>(
             &mut granularity,
         )
     } != 0;
-    let guarded = if failed {
-        count = 0;
+    crate::telemetry::count(crate::telemetry::Count::WatchAsks, 1);
+    crate::telemetry::stop(crate::telemetry::Count::WatchTime, asking);
+    (!failed).then_some(count)
+}
+
+/// `ahead`: a range a group's asking holds may be answered from the journal.
+fn observe_writes<T>(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    ahead: bool,
+    report: impl FnOnce(&Journal, usize, usize) -> T,
+) -> Option<(u64, T)> {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    if ahead && j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+        crate::telemetry::count(crate::telemetry::Count::WatchAhead, 1);
+        // Every asking so far is in the journal: a copy taken from now on
+        // holds what they found.
+        return Some((j.asked, report(j, first, last)));
+    }
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let asked = kernel_written(j, first, last);
+    let count = asked.unwrap_or(0);
+    let guarded = if asked.is_none() {
         if !guarded {
             return None;
         }
@@ -1027,6 +1156,48 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// Refreshes asked about ahead are answered from the journal while the
+    /// asking stands: a write after it is seen by the first asking after it
+    /// (nothing is lost, it comes a group later). What was not asked ahead is
+    /// asked of the kernel as ever, and a range alone is not asked ahead.
+    #[test]
+    fn an_asking_ahead_answers_for_its_ranges_until_it_is_done() {
+        if !ask_ahead_on() {
+            return;
+        }
+        // SAFETY: a private write-watched region of the test's own.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 16 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let page = |i: usize| p / PAGE + i;
+        // SAFETY: committed pages of ours.
+        let write = |i: usize| unsafe { ((p + i * PAGE + 8) as *mut u8).write(7) };
+        // Windows can reuse an address already in the journal: only what
+        // was found after this counts.
+        let (initial, _) = writes(p, p + 16 * PAGE, false).expect("watched");
+        let found = |list: &[(usize, u64)]| list.iter().filter(|w| w.1 > initial).map(|w| w.0).collect::<Vec<_>>();
+        write(1);
+        write(9);
+        let ahead = ask_ahead(&[(p + 8 * PAGE, p + 12 * PAGE), (p, p + 2 * PAGE)]).expect("asked ahead");
+        let (now, first) = writes(p, p + 2 * PAGE, false).unwrap();
+        assert_eq!(found(&first), [page(1)]);
+        assert!(first.iter().all(|&(_, when)| when <= now));
+        write(10);
+        let (_, second) = writes(p + 8 * PAGE, p + 12 * PAGE, false).unwrap();
+        assert_eq!(found(&second), [page(9)], "a write after the asking is the next one's");
+        write(14);
+        let (_, apart) = writes(p + 14 * PAGE, p + 15 * PAGE, false).unwrap();
+        assert_eq!(found(&apart), [page(14)], "asked of the kernel");
+        drop(ahead);
+        let (later, third) = writes(p + 8 * PAGE, p + 12 * PAGE, false).unwrap();
+        assert!(later > now);
+        assert!(third.contains(&(page(10), later)), "{third:?}");
+        assert!(ask_ahead(&[(p, p + PAGE)]).is_none());
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
 
     /// Two views of the same two physical pages, told as the runtime tells
     /// them: the two addresses.

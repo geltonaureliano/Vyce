@@ -78,6 +78,62 @@ pub(crate) fn free_present() -> bool {
     })
 }
 
+/// Whether a title buffer copy that goes on exactly where the one recorded
+/// before it in its list ended (source and destination both) becomes one
+/// step with it (`VYCE_JOIN_COPIES=0`: a step each, as before). Each step is
+/// a copy into title memory at submission, an opening of its guards and an
+/// end of the refreshes gathered so far; the title copies a few hundred
+/// bytes at a time, thousands of times a frame. The same bytes move: only
+/// copies whose two ranges, taken together, do not overlap are joined. What
+/// differs: a page that is not mapped fails the joined copy as a whole,
+/// which then goes page by page (zeros for what cannot be read), as a single
+/// copy does. `VICTORY_JOIN_COPIES` of github.com/avatarmanz/VIctory-7900XTX
+/// (0a43566, from fxceless's 578d459), where it is off by default.
+fn join_copies() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VYCE_JOIN_COPIES").is_none_or(|v| v != "0"))
+}
+
+/// Whether the copy `next` (destination, source, bytes) goes on exactly
+/// where `last` ended, source and destination both, and the two as one do
+/// not overlap (source over destination): then one copy of both moves the
+/// bytes the two would move in turn. (`continues` of the fork above.)
+fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
+    let ((d, s, n), (dst, src, len)) = (last, next);
+    let Some(all) = n.checked_add(len) else {
+        return false;
+    };
+    d.checked_add(n) == Some(dst)
+        && s.checked_add(n) == Some(src)
+        && (d.checked_add(all).is_some_and(|end| end <= s) || s.checked_add(all).is_some_and(|end| end <= d))
+}
+
+/// A list's prelude: an allocator and a list, closed until recorded.
+type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// Whether a host list's prelude is made when the list first needs one
+/// (`VYCE_LAZY_PRELUDE=0`: with the list, as before). A prelude runs the
+/// texture transitions and uploads a list needs before it; lists that name
+/// no texture never have one, and every host list was made with one all the
+/// same: twice the host objects per list. `VICTORY_LAZY_PRELUDE` of
+/// github.com/avatarmanz/VIctory-7900XTX (0a43566, from fxceless's 578d459).
+fn lazy_prelude() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VYCE_LAZY_PRELUDE").is_none_or(|v| v != "0"))
+}
+
+/// A prelude of `device`.
+fn make_prelude(device: &ID3D12Device) -> windows::core::Result<Prelude> {
+    // SAFETY: plain object creation.
+    unsafe {
+        let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+        let list: ID3D12GraphicsCommandList =
+            device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
+        list.Close()?;
+        Ok((allocator, list))
+    }
+}
+
 /// The most lists in one call (`VYCE_ECL_LISTS`, 32).
 fn ecl_lists() -> u64 {
     static MOST: OnceLock<u64> = OnceLock::new();
@@ -781,6 +837,84 @@ mod tests {
 
     use super::*;
 
+    /// A list's clamp buffers start its next recording in the state the
+    /// call that ran it left them in: the common one.
+    #[test]
+    fn clamp_buffers_start_each_recording_common() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        let state = |list: &HostList| list.clamp_chunks.lock().unwrap().all.iter().map(|c| c.1).collect::<Vec<_>>();
+        let Some((buffer, 0)) = list.clamp_room(64) else { return };
+        assert_eq!(state(&list), [D3D12_RESOURCE_STATE_UNORDERED_ACCESS]);
+        list.clamp_end();
+        assert_eq!(state(&list), [D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT]);
+        list.close();
+        list.reset();
+        assert_eq!(state(&list), [D3D12_RESOURCE_STATE_COMMON]);
+        // The same buffer, made writable from there.
+        let (again, at) = list.clamp_room(64).unwrap();
+        assert!(again == buffer && at == 0);
+        assert_eq!(state(&list), [D3D12_RESOURCE_STATE_UNORDERED_ACCESS]);
+        list.clamp_end();
+        list.close();
+    }
+
+    /// Copies that go on where the one before ended, both ends, are one
+    /// step; others, and those whose ranges would overlap as one, are not.
+    #[test]
+    fn copies_that_go_on_are_one_step() {
+        assert!(continues((1000, 5000, 16), (1016, 5016, 32)));
+        assert!(continues((5000, 1000, 16), (5016, 1016, 32)));
+        assert!(!continues((1000, 5000, 16), (1020, 5016, 32)));
+        assert!(!continues((1000, 5000, 16), (1016, 5020, 32)));
+        assert!(!continues((1000, 5000, 16), (1000, 5000, 16)));
+        // Source and destination would meet.
+        assert!(!continues((1000, 1016, 16), (1016, 1032, 16)));
+        assert!(!continues((1016, 1000, 16), (1032, 1016, 16)));
+        assert!(continues((1000, 1032, 16), (1016, 1048, 16)));
+        assert!(!continues((usize::MAX - 8, 0, 8), (0, 8, 8)));
+        let Some(host) = Host::new_warp() else { return };
+        let list = host.new_list().unwrap();
+        let (to, from) = (0x10_0000usize, 0x20_0000usize);
+        list.defer_copy(to as *mut u8, from as *const u8, 16);
+        list.defer_copy((to + 16) as *mut u8, (from + 16) as *const u8, 48);
+        list.defer_copy((to + 64) as *mut u8, (from + 80) as *const u8, 16);
+        let steps: Vec<(usize, usize, usize)> = list
+            .deferred()
+            .copies
+            .iter()
+            .filter_map(|step| match step {
+                &Step::Copy(d, s, n) => Some((d, s, n)),
+                _ => None,
+            })
+            .collect();
+        if join_copies() {
+            assert_eq!(steps, [(to, from, 64), (to + 64, from + 80, 16)]);
+        } else {
+            assert_eq!(steps.len(), 3);
+        }
+    }
+
+    /// A list that names no texture has no prelude made for it; the first
+    /// that needs one makes it on the list's device, once.
+    #[test]
+    fn a_prelude_is_made_when_a_list_first_needs_one() {
+        let Some(host) = Host::new_warp() else { return };
+        let list = host.new_list().unwrap();
+        assert_eq!(list.prelude.get().is_some(), !lazy_prelude());
+        assert!(list.prelude(&[]).is_none());
+        assert_eq!(list.prelude.get().is_some(), !lazy_prelude());
+        let made: *const Prelude = list.prelude_list();
+        assert!(list.prelude.get().is_some() && std::ptr::eq(list.prelude_list(), made));
+        let (allocator, prelude) = list.prelude_list();
+        // SAFETY: the list's own closed prelude, not running.
+        unsafe {
+            allocator.Reset().unwrap();
+            prelude.Reset(allocator, None).unwrap();
+            prelude.Close().unwrap();
+        }
+    }
+
     #[test]
     fn a_call_takes_its_most_lists_and_none_twice() {
         assert_eq!(calls(&[1, 2, 3, 4, 5], 2), [0..2, 2..4, 4..5]);
@@ -1057,8 +1191,9 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
-    /// The list that runs those transitions just before this one.
-    prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+    /// The list that runs those transitions just before this one, made when
+    /// the list first needs one ([`lazy_prelude`]).
+    prelude: OnceLock<Prelude>,
     /// What the title's list held for this recording, if the title reset or
     /// released it while a submission of it was still to run.
     kept: Mutex<Vec<Box<dyn std::any::Any + Send>>>,
@@ -1488,16 +1623,10 @@ impl Host {
                 &allocator,
                 None,
             )?;
-            let prelude_allocator: ID3D12CommandAllocator = self
-                .device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let prelude: ID3D12GraphicsCommandList = self.device.CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                &prelude_allocator,
-                None,
-            )?;
-            prelude.Close()?;
+            let prelude = OnceLock::new();
+            if !lazy_prelude() {
+                let _ = prelude.set(make_prelude(&self.device)?);
+            }
             crate::memstat::add(&crate::memstat::LISTS, 1);
             Ok(HostList {
                 allocator,
@@ -1506,7 +1635,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
-                prelude: (prelude_allocator, prelude),
+                prelude,
                 kept: Mutex::default(),
                 work: Mutex::default(),
                 writes: Default::default(),
@@ -2408,6 +2537,14 @@ impl HostList {
             chunks.at = 0;
             chunks.barrier = false;
             chunks.bound = false;
+            // Buffers are back in the common state when the call that ran
+            // the list ends, and the list runs in no call twice
+            // ([`calls`]): its next recording starts from there. (Left as
+            // the last recording ended them, its first barrier named a state
+            // they were no longer in.)
+            for (_, state) in &mut chunks.all {
+                *state = D3D12_RESOURCE_STATE_COMMON;
+            }
         }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2473,6 +2610,24 @@ impl HostList {
         !self.deferred().copies.is_empty()
     }
 
+    /// The list's prelude, made the first time it is needed
+    /// ([`lazy_prelude`]) on the list's own device.
+    fn prelude_list(&self) -> &Prelude {
+        if let Some(made) = self.prelude.get() {
+            return made;
+        }
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: a plain query of the list's own device.
+        let made = unsafe { self.list.GetDevice(&mut device) }
+            .and_then(|()| device.ok_or_else(windows::core::Error::empty))
+            .and_then(|device| make_prelude(&device));
+        match made {
+            Ok(made) => self.prelude.get_or_init(|| made),
+            // The textures' real states have been moved on already.
+            Err(e) => fail(format_args!("no host state prelude could be made ({e})")),
+        }
+    }
+
     /// At submission: the list that copies any newly dirtied textures from
     /// their staging buffers into their host textures and moves each texture
     /// this list uses from its real state to the one the list starts with;
@@ -2513,7 +2668,7 @@ impl HostList {
         if uploads.is_empty() && post_barriers.is_empty() {
             return None;
         }
-        let (allocator, list) = &self.prelude;
+        let (allocator, list) = self.prelude_list();
         // SAFETY: the prelude is not executing (every submission before this
         // one is finished); the textures and staging buffers are live.
         let recorded = unsafe {
@@ -2654,6 +2809,17 @@ impl HostList {
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
+        // One that goes on where the copy recorded just before it ended
+        // becomes one step with it ([`join_copies`]). Nothing was recorded
+        // in between, so the sets below are empty already.
+        if join_copies()
+            && let Some(Step::Copy(d, s, n)) = deferred.copies.last_mut()
+            && continues((*d, *s, *n), (dst as usize, src as usize, len))
+        {
+            *n += len;
+            crate::telemetry::count(Count::CopiesJoined, 1);
+            return;
+        }
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
@@ -3394,12 +3560,10 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            update(&shadow, from, to - from);
-        }
-        for ((_, from), (to, shadow)) in std::mem::take(&mut self.pieces) {
-            update(&shadow, from, to - from);
-        }
+        let mut work: Vec<Range> = self.refreshes.drain(..).map(|(shadow, from, to)| (shadow, from, to - from)).collect();
+        let pieces = std::mem::take(&mut self.pieces);
+        work.extend(pieces.into_iter().map(|((_, from), (to, shadow))| (shadow, from, to - from)));
+        refresh_all(&work);
     }
 
     /// After every list's steps (no title copy follows): each directly
@@ -3420,6 +3584,7 @@ impl Batch {
             for reads in reads.into_iter().filter(|r| !r.is_empty()) {
                 let started = std::time::Instant::now();
                 let copied = AtomicU64::new(0);
+                let _ahead = ask_ahead(reads);
                 in_parallel(reads, 8, |reads| {
                     for (shadow, address, len) in reads {
                         #[cfg(feature = "diagnostics")]
@@ -3593,6 +3758,13 @@ pub(crate) fn in_parallel<T: Sync>(list: &[T], least: usize, f: impl Fn(&[T]) + 
 
 /// Brings `[from, from + len)` of a host copy up to date now.
 fn update(shadow: &crate::shadow::Shadow, from: usize, len: usize) {
+    let us = refresh_one(shadow, from, len);
+    PREPARING[0].fetch_add(us, Ordering::Relaxed);
+}
+
+/// [`update`] without counting its time as the submitting thread's: how
+/// long it took.
+fn refresh_one(shadow: &crate::shadow::Shadow, from: usize, len: usize) -> u64 {
     let started = std::time::Instant::now();
     let copied = shadow.update(from, len);
     let us = started.elapsed().as_micros() as u64;
@@ -3602,8 +3774,70 @@ fn update(shadow: &crate::shadow::Shadow, from: usize, len: usize) {
         crate::telemetry::add(Count::Updates, 1);
         crate::telemetry::add(Count::UpdateTime, us);
     }
-    PREPARING[0].fetch_add(us, Ordering::Relaxed);
     PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+    us
+}
+
+/// Whether a group of refreshes of several copies runs on the kept threads
+/// beside the submitting one (`VYCE_WIDE_REFRESH=0`: one after another, as
+/// before; `=1` also with fewer than four logical processors). Each refresh
+/// writes its own copy and reads title memory; the write-watch journal and
+/// the guards have locks of their own, as for the title's threads.
+/// `VICTORY_WIDE_REFRESH` of github.com/avatarmanz/VIctory-7900XTX
+/// (0a43566, from fxceless's 578d459): there a submission's sixty copies
+/// took 45-50 ms a frame on one thread.
+fn wide_refresh() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VYCE_WIDE_REFRESH").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => std::thread::available_parallelism().is_ok_and(|n| n.get() >= 4),
+    })
+}
+
+/// Refreshes in a group spread over threads, at least.
+const WIDE_LEAST: usize = 4;
+
+/// `crate::watch::ask_ahead` for the write-watched memory of refreshes
+/// about to be done.
+fn ask_ahead(work: &[Range]) -> Option<crate::watch::Ahead> {
+    if !crate::watch::ask_ahead_on() || work.len() < 2 {
+        return None;
+    }
+    let ranges: Vec<(usize, usize)> =
+        work.iter().filter_map(|(shadow, address, len)| shadow.kernel_watched(*address, *len)).collect();
+    crate::watch::ask_ahead(&ranges)
+}
+
+/// Brings the ranges `work` of their host copies up to date now: the
+/// write-watched ones asked about together first (`crate::watch::ask_ahead`),
+/// and with [`wide_refresh`] the copies on several threads. Inside
+/// `crate::shadow::pass::early` nothing is asked ahead (a submission still
+/// running may land and write title memory meanwhile) and the other threads
+/// refresh as early too.
+fn refresh_all(work: &[Range]) {
+    if work.is_empty() {
+        return;
+    }
+    let early = crate::shadow::pass::is_early();
+    let _ahead = if early { None } else { ask_ahead(work) };
+    if !wide_refresh() || work.len() < WIDE_LEAST {
+        for (shadow, from, len) in work {
+            update(shadow, *from, *len);
+        }
+        return;
+    }
+    let started = std::time::Instant::now();
+    in_parallel(work, 1, |chunk| {
+        let run = || {
+            for (shadow, from, len) in chunk {
+                refresh_one(shadow, *from, *len);
+            }
+        };
+        if early { crate::shadow::pass::early(run) } else { run() }
+    });
+    // The submitting thread's time, not the sum of all threads'.
+    PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
 /// Copies title memory at submission. The ranges were checked against their
@@ -5053,6 +5287,36 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(!batch.texture_due(&a));
         assert!(!batch.texture_due(&a.clone()));
         assert!(!batch.texture_due(&b));
+    }
+
+    /// A group of refreshes spread over threads brings each copy up to
+    /// date as one thread does, and is as early as the thread that asks:
+    /// memory nothing watches is left alone in `pass::early`.
+    #[test]
+    fn refreshes_on_several_threads_are_as_early_as_their_caller() {
+        const N: usize = 6;
+        let Some(host) = crate::host::Host::new_warp() else { return };
+        let mut title = vec![1u8; (N + 1) << 16];
+        let base = (title.as_mut_ptr() as usize).next_multiple_of(1 << 16);
+        let skip = base - title.as_ptr() as usize;
+        let copies: Vec<_> =
+            (0..N).map(|i| crate::shadow::Shadow::for_test(&host, base + (i << 16), 1 << 16)).collect();
+        title[skip..][..N << 16].fill(2);
+        // SAFETY: the copies' mappings; nothing runs.
+        let held = |i: usize| unsafe { (copies[i].1 as *const u8).add(100).read() };
+        let mut batch = Batch::default();
+        let add = |batch: &mut Batch| {
+            for (i, (shadow, _)) in copies.iter().enumerate() {
+                batch.add(shadow, base + (i << 16), 4096);
+            }
+        };
+        add(&mut batch);
+        crate::shadow::pass::early(|| batch.flush());
+        assert!((0..N).all(|i| held(i) == 1), "copied while a submission may still write");
+        add(&mut batch);
+        batch.flush();
+        assert!((0..N).all(|i| held(i) == 2));
+        drop(title);
     }
 
     /// Refreshes of one copy near each other are one; a range shaders will

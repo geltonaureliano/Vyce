@@ -154,5 +154,32 @@ launcher):
 | VICTORY_HAIR=1, VICTORY_RAY_RESOLVES=1 | Rodam os fios de cabelo e os resolves de raios, deixados de fora (os resolves não têm o que resolver sem raios e custam de 10 a 30 s de compilação cada) |
 | VICTORY_HOIST_CLAMPS=7 | Os limites dos argumentos indiretos rodam um após o outro, como antes (o padrão agora é 1) |
 
+Chaves de comparação do trabalho da CPU (todas ligadas por padrão; o valor
+0 volta ao comportamento de antes, no processo que chama o launcher):
+
+| Variável | Efeito |
+| --- | --- |
+| VYCE_LATE_SIGNAL=0 | Cada sinal de fila e cada fila parada numa espera esperam a GPU terminar tudo (hoje o sinal vai para trás do que a GPU roda e uma thread própria encerra as submissões quando a GPU termina) |
+| VYCE_FREE_PRESENT=0 | O present espera a GPU terminar tudo antes de copiar o quadro |
+| VYCE_LATE_TICKS=0 | Uma espera de quadro cujo tick já passou dorme até o próximo |
+| VYCE_ONE_ECL=0 | Cada lista vai à fila numa chamada própria (hoje uma chamada por submissão, no máximo VYCE_ECL_LISTS listas, 32) |
+| VYCE_KEPT_POOL=0 | Threads novas a cada trabalho dividido (hoje 5 threads mantidas) |
+| VYCE_ONE_PASS=0 | Cópia de referência e comparação a cada faixa declarada (hoje uma passada por submissão) |
+| VYCE_PLAN_EXTRA=0 | O plano de descritores inteiro é refeito por poucos slots novos |
+| VYCE_OPENING=0, VYCE_PIN_ALWAYS=0 | As cópias próprias para a memória do jogo voltam a fixar páginas; o caminho rápido de guarda volta a ignorar as fixações |
+| VYCE_WIDE_REFRESH=0 | As atualizações das cópias de um grupo rodam uma após a outra |
+| VYCE_ASK_AHEAD=0 | Cada atualização pergunta ao kernel pelas páginas escritas da sua faixa (hoje uma pergunta por grupo) |
+| VYCE_JOIN_COPIES=0 | Cópias do jogo que continuam a anterior ficam em passos separados |
+| VYCE_LAZY_PRELUDE=0 | Toda lista nasce com a sua lista de transições, use ou não |
+| VYCE_SHARED_LOOKUPS=0 | As buscas de memória das gravações tomam a tabela só para si |
+
+Campos de VYCE_TELEMETRY desse trabalho (por quadro): gpu_idle_ms (GPU
+parada entre submissões), wait_*_ms e drains_* (tempo e número de esperas
+pela GPU por motivo: execute, signal, work, held, present, fence, list),
+late_signals, late_waits, landed e landed_here (submissões encerradas, e
+as encerradas por quem precisou antes da thread própria), ecl_calls,
+host_lists, watch_asks, watch_ms e watch_ahead (perguntas ao kernel e
+respostas do grupo), copies_joined, flights_max.
+
 Para abrir o painel de uma sessão já em execução sem reiniciar o jogo,
 execute scripts\vyce-monitor.ps1 e passe -GamePid, -StdoutLog e -StderrLog.

@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -681,6 +681,24 @@ impl Shadow {
         self.update_lazily(address, len, false)
     }
 
+    /// The part of `[address, address + len)` an update would ask the
+    /// kernel's write watch about (`crate::watch::ask_ahead`): memory not
+    /// known to be guarded or unwatched, cut to the copy.
+    pub(crate) fn kernel_watched(&self, address: usize, len: usize) -> Option<(usize, usize)> {
+        if self.direct.is_some() {
+            return None;
+        }
+        if let Some(root) = self.sparse.as_ref().and_then(|s| s.of.as_ref()) {
+            return root.kernel_watched(address, len);
+        }
+        if !matches!(self.watched.load(Ordering::Relaxed), 0 | 1) {
+            return None;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+        (from < to).then_some((from, to))
+    }
+
     /// [`Shadow::update`]; `lazy`: the tiles of a sparse copy that did not
     /// change the last times are looked at less often.
     pub(crate) fn update_lazily(&self, address: usize, len: usize, lazy: bool) -> usize {
@@ -991,12 +1009,60 @@ impl Shadow {
     }
 }
 
+/// Whether lookups of the tables below share their locks, misses of the
+/// windows made apart from the table (`VYCE_SHARED_LOOKUPS=0`: every lookup
+/// takes the table alone, as one mutex each did). The title's recording
+/// threads look up memory for every vertex, index, argument and view of a
+/// draw, beside the thread that submits; a miss of the windows asks the
+/// system about the memory (some 150 a frame). The idea is upstream
+/// VIctory's (ff920f2, a read-write lock for the views) as carried by
+/// github.com/avatarmanz/VIctory-7900XTX (ad30f2c); written anew here.
+fn shared_lookups() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VYCE_SHARED_LOOKUPS").is_none_or(|v| v != "0"))
+}
+
+/// A table looked at: shared with other lookups, or alone.
+enum Lookup<T: 'static> {
+    Shared(std::sync::RwLockReadGuard<'static, T>),
+    Alone(std::sync::RwLockWriteGuard<'static, T>),
+}
+
+impl<T> std::ops::Deref for Lookup<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        match self {
+            Lookup::Shared(guard) => guard,
+            Lookup::Alone(guard) => guard,
+        }
+    }
+}
+
+/// `table` to look at ([`shared_lookups`]).
+fn look<T>(table: &'static RwLock<T>) -> Lookup<T> {
+    if shared_lookups() {
+        Lookup::Shared(table.read().unwrap_or_else(|e| e.into_inner()))
+    } else {
+        Lookup::Alone(table.write().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+/// `table` to change.
+fn change<T>(table: &'static RwLock<T>) -> std::sync::RwLockWriteGuard<'static, T> {
+    table.write().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Windows of title memory the host GPU reads and writes in place, by start:
 /// each a run of committed pages of one allocation.
-static DIRECT: Mutex<BTreeMap<u64, Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+static DIRECT: RwLock<BTreeMap<u64, Arc<Shadow>>> = RwLock::new(BTreeMap::new());
 
-fn windows_of_memory() -> std::sync::MutexGuard<'static, BTreeMap<u64, Arc<Shadow>>> {
-    DIRECT.lock().unwrap_or_else(|e| e.into_inner())
+/// Held while a window is made, and while windows are taken out
+/// ([`remapped`]): the two one after the other, as when the table's lock was
+/// held for both, but lookups go on meanwhile. Taken before the table's.
+static MAKING: Mutex<()> = Mutex::new(());
+
+fn windows_of_memory() -> Lookup<BTreeMap<u64, Arc<Shadow>>> {
+    look(&DIRECT)
 }
 
 /// Buffers of windows gone since (by interface address): views of them are
@@ -1152,24 +1218,27 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
         device
     });
     let device = device.as_ref()?;
-    let mut map = windows_of_memory();
-    if let Some(s) = map
-        .range(..=address)
-        .rev()
-        .take(8)
-        .map(|(_, s)| s)
-        .find(|s| s.start + s.len >= end)
-    {
-        return Some(s.clone());
+    let holding = |map: &BTreeMap<u64, Arc<Shadow>>| {
+        map.range(..=address).rev().take(8).map(|(_, s)| s).find(|s| s.start + s.len >= end).cloned()
+    };
+    if let Some(s) = holding(&windows_of_memory()) {
+        return Some(s);
     }
     // Asked over and over for the same memory: not looked at each time.
-    static REFUSED: Mutex<BTreeMap<u64, (u64, u64)>> = Mutex::new(BTreeMap::new());
+    static REFUSED: RwLock<BTreeMap<u64, (u64, u64)>> = RwLock::new(BTreeMap::new());
     let frame = crate::queue::presented();
-    let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&(e, f)) = refused.get(&address)
-        && e == end
-        && f + 30 > frame
-    {
+    let refused_lately = || {
+        look(&REFUSED).get(&address).is_some_and(|&(e, f)| e == end && f + 30 > frame)
+    };
+    if refused_lately() {
+        return None;
+    }
+    // One made at a time; another thread may have made it meanwhile.
+    let _making = MAKING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = holding(&windows_of_memory()) {
+        return Some(s);
+    }
+    if refused_lately() {
         return None;
     }
     let page = PAGE as u64;
@@ -1217,9 +1286,15 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
                 tracing::info!("its regions:{text}");
             }
         }
+        let mut refused = change(&REFUSED);
+        // Not kept for good: some addresses are asked about once.
+        if refused.len() >= 4096 {
+            refused.retain(|_, &mut (_, f)| f + 600 > frame);
+        }
         refused.insert(address, (end, frame));
         return None;
     };
+    let mut map = change(&DIRECT);
     let count = map.len() + 1;
     if count <= 16 || count.is_power_of_two() {
         tracing::info!(
@@ -1340,9 +1415,7 @@ fn unmapped(address: usize) -> Option<usize> {
 
 /// Tiles of `[start, end)` known to have no title memory are looked at again.
 pub(crate) fn filled(start: u64, end: u64) {
-    let over: Vec<Arc<Shadow>> = SPARSE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    let over: Vec<Arc<Shadow>> = look(&SPARSE)
         .iter()
         .filter(|(chunk, _)| *chunk * CHUNK < end && start < (*chunk + 1) * CHUNK)
         .filter_map(|(_, s)| s.clone())
@@ -1378,7 +1451,9 @@ pub(crate) fn remapped(start: u64, end: u64) {
     use windows::core::Interface;
     filled(start, end);
     crate::memory::remapped(start, end);
-    let mut map = windows_of_memory();
+    // Not while a window is made: it may be one of this memory.
+    let _making = MAKING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = change(&DIRECT);
     if map.is_empty() {
         return;
     }
@@ -1688,9 +1763,7 @@ pub(crate) fn sweep(frame: u64) {
     let keep: u64 = if gone_only { 600 } else { 120 };
     let mut given = 0u64;
     let started = std::time::Instant::now();
-    let all: Vec<Arc<Shadow>> = SPARSE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    let all: Vec<Arc<Shadow>> = look(&SPARSE)
         .values()
         .flatten()
         .cloned()
@@ -1849,7 +1922,7 @@ fn buffer_desc(
 }
 
 /// Sparse copies by chunk.
-static SPARSE: Mutex<BTreeMap<u64, Option<Arc<Shadow>>>> = Mutex::new(BTreeMap::new());
+static SPARSE: RwLock<BTreeMap<u64, Option<Arc<Shadow>>>> = RwLock::new(BTreeMap::new());
 
 fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow> {
     use windows::Win32::Graphics::Direct3D12::*;
@@ -1908,9 +1981,12 @@ fn sparse(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if cfg!(test) || (end - 1) / CHUNK != address / CHUNK {
         return None;
     }
-    SPARSE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    // (The shared look ends with its statement, before the table is changed.)
+    let known = look(&SPARSE).get(&(address / CHUNK)).cloned();
+    if let Some(known) = known {
+        return known;
+    }
+    change(&SPARSE)
         .entry(address / CHUNK)
         .or_insert_with(|| sparse_buffer(address / CHUNK * CHUNK, CHUNK, None).map(Arc::new))
         .clone()
@@ -2492,15 +2568,15 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+static BUFFERS: RwLock<BTreeMap<(u64, usize), Entry>> = RwLock::new(BTreeMap::new());
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+fn buffers() -> Lookup<BTreeMap<(u64, usize), Entry>> {
+    look(&BUFFERS)
 }
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    let before = buffers().insert(
+    let before = change(&BUFFERS).insert(
         (start, resource),
         Entry {
             end: start + len,
@@ -2516,7 +2592,7 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    let gone = buffers().remove(&(start, resource));
+    let gone = change(&BUFFERS).remove(&(start, resource));
     if let Some(shadow) = gone.and_then(|e| e.shadow) {
         crate::host::retire(shadow);
     }
@@ -2553,14 +2629,30 @@ fn find_copy(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if let Some(copy) = sparse(address, end) {
         return Some(copy);
     }
-    let mut map = buffers();
-    let holding: Vec<((u64, usize), bool)> = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .filter(|(_, e)| e.end >= end)
-        .map(|(k, e)| (*k, e.shadow.is_some()))
-        .collect();
+    // Most find a copy made already: looked for with the table shared.
+    let holding = |map: &BTreeMap<(u64, usize), Entry>| -> Vec<((u64, usize), bool)> {
+        map.range(..=(address, usize::MAX))
+            .rev()
+            .take(64)
+            .filter(|(_, e)| e.end >= end)
+            .map(|(k, e)| (*k, e.shadow.is_some()))
+            .collect()
+    };
+    {
+        let map = buffers();
+        let held = holding(&map);
+        if let Some((key, _)) = held.iter().find(|(_, made)| *made) {
+            return map.get(key).and_then(|e| e.shadow.clone());
+        }
+        if held.is_empty() {
+            drop(map);
+            return loose(address, end);
+        }
+    }
+    // The copy is made with the table alone, as before (looked at again: it
+    // may be made by now).
+    let mut map = change(&BUFFERS);
+    let holding = holding(&map);
     let key = holding
         .iter()
         .find(|(_, made)| *made)
@@ -2716,7 +2808,7 @@ pub(crate) fn near(va: u64) -> String {
             .values()
             .map(|s| (s.gpu, s.start, s.len)),
     );
-    for s in SPARSE.lock().unwrap_or_else(|e| e.into_inner()).values().flatten() {
+    for s in look(&SPARSE).values().flatten() {
         all.push((s.gpu, s.start, s.len));
         if let Some(sparse) = &s.sparse {
             let aliases = sparse.aliases.lock().unwrap_or_else(|e| e.into_inner());
@@ -2746,6 +2838,57 @@ pub(crate) fn near(va: u64) -> String {
 mod tests {
     use super::*;
     use std::ops::Range;
+
+    /// Lookups of title buffers from many threads at once, while other
+    /// buffers come and go: each finds the one copy of its buffer, made once,
+    /// and nobody waits for good.
+    #[test]
+    fn buffers_are_found_from_many_threads_while_others_come_and_go() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        const N: u64 = 16;
+        // Nobody else's addresses.
+        let base = 0x7_4c00_0000u64;
+        let at = |i: u64| base + i * 0x10_0000;
+        for i in 0..N {
+            register(0x5000 + i as usize, at(i), 64 << 10);
+        }
+        let seen: Vec<Vec<usize>> = std::thread::scope(|s| {
+            let churn = s.spawn(|| {
+                for round in 0..400u64 {
+                    let i = round % 8;
+                    register(0x6000 + i as usize, at(N + i), 64 << 10);
+                    assert!(in_buffer(at(N + i), 64));
+                    unregister(0x6000 + i as usize, at(N + i));
+                }
+            });
+            let finders: Vec<_> = (0..8)
+                .map(|_| {
+                    s.spawn(|| {
+                        let mut seen = vec![0usize; N as usize];
+                        for _ in 0..50 {
+                            for i in 0..N {
+                                assert!(in_buffer(at(i) + 8, 16));
+                                assert_eq!(buffer_end(at(i) + 8), Some(at(i) + (64 << 10)));
+                                let copy = find(at(i) + 8, 16).expect("a copy of the buffer");
+                                let p = Arc::as_ptr(&copy) as usize;
+                                let was = std::mem::replace(&mut seen[i as usize], p);
+                                assert!(was == 0 || was == p, "a second copy of buffer {i}");
+                            }
+                        }
+                        seen
+                    })
+                })
+                .collect();
+            churn.join().unwrap();
+            finders.into_iter().map(|f| f.join().unwrap()).collect()
+        });
+        assert!(seen.windows(2).all(|w| w[0] == w[1]), "one copy each");
+        for i in 0..N {
+            unregister(0x5000 + i as usize, at(i));
+        }
+    }
 
     #[test]
     fn growing_snapshot_keeps_the_first_seen_bytes() {

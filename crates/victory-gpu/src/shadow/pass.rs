@@ -277,7 +277,7 @@ pub(crate) fn early<R>(f: impl FnOnce() -> R) -> R {
 }
 
 /// Whether this thread is in [`early`].
-pub(super) fn is_early() -> bool {
+pub(crate) fn is_early() -> bool {
     EARLY.get()
 }
 
@@ -426,6 +426,42 @@ mod tests {
         for copied in [&one, &each] {
             assert!(copied.shadow.pending.lock().unwrap().is_empty());
             assert!(copied.shadow.sparse.as_ref().unwrap().before.lock().unwrap().is_empty());
+        }
+    }
+
+    /// The same on ranges drawn at random, many rounds: one pass and a pass
+    /// for each range leave the same title bytes, whatever overlaps.
+    #[test]
+    fn one_pass_matches_a_pass_per_range_on_random_ranges() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |n: usize| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as usize % n
+        };
+        for round in 0..12 {
+            let (Some(one), Some(each)) = (Copied::new(), Copied::new()) else { return };
+            let ranges: Vec<(usize, usize)> = (0..1 + next(24))
+                .map(|_| {
+                    let from = next(SIZE - 1);
+                    (from, from + 1 + next((SIZE - from).min(3 * PAGE)))
+                })
+                .collect();
+            let all: Vec<Range> = ranges.iter().map(|r| one.range(r.0, r.1)).collect();
+            for (shadow, address, len) in &all {
+                shadow.close_to_refreshes(*address, *len);
+            }
+            keep_before(&all);
+            one.write();
+            copy_back(&all);
+            for &(from, to) in &ranges {
+                each.shadow.writing(each.base + from, to - from);
+            }
+            each.write();
+            for &(from, to) in &ranges {
+                each.shadow.copy_back(each.base + from, to - from);
+            }
+            assert!(one.title() == each.title(), "round {round}: {ranges:?}");
+            assert!(one.shadow.pending.lock().unwrap().is_empty());
         }
     }
 
