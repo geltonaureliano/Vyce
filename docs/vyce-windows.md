@@ -29,6 +29,39 @@ na pasta logs. O argumento do executável também continua disponível para quem
 usa a CLI diretamente. Quando o argumento é omitido, o arquivo é localizado
 na pasta indicada por game_dir no victory.toml.
 
+### Opções do jogo
+
+O launcher ajusta o arquivo de configurações do próprio jogo antes de
+abri-lo (Vyce-data\data\<título>\storage\settings\settings.xml); a
+primeira cópia fica ao lado como settings.xml.original, e a usada em cada
+sessão vai para logs\<data>.settings.xml.
+
+| Opção | Efeito |
+| --- | --- |
+| -OutputSize 1920x1080 | Tamanho da imagem do jogo (a cena é 1/1,5 dele); keep deixa como está |
+| -TitleSettings light | Desliga o que mais pesa numa placa de PC: filas assíncronas, borrão de movimento, menos detalhe ao longe e reflexos menores |
+| -TitleSettings keep | Não muda nada além do tamanho |
+| -TitleSettings original | Volta o arquivo como o jogo o criou |
+| -TitleArguments a, b | Argumentos repassados ao jogo |
+
+Ainda não se viu o jogo respeitar cada valor do arquivo: compare uma
+sessão com -OutputSize keep -TitleSettings keep e procure no log as linhas
+"presenting to a window" e "twins made".
+
+### Cache pronto antes de jogar
+
+Uma mudança no tradutor ou no driver faz o jogo traduzir os shaders e
+montar os pipelines de novo na primeira sessão, o que deixa os primeiros
+minutos lentos. O comando warm faz isso antes, com o jogo fechado:
+
+~~~powershell
+victory warm D:\torrent\Vyce-data\lab\shaders\host --pipelines D:\torrent\Vyce-data\lab\compute-used.txt
+~~~
+
+Ele traduz os contêineres das pastas dadas para o cache de shaders e monta
+os pipelines de compute cujos hashes o arquivo lista. Pipelines gráficos
+dependem do estado que o jogo passa e só são montados em jogo.
+
 ## Local dos arquivos
 
 Com o clone em D:\torrent\Vyce, o launcher usa a pasta irmã
@@ -131,6 +164,17 @@ Para comparar sem mudar de binário, defina no processo que chama o launcher
 VICTORY_ASYNC_SUBMIT=0 (submissões esperadas, como antes),
 VICTORY_STRETCH=0 (sem a memória do jogo usada no lugar por uma segunda
 vista) ou VICTORY_PLAN_REUSE=0 (plano de descritores anterior).
+
+Chaves de comparação para a placa NVIDIA (no processo que chama o
+launcher):
+
+| Variável | Efeito |
+| --- | --- |
+| VICTORY_EXACT_VIEWS=0 | Volta às vistas de buffer de antes (a NVIDIA lê outros bytes de vistas estruturadas de passo múltiplo de 8, 12 ou 16; medido numa RTX 2070 SUPER) |
+| VYCE_SYNC_BARRIER=0 | As sincronizações do jogo voltam a ser ignoradas (hoje viram uma barreira para as escritas dos shaders) |
+| VICTORY_WRITE_SKIP=0 | Toda vista de escrita é tratada como escrita, mesmo de shaders que não escrevem em buffers |
+| VICTORY_HAIR=1, VICTORY_RAY_RESOLVES=1 | Rodam os fios de cabelo e os resolves de raios, deixados de fora (os resolves não têm o que resolver sem raios e custam de 10 a 30 s de compilação cada) |
+| VICTORY_HOIST_CLAMPS=7 | Os limites dos argumentos indiretos rodam um após o outro, como antes (o padrão agora é 1) |
 
 Para abrir o painel de uma sessão já em execução sem reiniciar o jogo,
 execute scripts\vyce-monitor.ps1 e passe -GamePid, -StdoutLog e -StderrLog.

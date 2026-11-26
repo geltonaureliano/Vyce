@@ -61,9 +61,9 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
-    /// It animates or draws hair strands ([`hair_strands`]).
+    /// Why it is left out of the picture, if it is ([`left_out_program`]).
     #[cfg(windows)]
-    hair: bool,
+    left_out: Option<&'static str>,
     /// Its result gets the least indirect light ([`crate::ambient`]).
     #[cfg(windows)]
     pub(crate) resolves_light: bool,
@@ -78,14 +78,24 @@ pub(crate) struct Shader {
     translated: OnceLock<Option<Translated>>,
 }
 
-/// Whether a container's program is one of those that animate and draw hair
-/// strands, by its name. `VICTORY_HAIR` has them run.
-/// shortcut: left out, as some of them do not translate (an address from a
-/// phi) and the others draw lines all over the screen without them.
+/// Why a container's program, named `hash` in the log, is left out of the
+/// picture with every draw and dispatch of its pipelines, if it is:
+///
+/// - It is one of those that animate and draw hair strands, by its name.
+///   `VICTORY_HAIR` has them run. shortcut: some of them do not translate (an
+///   address from a phi) and the others draw lines all over the screen
+///   without them.
+/// - It shades what a ray hit, and no rays run ([`victory_shader::emit::rays`]):
+///   there are no hits to shade. There are hundreds of these, and the host's
+///   compiler takes 10 to 30 seconds for each, so a first start was busy with
+///   them for many minutes. `VICTORY_RAY_RESOLVES=1` has them run.
+/// - `VICTORY_SKIP_PIPELINES` lists its hash.
 #[cfg(windows)]
-fn hair_strands(container: &[u8]) -> bool {
-    static RUN: OnceLock<bool> = OnceLock::new();
-    const NAMES: [&[u8]; 18] = [
+fn left_out_program(container: &[u8], hash: &str) -> Option<&'static str> {
+    static RUN: OnceLock<[bool; 2]> = OnceLock::new();
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    const RESOLVES: [&[u8]; 2] = [b"CS_RaytracingResolve", b"CS_DummyResolve"];
+    const HAIR: [&[u8]; 18] = [
         b"InterpolateStrand",
         b"HairStrand",
         b"CS_VisHair",
@@ -105,21 +115,40 @@ fn hair_strands(container: &[u8]) -> bool {
         b"CS_CullMaskPass",
         b"CS_LodBlend",
     ];
-    if *RUN.get_or_init(|| std::env::var_os("VICTORY_HAIR").is_some()) {
-        return false;
+    let hashes = HASHES.get_or_init(|| {
+        parse_skip_hashes(&std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default())
+    });
+    if hashes.iter().any(|h| h == hash) {
+        return Some("named");
     }
+    let [hair, resolves] = *RUN.get_or_init(|| {
+        [
+            std::env::var_os("VICTORY_HAIR").is_some(),
+            victory_shader::emit::rays()
+                || std::env::var("VICTORY_RAY_RESOLVES").is_ok_and(|v| v == "1"),
+        ]
+    });
     const END: &[u8] = b"_Wrapped";
     container
         .windows(END.len())
         .enumerate()
         .filter(|(_, w)| *w == END)
-        .any(|(at, _)| {
+        .find_map(|(at, _)| {
             let before = &container[at.saturating_sub(100)..at];
             let name = before
                 .rsplit(|b| !b.is_ascii_alphanumeric() && *b != b'_')
                 .next()
                 .unwrap_or_default();
-            NAMES.iter().any(|n| name.windows(n.len()).any(|w| w == *n))
+            let has = |names: &[&[u8]]| {
+                names.iter().any(|n| name.windows(n.len()).any(|w| w == *n))
+            };
+            if !hair && has(&HAIR) {
+                Some("hair strands")
+            } else if !resolves && has(&RESOLVES) {
+                Some("ray resolves")
+            } else {
+                None
+            }
         })
 }
 
@@ -191,7 +220,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
-                hair: hair_strands(bytes),
+                left_out: left_out_program(bytes, &full.to_hex()[..16]),
                 #[cfg(windows)]
                 resolves_light: bytes
                     .windows(crate::ambient::PROGRAM.len())
@@ -221,6 +250,11 @@ pub(crate) struct Translated {
     /// Whether the shader may write memory (buffer, image, or global stores
     /// and atomics); `true` when its code is not known.
     pub(crate) writes_memory: bool,
+    /// Whether the shader may write buffers; `true` when its code is not
+    /// known. The title binds buffers its shaders only read through
+    /// unordered access views, and every range taken for written costs a
+    /// snapshot, a compare and perhaps a copy of its bytes.
+    pub(crate) writes_buffers: bool,
 }
 
 #[cfg(windows)]
@@ -295,6 +329,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let programs = victory_shader::container_programs(&c).unwrap_or_default();
     let writes_memory = programs.is_empty() || programs.iter().any(writes_memory);
+    let writes_buffers = programs.is_empty() || programs.iter().any(writes_buffers);
     let (used, native_heap) = programs
         .into_iter()
         .find(|p| {
@@ -314,6 +349,31 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         used,
         resource_heap: dxil_heap || native_heap,
         writes_memory,
+        writes_buffers,
+    })
+}
+
+/// Whether a native program may write buffer memory: as [`writes_memory`],
+/// without images (no buffer's host copy holds those) and with scalar
+/// memory, and without the program's own scratch memory. After victory-mix
+/// and upstream #413.
+#[cfg(windows)]
+fn writes_buffers(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Mubuf
+            | Encoding::Mtbuf
+            | Encoding::Smem
+            | Encoding::Flat
+            | Encoding::Global => name.is_none_or(|n| stores(n) && !n.contains("scratch")),
+            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        }
     })
 }
 
@@ -359,6 +419,9 @@ struct Pipeline {
     /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
     host: Arc<make::Pending>,
+    /// Why draws and dispatches with it are left out, if they are.
+    #[cfg(windows)]
+    left_out: Option<&'static str>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -381,7 +444,11 @@ pub(crate) fn bound(this: This) {
         return;
     }
     #[cfg(windows)]
-    make::bound(&p.host);
+    if let Some(why) = p.left_out {
+        tracing::info!(pipeline = ?this, why, "left out");
+    } else {
+        make::bound(&p.host);
+    }
     let frame = crate::frame::current();
     for shader in &p.shaders {
         tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
@@ -408,6 +475,84 @@ pub(crate) fn peek_host_pipeline<'a>(this: This) -> Option<&'a host::HostPipelin
     make::peek(&pipeline(this).host)
 }
 
+/// What [`warm`] did.
+#[cfg(windows)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Warmed {
+    /// Containers with a translation now in the cache, and without one.
+    pub translated: usize,
+    pub refused: usize,
+    /// Compute pipelines in the library now, and those the host refused.
+    pub pipelines: usize,
+    pub failed: usize,
+}
+
+/// Translates the shader containers a run would meet into the shader cache
+/// and makes the host pipelines of the compute programs `wanted` picks (by
+/// hash, as logged), so that the first run after a change of translator or
+/// driver does not. Graphics pipelines need the title's state: not made.
+#[cfg(windows)]
+pub fn warm(
+    containers: &[Vec<u8>],
+    wanted: impl Fn(&str) -> bool + Sync,
+    threads: usize,
+    progress: impl Fn(usize, usize) + Sync,
+) -> Warmed {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use victory_shader::HwStage;
+    let next = AtomicUsize::new(0);
+    let total = Mutex::new(Warmed::default());
+    std::thread::scope(|s| {
+        for _ in 0..threads.max(1) {
+            let spawned = std::thread::Builder::new().stack_size(32 << 20).spawn_scoped(s, || {
+                loop {
+                    let at = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(bytes) = containers.get(at) else { break };
+                    let stage = victory_shader::Container::parse(bytes)
+                        .and_then(|c| victory_shader::container_programs(&c))
+                        .ok()
+                        .and_then(|programs| {
+                            programs.iter().find_map(|p| match p.stage {
+                                HwStage::Vs => Some("vertex"),
+                                HwStage::Ps => Some("pixel"),
+                                HwStage::Ms => Some("mesh"),
+                                HwStage::Cs => Some("compute"),
+                                _ => None,
+                            })
+                        });
+                    let Some(stage) = stage else { continue };
+                    let shader = shader(stage, bytes);
+                    let mut one = Warmed::default();
+                    if shader.translated().is_none() {
+                        one.refused = 1;
+                    } else {
+                        one.translated = 1;
+                        if stage == "compute" && shader.left_out.is_none() && wanted(&shader.hash) {
+                            match host::HostPipeline::new(&[shader], None) {
+                                Some(_) => one.pipelines = 1,
+                                None => one.failed = 1,
+                            }
+                            library::save(false);
+                        }
+                    }
+                    let mut t = total.lock().unwrap_or_else(|e| e.into_inner());
+                    t.translated += one.translated;
+                    t.refused += one.refused;
+                    t.pipelines += one.pipelines;
+                    t.failed += one.failed;
+                    drop(t);
+                    progress(at, containers.len());
+                }
+            });
+            if let Err(e) = spawned {
+                tracing::warn!(error = %e, "no thread to warm the caches with");
+            }
+        }
+    });
+    library::save(true);
+    total.into_inner().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
@@ -420,7 +565,7 @@ pub(crate) fn making() -> u64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -440,22 +585,11 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
-fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
-    let hashes = HASHES.get_or_init(|| {
-        let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
-    });
-    p.shaders
-        .iter()
-        .find(|shader| shader.hair || !hashes.is_empty() && hashes.contains(&shader.hash))
-        .map(|shader| shader.hash.as_str())
-}
-
-#[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn is_skipped(this: This) -> bool {
-    !this.is_null() && skipped_shader(pipeline(this)).is_some()
+/// Why draws and dispatches with a title pipeline are left out, if they are
+/// ([`left_out_program`]).
+#[cfg(windows)]
+pub(crate) fn left_out(this: This) -> Option<&'static str> {
+    (!this.is_null()).then(|| pipeline(this).left_out).flatten()
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
@@ -466,8 +600,8 @@ pub(crate) fn note_drop(this: This) {
         Some("no pipeline set".to_owned())
     } else {
         let p = pipeline(this);
-        skipped_shader(p)
-            .map(|hash| format!("skipped shader {hash}"))
+        p.left_out
+            .map(|why| format!("left out: {why}"))
             .or_else(|| make::missing(&p.host))
     };
     if let Some(why) = why {
@@ -523,12 +657,18 @@ fn hand_out(
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
-    make::early(&host);
+    let left_out = shaders.iter().find_map(|s| s.left_out);
+    #[cfg(windows)]
+    if left_out.is_none() {
+        make::early(&host);
+    }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
         packet: [0; 8],
         #[cfg(windows)]
         host,
+        #[cfg(windows)]
+        left_out,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -737,6 +877,26 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
+    /// Programs left out of the picture, by the names their containers
+    /// hold: hair strands, and ray resolves while no rays run.
+    #[test]
+    #[cfg(windows)]
+    fn left_out_programs_are_found_by_name() {
+        let named = |name: &str| {
+            let mut bytes = b"  dx_".to_vec();
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.extend_from_slice(b"_1a2b3c4d_Wrapped  ");
+            bytes
+        };
+        let hash = "0011223344556677";
+        assert_eq!(super::left_out_program(&named("CS_InterpolateStrands"), hash), Some("hair strands"));
+        assert_eq!(super::left_out_program(&named("CS_RaytracingResolve_12"), hash), Some("ray resolves"));
+        assert_eq!(super::left_out_program(&named("CS_DummyResolve"), hash), Some("ray resolves"));
+        assert_eq!(super::left_out_program(&named("CS_ScreenProbes_TemporalResolve"), hash), None);
+        assert_eq!(super::left_out_program(&named("CS_BatchCullMeshlets"), hash), None);
+        assert_eq!(super::left_out_program(b"no name at all", hash), None);
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {

@@ -89,6 +89,8 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    /// The host state the depth view needs of its texture ([`depth_state`]).
+    depth_state: u32,
     /// None leaves the host list's default bounds (0..1) in place.
     depth_bounds: Option<(f32, f32)>,
     /// The title's primitive topology (the host's may differ).
@@ -198,6 +200,23 @@ fn dropped(pipeline: usize) {
     }
 }
 
+/// Draws and dispatches of pipelines left out of the picture so far
+/// ([`crate::pipeline::left_out`]): not counted as dropped.
+static LEFT_OUT: AtomicU64 = AtomicU64::new(0);
+
+/// Those since the last call.
+pub(crate) fn take_left_out() -> u64 {
+    LEFT_OUT.swap(0, Ordering::Relaxed)
+}
+
+/// Whether buffer ranges a shader names through unordered access views are
+/// taken for written only if its code can write buffers.
+/// `VICTORY_WRITE_SKIP=0` takes every such range for written, as before.
+fn write_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("VICTORY_WRITE_SKIP").is_ok_and(|v| v == "0"))
+}
+
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 
@@ -210,7 +229,9 @@ pub(crate) fn dispatched() -> u64 {
 /// copy in upload memory.
 /// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
 /// other views as 1 MiB (both cut at their buffer's end).
-fn root_view(list: &HostList, address: u64, kind: u8) -> Option<u64> {
+/// What a shader that cannot write buffers (`writes` false) is given through
+/// an unordered access view stays as it is.
+fn root_view(list: &HostList, address: u64, kind: u8, writes: bool) -> Option<u64> {
     let reach = if kind == 0 { 1 << 16 } else { 1 << 20 };
     let shadow = crate::shadow::find_reaching(address, reach)?;
     let mut len = shadow.left(address).min(reach);
@@ -237,7 +258,7 @@ fn root_view(list: &HostList, address: u64, kind: u8) -> Option<u64> {
             list.keep(&shadow.buffer);
         }
         shadow.refresh(list, address, len);
-        if kind == 2 {
+        if kind == 2 && writes {
             shadow.gpu_writes(list, address, len);
         }
         return Some(gpu);
@@ -594,6 +615,16 @@ impl State {
         let mut rtvs = Vec::new();
         for record in &targets {
             let Some(texture) = crate::resource::host_resource(record.resource) else {
+                // A typed null view (or a target without a host copy) still
+                // takes its place: left out, the next live target would move
+                // into it and the pixel shader's outputs reach the wrong
+                // targets (victory-mix).
+                // shortcut: a view without a format or dimension has no null
+                // view to stand for it and is left out, as before.
+                match record.desc().filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0) {
+                    Some(desc) => rtvs.push(host.null_rtv(&desc)),
+                    None => once!("a render target without a texture or a format left out"),
+                }
                 continue;
             };
             self.targets.push(record.resource as usize);
@@ -602,12 +633,15 @@ impl State {
             rtvs.push(host.rtv(texture, record.desc().as_ref()));
         }
         self.depth = 0;
+        self.depth_state = DEPTH_WRITE;
         let dsv = depth.and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            let desc = record.depth_desc();
+            self.depth_state = depth_state(texture, desc.as_ref());
+            Some(host.dsv(texture, desc.as_ref()))
         });
         // SAFETY: an open list; the views were just made.
         unsafe {
@@ -782,6 +816,18 @@ impl State {
         }
     }
 
+    /// Whether what is drawn or dispatched now is left out of the picture
+    /// ([`crate::pipeline::left_out`]); counts it then.
+    pub(crate) fn left_out(&self) -> bool {
+        let out = crate::pipeline::left_out(self.pipeline as This).is_some();
+        if out {
+            LEFT_OUT.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(self.pipeline as This);
+        }
+        out
+    }
+
     /// Brings the host list up to date for a draw; false if the draw cannot
     /// run on the host.
     fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
@@ -790,10 +836,6 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
-        #[cfg(feature = "diagnostics")]
-        if crate::pipeline::is_skipped(self.pipeline as This) {
-            return no("skipped by name");
-        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return no("no host pipeline");
         };
@@ -855,12 +897,21 @@ impl State {
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
         const RENDER_TARGET: u32 = 0x4;
-        const DEPTH_WRITE: u32 = 0x10;
         for &t in &self.targets {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
         }
         if self.depth != 0 {
-            crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
+            // A view that writes neither plane keeps the texture readable:
+            // the depth read state, with the shader read states if this
+            // draw's shaders read the same texture (they were in the write
+            // state, which shader reads must not see; victory-mix).
+            let state = if self.depth_state == DEPTH_READ {
+                let (tested, read) = TESTED_DEPTH.get();
+                if read && tested == self.depth { DEPTH_READ | SHADER_RESOURCE } else { DEPTH_READ }
+            } else {
+                DEPTH_WRITE
+            };
+            crate::list::ensure_state(list, self.depth as This, state);
         }
         true
     }
@@ -872,6 +923,10 @@ impl State {
     /// descriptors its tables hold.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         self.null_uav = false;
+        // The depth target a draw only tests, for the views of it that the
+        // draw's shaders read (`readable`).
+        let tested = if !compute && self.depth_state == DEPTH_READ { self.depth } else { 0 };
+        TESTED_DEPTH.set((tested, false));
         let l = &list.list;
         let by_address = p.stages.iter().any(|s| {
             s.translated()
@@ -935,7 +990,8 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
-            if !self.tables(list, &t.used, compute) {
+            let writes = t.writes_buffers || !write_skip();
+            if !self.tables(list, &t.used, compute, writes) {
                 return no("a table not made");
             }
             if let Some((param, dwords)) = stage.user_data {
@@ -991,7 +1047,7 @@ impl State {
                         once!(slot, kind, "a shader reads a root view the title did not set");
                         return no("a root view not set");
                     };
-                    let Some(gpu) = root_view(list, *address, kind) else {
+                    let Some(gpu) = root_view(list, *address, kind, writes) else {
                         once!(
                             slot,
                             kind,
@@ -1040,10 +1096,7 @@ impl State {
     /// `USE_THREAD_DIMENSIONS`).
     // shortcut: y and z stay groups; such dispatches are one-dimensional.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, threads: bool) {
-        #[cfg(feature = "diagnostics")]
-        if crate::pipeline::is_skipped(self.pipeline as This) {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
-            crate::pipeline::note_drop(self.pipeline as This);
+        if self.left_out() {
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -1243,6 +1296,10 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        if self.left_out() {
+            list.missed_draw();
+            return;
+        }
         if x > MAX_GROUPS {
             once!(x, "a mesh dispatch past the host's group limit dropped");
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1279,7 +1336,7 @@ impl State {
         }
     }
 
-    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool, writes: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -1291,7 +1348,7 @@ impl State {
             return;
         };
         match host.mirror(index, handle, true) {
-            Some(view) => readable(list, u, &view),
+            Some(view) => readable(list, u, &view, writes),
             None => self.null_uav |= u.kind == ResourceType::Uav,
         }
     }
@@ -1304,7 +1361,9 @@ impl State {
     /// within a list. Returns the fresh tables' new byte offsets by root
     /// parameter in `self.made`, or `false` when the draw must be dropped (a
     /// constant table found no dynamic slots).
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> bool {
+    ///
+    /// `writes`: whether the shader may write buffers (see [`readable`]).
+    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool, writes: bool) -> bool {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         // Taken out so `self` stays free to borrow; a draw dropped below
         // leaves it empty, and it grows again.
@@ -1342,7 +1401,7 @@ impl State {
         }
         for u in used.iter().filter(tables) {
             if !fresh.contains(u.slot) {
-                self.table_entry(list, u, compute);
+                self.table_entry(list, u, compute, writes);
             }
         }
         for slot in fresh.iter() {
@@ -1368,7 +1427,7 @@ impl State {
             let last = table + u64::from(needed - 1) * 32;
             if heap.index(last).is_none() {
                 for u in entries {
-                    self.table_entry(list, u, compute);
+                    self.table_entry(list, u, compute, writes);
                 }
                 continue;
             }
@@ -1381,7 +1440,7 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     match crate::descriptor::view(handle) {
-                        Some(view) => readable(list, u, &view),
+                        Some(view) => readable(list, u, &view, writes),
                         None => self.null_uav |= u.kind == ResourceType::Uav,
                     }
                 }
@@ -1416,7 +1475,7 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     match crate::descriptor::view(handle) {
-                        Some(view) => readable(list, u, &view),
+                        Some(view) => readable(list, u, &view, writes),
                         None => self.null_uav |= u.kind == ResourceType::Uav,
                     }
                 }
@@ -1433,7 +1492,7 @@ impl State {
                 }
                 once!(n, "descriptor table did not fit in command-list slots");
                 for u in entries {
-                    self.table_entry(list, u, compute);
+                    self.table_entry(list, u, compute, writes);
                 }
                 continue;
             };
@@ -1462,7 +1521,7 @@ impl State {
                     Some(view) => {
                         host.make_at(index, &view);
                         if let Some(u) = used {
-                            readable(list, u, &view);
+                            readable(list, u, &view, writes);
                         }
                     }
                     None => {
@@ -1558,6 +1617,10 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
+        if self.left_out() {
+            list.missed_draw();
+            return;
+        }
         let rects = self.topology == RECTANGLES && !self.draws_rectangles();
         let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
         if ran {
@@ -1658,6 +1721,10 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
+        if self.left_out() {
+            list.missed_draw();
+            return;
+        }
         let rects = self.topology == RECTANGLES && !self.draws_rectangles();
         if rects {
             once!("indexed rectangles not drawn");
@@ -1756,12 +1823,6 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
-        // Skip before the argument clamp can mutate the indirect buffer.
-        #[cfg(feature = "diagnostics")]
-        if crate::pipeline::is_skipped(self.pipeline as This) {
-            crate::pipeline::note_drop(self.pipeline as This);
-            return false;
-        }
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
@@ -2044,10 +2105,47 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     Some(signature)
 }
 
+/// Host states of a depth target, and of a texture shaders read.
+const DEPTH_WRITE: u32 = 0x10;
+const DEPTH_READ: u32 = 0x20;
+const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+
+thread_local! {
+    /// While a draw is prepared (`State::bind`, then its targets' states):
+    /// the depth target the draw only tests (0: none, or one it writes),
+    /// and whether a view its shaders read is of that same texture.
+    static TESTED_DEPTH: std::cell::Cell<(usize, bool)> = const { std::cell::Cell::new((0, false)) };
+}
+
+/// The host state a depth view needs of its texture: the read state if the
+/// view writes no plane the format has (the title's read-only flags), else
+/// the write state (victory-mix).
+/// shortcut: whole textures have one state, so a view that writes one of
+/// two planes counts as writing.
+fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>) -> u32 {
+    // D16_UNORM and D32_FLOAT: depth formats without a stencil plane.
+    const ONE_PLANE: [i32; 2] = [55, 40];
+    let Some(desc) = desc else {
+        return DEPTH_WRITE;
+    };
+    let format = if desc.Format.0 == 0 {
+        // SAFETY: a live texture; a view without a format has its own.
+        unsafe { texture.GetDesc() }.Format.0
+    } else {
+        desc.Format.0
+    };
+    let mut needed = D3D12_DSV_FLAG_READ_ONLY_DEPTH.0;
+    if !ONE_PLANE.contains(&format) {
+        needed |= D3D12_DSV_FLAG_READ_ONLY_STENCIL.0;
+    }
+    if desc.Flags.0 & needed == needed { DEPTH_READ } else { DEPTH_WRITE }
+}
+
 /// Gets what a shader reads or writes through a view ready: buffer data
-/// copied, textures moved to the state they need.
-fn readable(list: &HostList, u: &UsedResource, view: &View) {
-    const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+/// copied, textures moved to the state they need. A shader that cannot
+/// write buffers (`writes` false) leaves those it is given unordered access
+/// to as they are.
+fn readable(list: &HostList, u: &UsedResource, view: &View, writes: bool) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
@@ -2058,7 +2156,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         && let Some(shadow) = crate::shadow::find(address, len)
     {
         shadow.refresh(list, address, len);
-        if u.kind == ResourceType::Uav {
+        if u.kind == ResourceType::Uav && writes {
             shadow.gpu_writes(list, address, len);
         }
     }
@@ -2069,7 +2167,16 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
             {
                 crate::texture::upload(list, *resource as This, t);
             }
-            crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
+            // The depth target the draw only tests is read both ways at
+            // once: both read states, which its preparation asks for too.
+            let (tested, _) = TESTED_DEPTH.get();
+            let state = if tested != 0 && tested == *resource {
+                TESTED_DEPTH.set((tested, true));
+                DEPTH_READ | SHADER_RESOURCE
+            } else {
+                SHADER_RESOURCE
+            };
+            crate::list::ensure_state(list, *resource as This, state);
             #[cfg(feature = "diagnostics")]
             if let Some(t) = crate::resource::host_resource(*resource as This) {
                 // SAFETY: a live resource.
