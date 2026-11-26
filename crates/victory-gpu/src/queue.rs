@@ -1,6 +1,6 @@
-//! Command queues. Submitted lists run on the host GPU and are waited for,
-//! so fence signals complete at once, unless a wait holds the queue back
-//! (`timeline`).
+//! Command queues. Submitted lists run on the host GPU; a queue's signals go
+//! behind what it runs, and a wait holds the queue back unless what it waits
+//! for is on its way there (`timeline`).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::collections::VecDeque;
@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use crate::fence::Held;
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
+use crate::telemetry::Count;
 use crate::timeline::{Op, Timeline};
 
 const QUEUE_IIDS: [Iid; 4] = [
@@ -125,15 +126,23 @@ struct Submission {
 }
 
 #[cfg(windows)]
+impl Submission {
+    /// What is in flight, if it meets waits.
+    fn line(&self) -> Option<&crate::flight::Line> {
+        crate::flight::late_signal().then(|| &**self.host.line())
+    }
+}
+
+#[cfg(windows)]
 impl crate::timeline::Lists for Submission {
     fn ready(&self) -> usize {
-        self.runs.iter().take_while(|l| l.unmet().is_empty()).count()
+        self.runs.iter().take_while(|l| l.waits_met(self.line())).count()
     }
     fn len(&self) -> usize {
         self.runs.len()
     }
     fn early(&mut self) -> bool {
-        self.runs.front().is_some_and(|l| l.write_early())
+        self.runs.front().is_some_and(|l| l.write_early(self.line()))
     }
     fn take(&mut self, n: usize) -> Box<dyn FnOnce()> {
         let (host, runs) = (self.host, self.runs.drain(..n).collect::<Vec<_>>());
@@ -149,6 +158,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
+    let _call = crate::telemetry::call(Count::Executes);
     #[cfg(windows)]
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
@@ -177,8 +187,8 @@ pub(crate) struct Plane {
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
     execute(this, count, lists);
 }
-/// Signal with sync settings for the top and bottom of the pipe; our
-/// submissions are complete when they return, so it signals at once.
+/// Signal with sync settings for the top and bottom of the pipe; ours are
+/// all at the bottom.
 extern "system" fn signal2_x(
     this: This,
     fence: This,
@@ -195,6 +205,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    let _call = crate::telemetry::call(Count::Signals);
     queue(this)
         .timeline
         .submit(Op::Signal(Held::new(fence), value));
@@ -205,6 +216,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    let _call = crate::telemetry::call(Count::QueueWaits);
     queue(this)
         .timeline
         .submit(Op::Wait(Held::new(fence), value));
@@ -333,6 +345,7 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    let _call = crate::telemetry::call(Count::Presents);
     let mut shown = None;
     #[allow(unused_mut)]
     let mut over: Option<object::Ref> = None;
@@ -352,10 +365,13 @@ extern "system" fn present(
         let resource = unsafe { *plane.resources };
         shown = (!resource.is_null()).then(|| object::Ref::new(resource));
     }
-    // After the work the queue holds back.
-    queue(this)
-        .timeline
-        .submit(Op::Work(Box::new(move || show(shown, over))));
+    // After the work the queue holds back, and behind what the host GPU runs.
+    let work: Box<dyn FnOnce() + Send> = Box::new(move || show(shown, over));
+    #[cfg(windows)]
+    let behind = crate::host::free_present();
+    #[cfg(not(windows))]
+    let behind = false;
+    queue(this).timeline.submit(if behind { Op::Behind(work) } else { Op::Work(work) });
     S_OK
 }
 
@@ -533,6 +549,7 @@ extern "system" fn copy_page_mappings(
     pool_pages: u32,
     _flags: u32,
 ) -> HRESULT {
+    let _call = crate::telemetry::call(Count::Mappings);
     let Some(map) = crate::resource::page_mapper() else {
         return E_INVALIDARG;
     };

@@ -102,6 +102,10 @@ struct Journal {
     written: BTreeMap<usize, u64>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
+    /// Page ranges asked about ahead of a group of refreshes
+    /// ([`ask_ahead`]): until it is done, [`writes`] answers for a range
+    /// inside one from the journal, without another kernel call.
+    ahead: Vec<(usize, usize)>,
 }
 
 impl Journal {
@@ -117,6 +121,7 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
+    ahead: Vec::new(),
 });
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -125,37 +130,136 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    observe_writes(start, end, guarded, Journal::pages)
+    observe_writes(start, end, guarded, true, Journal::pages)
 }
 
 /// Records writes and returns only their generation. Copy-back already knows
 /// which pages it synchronized, so it does not need a snapshot of the journal.
+/// Always asks the kernel: what it finds written are our own writes too,
+/// which must not count as the title's later.
 pub(crate) fn copy_epoch(start: usize, end: usize, known_guarded: bool) -> Option<u64> {
     let epoch_only = |_: &Journal, _: usize, _: usize| ();
     if known_guarded {
         observe_guarded_writes(start, end, epoch_only)
     } else {
-        observe_writes(start, end, true, epoch_only)
+        observe_writes(start, end, true, false, epoch_only)
     }
     .map(|(now, ())| now)
 }
 
-fn observe_writes<T>(
-    start: usize,
-    end: usize,
-    guarded: bool,
-    report: impl FnOnce(&Journal, usize, usize) -> T,
-) -> Option<(u64, T)> {
+/// Whether a group of refreshes asks the kernel once for all of their
+/// write-watched memory ([`ask_ahead`]; `VYCE_ASK_AHEAD=0`: each refresh
+/// asks for its own range, as before).
+pub(crate) fn ask_ahead_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VYCE_ASK_AHEAD").is_none_or(|v| v != "0"))
+}
+
+/// Ranges of one group closer than this (in pages) are asked about
+/// together: walking the pages between them costs less than another kernel
+/// call (one that resets written pages costs tens of microseconds whatever
+/// the range).
+const AHEAD_GAP: usize = (8 << 20) / PAGE;
+/// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
+const AHEAD_MOST: usize = (1 << 30) / PAGE;
+
+/// Until dropped, refreshes of what [`ask_ahead`] asked are answered from
+/// the journal.
+pub(crate) struct Ahead(());
+
+impl Drop for Ahead {
+    fn drop(&mut self) {
+        JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).ahead.clear();
+    }
+}
+
+/// Asks the kernel about many ranges `(start, end)` of write-watched memory
+/// at once, before the [`writes`] of each: ranges close together are one
+/// asking (halved where one fails: across two reservations, or into memory
+/// that is not write-watched), and until the result is dropped `writes`
+/// answers for them from the journal. A range alone is left to `writes`.
+///
+/// No less right than an asking per range, as long as nothing of ours
+/// writes title memory meanwhile (refreshes write their copies): the
+/// journal keeps what each asking found for every asker, and a page the
+/// title writes after this asking is still written for the kernel, so the
+/// next asking finds it. What changes: such a write is seen by the next
+/// group of refreshes, not by this one. `ASK_ONCE`/`ask_ahead` of
+/// github.com/avatarmanz/VIctory-7900XTX (0a43566, from fxceless's
+/// 578d459), here for a group of refreshes rather than a whole submission.
+pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) -> Option<Ahead> {
+    if !ask_ahead_on() {
+        return None;
+    }
+    let mut pieces: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|r| r.0 < r.1)
+        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .collect();
+    if pieces.len() < 2 {
+        return None;
+    }
+    pieces.sort_unstable();
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    // Another group's asking stands (one thread refreshes at a time).
+    if !j.ahead.is_empty() {
+        return None;
+    }
+    let (mut asked, mut written) = (Vec::new(), Vec::new());
+    let mut i = 0;
+    while i < pieces.len() {
+        let first = pieces[i].0;
+        let mut last = pieces[i].1;
+        let mut k = i + 1;
+        while k < pieces.len() && pieces[k].0 <= last + AHEAD_GAP && last.max(pieces[k].1) - first <= AHEAD_MOST {
+            last = last.max(pieces[k].1);
+            k += 1;
+        }
+        ask_run(&mut j, &pieces[i..k], &mut asked, &mut written);
+        i = k;
+    }
+    if asked.is_empty() {
+        return None;
+    }
+    j.asked += 1;
+    let now = j.asked;
+    for page in written {
+        j.written.insert(page, now);
+    }
+    j.ahead = asked;
+    Some(Ahead(()))
+}
+
+/// One kernel asking for `pieces` (page ranges in order); by halves if it
+/// fails. A piece alone is left to [`writes`]. Adds what was asked to
+/// `asked` and the pages found written to `written`.
+fn ask_run(j: &mut Journal, pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: &mut Vec<usize>) {
+    if pieces.len() < 2 {
+        return;
+    }
+    let first = pieces[0].0;
+    let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
+    if let Some(count) = kernel_written(j, first, last) {
+        written.extend(j.found[..count].chunk_by(|a, b| *a / PAGE == *b / PAGE).map(|hits| hits[0] / PAGE));
+        asked.push((first, last));
+        return;
+    }
+    let (a, b) = pieces.split_at(pieces.len() / 2);
+    ask_run(j, a, asked, written);
+    ask_run(j, b, asked, written);
+}
+
+/// Asks the kernel which 4 KiB pages of the pages `[first, last)` were
+/// written since it was last asked (and forgets that): how many it put into
+/// `j.found`, `None` if the range is not write-watched memory of one
+/// reservation. Under the journal's lock.
+fn kernel_written(j: &mut Journal, first: usize, last: usize) -> Option<usize> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
-    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
+    let asking = crate::telemetry::start();
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
         GetWriteWatch(
@@ -167,8 +271,33 @@ fn observe_writes<T>(
             &mut granularity,
         )
     } != 0;
-    let guarded = if failed {
-        count = 0;
+    crate::telemetry::count(crate::telemetry::Count::WatchAsks, 1);
+    crate::telemetry::stop(crate::telemetry::Count::WatchTime, asking);
+    (!failed).then_some(count)
+}
+
+/// `ahead`: a range a group's asking holds may be answered from the journal.
+fn observe_writes<T>(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    ahead: bool,
+    report: impl FnOnce(&Journal, usize, usize) -> T,
+) -> Option<(u64, T)> {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    if ahead && j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+        crate::telemetry::count(crate::telemetry::Count::WatchAhead, 1);
+        // Every asking so far is in the journal: a copy taken from now on
+        // holds what they found.
+        return Some((j.asked, report(j, first, last)));
+    }
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let asked = kernel_written(j, first, last);
+    let count = asked.unwrap_or(0);
+    let guarded = if asked.is_none() {
         if !guarded {
             return None;
         }
@@ -242,12 +371,14 @@ struct Guards {
     /// Blocks whose page was guarded together with its other views (those
     /// views' blocks are in it too): a write to one opens them all.
     aliased: BTreeSet<usize>,
-    /// Blocks the kernel is about to write for the runtime ([`writing`]),
-    /// from, to, and until when they are left writable: a read may be
-    /// asynchronous and land after the call that asked for it returned, and
-    /// the kernel does not fault into our handler, it fails. Until then
-    /// they are not made read-only, and every check reports them written.
-    pins: Vec<(usize, usize, std::time::Instant)>,
+    /// Blocks the kernel is about to write for the runtime ([`writing`]) and
+    /// until when they are left writable: a read may be asynchronous and
+    /// land after the call that asked for it returned, and the kernel does
+    /// not fault into our handler, it fails. Until then they are not made
+    /// read-only, and every check reports them written.
+    pins: BTreeMap<usize, std::time::Instant>,
+    /// When the pins that ended were last taken out.
+    pruned: Option<std::time::Instant>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -255,7 +386,8 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     clean: BTreeSet::new(),
     holes: BTreeSet::new(),
     aliased: BTreeSet::new(),
-    pins: Vec::new(),
+    pins: BTreeMap::new(),
+    pruned: None,
 });
 
 /// How long blocks stay writable after [`writing`].
@@ -264,8 +396,73 @@ const PIN: std::time::Duration = std::time::Duration::from_secs(2);
 impl Guards {
     /// Whether `block` is left writable for a kernel write.
     fn pinned(&self, block: usize) -> bool {
-        self.pins.iter().any(|&(from, to, _)| from <= block && block < to)
+        self.pins.get(&block).is_some_and(|&until| until > std::time::Instant::now())
     }
+
+    /// Leaves the blocks `[from, to)` writable until `until`.
+    fn pin(&mut self, from: usize, to: usize, until: std::time::Instant) {
+        if to - from < 256 {
+            self.pins.extend((from..to).map(|block| (block, until)));
+        } else {
+            // Merged in one go: a window of a gigabyte has 16,384 blocks.
+            let mut more: BTreeMap<_, _> = (from..to).map(|block| (block, until)).collect();
+            self.pins.append(&mut more);
+        }
+        crate::telemetry::note(crate::telemetry::Gauge::Pins, self.pins.len() as u64);
+    }
+
+    /// Takes out pins that ended, now and then.
+    fn prune(&mut self) {
+        const OFTEN: std::time::Duration = std::time::Duration::from_millis(100);
+        let now = std::time::Instant::now();
+        if self.pins.is_empty() || self.pruned.is_some_and(|at| now - at < OFTEN) {
+            return;
+        }
+        self.pruned = Some(now);
+        self.pins.retain(|_, until| *until > now);
+    }
+}
+
+/// Title memory some block of which was made read-only, one bit for every
+/// 2 MiB of the first TiB (the title's GPU addresses have 40 bits, its
+/// memory lies far below that): set before the block is, never cleared.
+/// Where no bit is set there is nothing to open before a write of ours.
+static TOUCHED: [AtomicU64; TOUCHED_WORDS] = [const { AtomicU64::new(0) }; TOUCHED_WORDS];
+const TOUCHED_SHIFT: usize = 21;
+const TOUCHED_WORDS: usize = (1 << (40 - TOUCHED_SHIFT)) / 64;
+
+/// Notes that blocks of `[from, to)` (block numbers) may be read-only from
+/// now on.
+fn touch(from: usize, to: usize) {
+    let (first, last) = (from * BLOCK >> TOUCHED_SHIFT, (to * BLOCK - 1) >> TOUCHED_SHIFT);
+    for bit in first..=last.min(TOUCHED_WORDS * 64 - 1) {
+        let (word, bit) = (&TOUCHED[bit / 64], 1u64 << (bit % 64));
+        if word.load(Ordering::Relaxed) & bit == 0 {
+            word.fetch_or(bit, Ordering::Release);
+        }
+    }
+}
+
+/// Whether a block of `[at, at + len)` may be read-only (`len` not 0).
+fn touched(at: usize, len: usize) -> bool {
+    let (first, last) = (at >> TOUCHED_SHIFT, (at + len - 1) >> TOUCHED_SHIFT);
+    last >= TOUCHED_WORDS * 64
+        || (first..=last).any(|bit| TOUCHED[bit / 64].load(Ordering::Acquire) >> (bit % 64) & 1 != 0)
+}
+
+/// Whether a check that finds its range guarded already honours pins too
+/// (`VYCE_PIN_ALWAYS=0`: as before, only a range's first check did, and a
+/// block waiting for a kernel read could be made read-only under it).
+fn pin_always() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VYCE_PIN_ALWAYS").is_none_or(|v| v != "0"))
+}
+
+/// Whether our own copies open title memory without pinning it
+/// (`VYCE_OPENING=0`: they go through [`writing`], as before).
+pub(crate) fn opens_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VYCE_OPENING").is_none_or(|v| v != "0"))
 }
 
 /// Views of one page past which its views are not guarded together (the
@@ -460,24 +657,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     {
         let mut g = guards();
         if g.protected.contains(&first) || g.holes.contains(&first) {
-            let mut written = Vec::new();
-            let mut run: Option<usize> = None;
-            for block in first..=last {
-                let open = block < last && !g.clean.contains(&block) && !g.holes.contains(&block);
-                if open {
-                    if g.protected.contains(&block) {
-                        g.clean.insert(block);
-                        written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-                    } else {
-                        run.get_or_insert(block);
-                        continue;
-                    }
-                }
-                if let Some(from) = run.take() {
-                    protect(&mut g, from, block, &mut written);
-                }
-            }
-            return Some(written);
+            return Some(guard_blocks(&mut g, first, last, false, pin_always()));
         }
     }
     // Slow path (first encounter): `start` is itself a mapped view, or if
@@ -488,13 +668,16 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     } else {
         first_mapped(start, end)?
     };
-    let check_each = probe != start;
     install();
-    let mut g = guards();
-    if !g.pins.is_empty() {
-        let now = std::time::Instant::now();
-        g.pins.retain(|&(_, _, until)| until > now);
-    }
+    Some(guard_blocks(&mut guards(), first, last, probe != start, true))
+}
+
+/// [`guard`] for the blocks `[first, last)`: the pages written. `check_each`:
+/// some of them may be no view memory. `pins`: blocks waiting for a kernel
+/// write are left alone.
+fn guard_blocks(g: &mut Guards, first: usize, last: usize, check_each: bool, pins: bool) -> Vec<usize> {
+    g.prune();
+    let pins = pins && !g.pins.is_empty();
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     for block in first..=last {
@@ -503,7 +686,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             && !g.holes.contains(&block)
             && (!check_each || mapped(block * BLOCK));
         if open {
-            if g.pinned(block) {
+            if pins && g.pinned(block) {
                 // The kernel may be writing it: left writable, reported
                 // written at every check until the pin ends.
                 written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
@@ -519,10 +702,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             }
         }
         if let Some(from) = run.take() {
-            protect(&mut g, from, block, &mut written);
+            protect(g, from, block, &mut written);
         }
     }
-    Some(written)
+    written
 }
 
 /// Scans `[start, end)` jumping over unmapped holes; returns the first
@@ -603,6 +786,7 @@ fn mapped(at: usize) -> bool {
 /// so subsequent checks neither retry `VirtualProtect` nor fault copying them.
 fn protect(g: &mut Guards, from: usize, to: usize, written: &mut Vec<usize>) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    touch(from, to);
     let set = |from: usize, to: usize| {
         let mut old = 0;
         // SAFETY: title view memory; only its protection changes.
@@ -651,6 +835,9 @@ fn protect(g: &mut Guards, from: usize, to: usize, written: &mut Vec<usize>) {
         }
         for &at in shown {
             let alias = at / BLOCK;
+            // Also one that cannot be made read-only: a write of ours there
+            // must open the page's other views.
+            touch(alias, alias + 1);
             g.aliased.insert(alias);
             if alias != block && !g.protected.contains(&alias) && !g.pinned(alias) {
                 let mut old = 0;
@@ -733,18 +920,42 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     true
 }
 
-/// Before our own write into title memory `[at, at + len)` through the
-/// kernel (which does not fault into our handler): opens its guarded blocks.
-/// The runtime calls it (as `kernel_will_write`) before the title's kernel
-/// reads into its own memory.
+/// Before our own copy into title memory `[at, at + len)` on this thread:
+/// opens its guarded blocks (and the same pages at their other views), so
+/// that the copy does not fault block by block and the blocks count as
+/// written. Nothing is pinned: the copy is over when its call returns, and a
+/// block guarded again in between faults into our handler. A copy that goes
+/// through the kernel after all is told of by [`writing`].
+pub(crate) fn opening(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    if !opens_only() {
+        return writing(at, len);
+    }
+    if !touched(at, len) {
+        crate::telemetry::count(crate::telemetry::Count::OpeningsIdle, 1);
+        return;
+    }
+    crate::telemetry::count(crate::telemetry::Count::Openings, 1);
+    // `open` knows the other views: those of a page guarded together with
+    // its views are all noted (`Guards::aliased`).
+    open(&mut guards(), at, at + len);
+}
+
+/// Before a write into title memory `[at, at + len)` through the kernel
+/// (which does not fault into our handler): opens its guarded blocks, and
+/// leaves them so for a while. The runtime calls it (as `kernel_will_write`)
+/// before the title's kernel reads into its own memory.
 pub fn writing(at: usize, len: usize) {
     if len == 0 {
         return;
     }
     let (first, last) = (at / BLOCK, (at + len).div_ceil(BLOCK));
     let mut g = guards();
+    g.prune();
     let until = std::time::Instant::now() + PIN;
-    g.pins.push((first, last, until));
+    g.pin(first, last, until);
     open(&mut g, at, at + len);
     if !view_guard() {
         return;
@@ -758,7 +969,7 @@ pub fn writing(at: usize, len: usize) {
         }
         for alias in shown {
             if alias / BLOCK != block {
-                g.pins.push((alias / BLOCK, alias / BLOCK + 1, until));
+                g.pin(alias / BLOCK, alias / BLOCK + 1, until);
                 open_here(&mut g, alias, alias + BLOCK);
             }
         }
@@ -812,6 +1023,12 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         let aliased: Vec<usize> = g.aliased.range(at / BLOCK..end.div_ceil(BLOCK)).copied().collect();
         for block in aliased {
             g.aliased.remove(&block);
+        }
+        // What a kernel write was to land in is not there any more.
+        let pinned: Vec<usize> =
+            g.pins.range(at / BLOCK..end.div_ceil(BLOCK)).map(|(&block, _)| block).collect();
+        for block in pinned {
+            g.pins.remove(&block);
         }
         if changed {
             bump_region_epochs(at, end);
@@ -940,6 +1157,48 @@ mod tests {
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+    /// Refreshes asked about ahead are answered from the journal while the
+    /// asking stands: a write after it is seen by the first asking after it
+    /// (nothing is lost, it comes a group later). What was not asked ahead is
+    /// asked of the kernel as ever, and a range alone is not asked ahead.
+    #[test]
+    fn an_asking_ahead_answers_for_its_ranges_until_it_is_done() {
+        if !ask_ahead_on() {
+            return;
+        }
+        // SAFETY: a private write-watched region of the test's own.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 16 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let page = |i: usize| p / PAGE + i;
+        // SAFETY: committed pages of ours.
+        let write = |i: usize| unsafe { ((p + i * PAGE + 8) as *mut u8).write(7) };
+        // Windows can reuse an address already in the journal: only what
+        // was found after this counts.
+        let (initial, _) = writes(p, p + 16 * PAGE, false).expect("watched");
+        let found = |list: &[(usize, u64)]| list.iter().filter(|w| w.1 > initial).map(|w| w.0).collect::<Vec<_>>();
+        write(1);
+        write(9);
+        let ahead = ask_ahead(&[(p + 8 * PAGE, p + 12 * PAGE), (p, p + 2 * PAGE)]).expect("asked ahead");
+        let (now, first) = writes(p, p + 2 * PAGE, false).unwrap();
+        assert_eq!(found(&first), [page(1)]);
+        assert!(first.iter().all(|&(_, when)| when <= now));
+        write(10);
+        let (_, second) = writes(p + 8 * PAGE, p + 12 * PAGE, false).unwrap();
+        assert_eq!(found(&second), [page(9)], "a write after the asking is the next one's");
+        write(14);
+        let (_, apart) = writes(p + 14 * PAGE, p + 15 * PAGE, false).unwrap();
+        assert_eq!(found(&apart), [page(14)], "asked of the kernel");
+        drop(ahead);
+        let (later, third) = writes(p + 8 * PAGE, p + 12 * PAGE, false).unwrap();
+        assert!(later > now);
+        assert!(third.contains(&(page(10), later)), "{third:?}");
+        assert!(ask_ahead(&[(p, p + PAGE)]).is_none());
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
     /// Two views of the same two physical pages, told as the runtime tells
     /// them: the two addresses.
     fn two_views() -> (usize, usize) {
@@ -960,6 +1219,10 @@ mod tests {
             assert!(one != 0 && two != 0);
             title_memory_view(one, 2 * BLOCK, section as usize, 0);
             title_memory_view(two, 2 * BLOCK, section as usize, 0);
+            // As the runtime tells of a mapping. Another test's memory was
+            // here, perhaps, pinned by a copy into it.
+            title_memory_remapped(one, 2 * BLOCK);
+            title_memory_remapped(two, 2 * BLOCK);
             (one, two)
         }
     }
@@ -1057,6 +1320,8 @@ mod tests {
             (section, MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize)
         };
         title_memory_view(guarded, 2 * BLOCK, section as usize, 0);
+        // As in `two_views`.
+        title_memory_remapped(guarded, 2 * BLOCK);
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
         assert_eq!(guard(guarded, guarded + 2 * BLOCK), Some(vec![pages(0), pages(1)]));
         assert_eq!(guard(guarded, guarded + 2 * BLOCK), Some(Vec::new()));
@@ -1165,6 +1430,139 @@ mod tests {
         drop_views(&[guarded, other]);
     }
 
+    /// A view of two blocks of a pagefile section.
+    fn one_view() -> usize {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        // Another test's view was here, perhaps.
+        title_memory_remapped(view, 2 * BLOCK);
+        view
+    }
+
+    fn read_only(at: usize) -> bool {
+        !writable(at)
+    }
+
+    /// A block waiting for a kernel read is left writable, and reported
+    /// written, by a check whose first block is guarded already; when the
+    /// wait is over it is guarded like the others.
+    #[test]
+    fn a_check_of_guarded_memory_leaves_pinned_blocks_writable() {
+        if !pin_always() {
+            return;
+        }
+        let view = one_view();
+        let page = |block: usize| (view + block * BLOCK) / PAGE;
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(vec![page(0), page(1)]));
+        assert!(read_only(view) && read_only(view + BLOCK));
+        writing(view + BLOCK + 100, 13);
+        assert!(read_only(view) && !read_only(view + BLOCK));
+        for _ in 0..3 {
+            assert_eq!(guard(view, view + 2 * BLOCK), Some(vec![page(1)]));
+            assert!(read_only(view) && !read_only(view + BLOCK), "the kernel may be writing it");
+        }
+        // The pin ends.
+        guards().pins.insert(view / BLOCK + 1, std::time::Instant::now());
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(vec![page(1)]));
+        assert!(read_only(view + BLOCK));
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(Vec::new()));
+        drop_views(&[view]);
+    }
+
+    /// Before a copy of ours guarded blocks are opened, at the page's other
+    /// views too, and count as written; nothing is pinned, and memory that
+    /// was never guarded is left alone.
+    #[test]
+    fn opening_reports_and_does_not_pin() {
+        if !opens_only() {
+            return;
+        }
+        let view = one_view();
+        let page = |block: usize| (view + block * BLOCK) / PAGE;
+        opening(view + BLOCK, 8);
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(vec![page(0), page(1)]));
+        assert!(touched(view, 2 * BLOCK));
+        opening(view + BLOCK + 8, 16);
+        assert!(read_only(view) && !read_only(view + BLOCK));
+        assert!(!guards().pins.contains_key(&(view / BLOCK + 1)));
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(vec![page(1)]), "written");
+        assert!(read_only(view + BLOCK), "and guarded again at once");
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(Vec::new()));
+        drop_views(&[view]);
+
+        let (one, two) = two_views();
+        let page = |view: usize, block: usize| (view + block * BLOCK) / PAGE;
+        guard(one, one + 2 * BLOCK).unwrap();
+        guard(two, two + 2 * BLOCK).unwrap();
+        opening(two + 8, 8);
+        assert_eq!(guard(one, one + 2 * BLOCK), Some(vec![page(one, 0)]));
+        assert_eq!(guard(two, two + 2 * BLOCK), Some(vec![page(two, 0)]));
+        drop_views(&[one, two]);
+    }
+
+    /// Ranges are found in the coarse map at their ends too, and addresses
+    /// past it count as touched.
+    #[test]
+    fn the_coarse_map_holds_every_block_made_read_only() {
+        const MIB: usize = 1 << 20;
+        // Nobody's addresses.
+        let base = 0xe3_0000_0000usize;
+        assert!(!touched(base, 8 * MIB));
+        touch((base + 2 * MIB) / BLOCK, (base + 2 * MIB) / BLOCK + 1);
+        assert!(!touched(base, 2 * MIB) && touched(base, 2 * MIB + 1));
+        assert!(touched(base + 2 * MIB, 1) && touched(base + 4 * MIB - 1, 1));
+        assert!(!touched(base + 4 * MIB, 4 * MIB));
+        // Across two bits.
+        touch((base + 16 * MIB) / BLOCK - 1, (base + 16 * MIB) / BLOCK + 1);
+        assert!(touched(base + 14 * MIB, 1) && touched(base + 17 * MIB, 1));
+        assert!(!touched(base + 18 * MIB, 1));
+        let past = 1usize << 40;
+        assert!(touched(past, 1) && touched(past - 1, 2) && touched(usize::MAX - 16, 8));
+        touch(past / BLOCK, past / BLOCK + 1);
+    }
+
+    /// What a copy of ours pays before it writes memory no copy of the host
+    /// guards: `cargo test --release -p victory-gpu -- --ignored --nocapture opening_against`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn opening_against_writing() {
+        const N: u32 = 100_000;
+        let mut memory = vec![0u8; 64 << 20];
+        let base = memory.as_mut_ptr() as usize;
+        let time = |f: &dyn Fn(usize)| {
+            let started = std::time::Instant::now();
+            for i in 0..N as usize {
+                f(base + i * 4096 % (63 << 20));
+            }
+            started.elapsed() / N
+        };
+        let idle = time(&|at| opening(at, 256));
+        let (view, other) = two_views();
+        guard(view, view + 2 * BLOCK).unwrap();
+        let guarded = time(&|at| opening(view + at % BLOCK, 256));
+        let pinned = time(&|at| writing(at, 256));
+        println!(
+            "a copy of ours opens its memory in {idle:?}, in guarded memory {guarded:?}, with a pin {pinned:?}"
+        );
+        drop_views(&[view, other]);
+        // The memory goes, and its pins with it.
+        let blocks = base / BLOCK..(base + memory.len()).div_ceil(BLOCK);
+        guards().pins.retain(|block, _| !blocks.contains(block));
+    }
+
     /// A kernel read into a guarded view block fails; opened first, it
     /// lands and the block counts as written.
     #[test]
@@ -1187,6 +1585,8 @@ mod tests {
             MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
         };
         assert_ne!(view, 0);
+        // As in `two_views`.
+        title_memory_remapped(view, 2 * BLOCK);
         assert!(guard(view, view + 2 * BLOCK).is_some()); // now read-only
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"from the disk").unwrap();

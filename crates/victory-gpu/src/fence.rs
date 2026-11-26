@@ -1,5 +1,6 @@
-//! Fences: a 64-bit value and the events waiting for it. Nothing runs on a
-//! GPU yet, so only signals (the title's, later our queues') move one.
+//! Fences: a 64-bit value and the events waiting for it. Signals move one
+//! (the title's own, and its queues' once the work before them has run), and
+//! lists' bottom-of-pipe writes into its memory.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
@@ -127,6 +128,16 @@ impl Held {
         completed(self.0.get()) >= value
     }
 
+    /// Whether both are the same fence.
+    pub(crate) fn same(&self, other: &Held) -> bool {
+        self.0.get() == other.0.get()
+    }
+
+    /// Where the fence's value is.
+    pub(crate) fn address(&self) -> usize {
+        gpu_address(self.0.get()) as usize
+    }
+
     /// Moves the fence and sets its events; wakes no queue.
     pub(crate) fn signal(&self, value: u64) {
         set(self.0.get(), value);
@@ -146,11 +157,18 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     }
     if event.is_null() {
         // A null event means "block until reached".
-        // shortcut: only work still to run on a queue can reach it later (the
-        // title's other threads aside), so fail instead of hanging if there
-        // is none.
+        // shortcut: only work still to run on a queue, or in flight, can
+        // reach it later (the title's other threads aside), so fail instead
+        // of hanging if there is none.
         drop(waiters);
         while fence.value.load(Ordering::Acquire) < value {
+            #[cfg(windows)]
+            if let Some(line) = crate::host::line()
+                && line.busy()
+            {
+                line.drain(crate::telemetry::Count::WaitFence);
+                continue;
+            }
             if !crate::timeline::active() {
                 // It may just have run.
                 if fence.value.load(Ordering::Acquire) >= value {

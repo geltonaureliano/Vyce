@@ -43,6 +43,8 @@ pub(crate) struct HostHeap {
     /// Where the next search starts, the slots taken, and the smallest run
     /// known not to be free since the last release (`usize::MAX`: none).
     next: Mutex<(u32, Vec<bool>, usize)>,
+    /// How many of them are taken (for the session panel).
+    taken: AtomicU64,
     /// Per-slot element byte stride (`u32`) for structured buffers whose
     /// stride shader analysis could not recover statically.
     strides: Option<StrideTable>,
@@ -189,6 +191,8 @@ struct Bindless {
     loose: bool,
     /// The host resources those slots view, held by the plans until then.
     extra: Vec<ID3D12Resource>,
+    /// What slots read since then that the plan lacks.
+    lacking: Lacking,
     /// The released-view, placed-texture, and memory-remap epochs `uses` was checked at.
     checked: (u64, u64, u64),
     /// What submissions do for the slots, until they or what they view change.
@@ -231,6 +235,46 @@ const SLOT_BUDGET_US: u64 = 20_000;
 const SLOT_CHUNK: usize = 512;
 /// Slots made at each submission whatever time they take.
 const URGENT: usize = 2048;
+
+/// Memory to bring up to date with a plan that slots came to read after the
+/// whole plan was built ([`plan_extra`]): ranges outside its own, and
+/// misaligned constant buffers.
+#[derive(Default)]
+struct Lacking {
+    reads: Arc<Vec<(Arc<crate::shadow::Shadow>, usize, usize)>>,
+    known: std::collections::HashSet<(usize, usize, usize)>,
+    /// Bounce slice, title address, bytes: one for each slice.
+    bounces: Arc<Vec<(usize, u64, u32)>>,
+    at: HashMap<usize, usize>,
+}
+
+impl Lacking {
+    fn read(&mut self, range: &(Arc<crate::shadow::Shadow>, usize, usize)) {
+        if self.known.insert((Arc::as_ptr(&range.0) as usize, range.1, range.2)) {
+            Arc::make_mut(&mut self.reads).push(range.clone());
+        }
+    }
+
+    /// A slice's constants are somewhere else now.
+    fn bounce(&mut self, bounce: (usize, u64, u32)) {
+        let bounces = Arc::make_mut(&mut self.bounces);
+        match self.at.get(&bounce.0) {
+            Some(&at) => bounces[at] = bounce,
+            None => {
+                self.at.insert(bounce.0, bounces.len());
+                bounces.push(bounce);
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.reads.len().max(self.bounces.len())
+    }
+
+    fn clear(&mut self) {
+        *self = Lacking::default();
+    }
+}
 
 impl Bindless {
     /// The slot-making budget, refilled for the time passed since.
@@ -373,6 +417,10 @@ pub(crate) struct BindlessPlan {
     /// Of them, those new in this plan.
     fresh: Vec<(usize, u64, u32)>,
     fresh_reads: Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// What slots read besides, since the lists above were made
+    /// ([`Lacking`]).
+    extra_reads: Arc<Vec<(Arc<crate::shadow::Shadow>, usize, usize)>>,
+    extra_bounces: Arc<Vec<(usize, u64, u32)>>,
     /// The frame (plus one) the bounces were last copied in.
     copied_in: AtomicU64,
     /// The host resources the slots view, held while a submission runs.
@@ -391,35 +439,64 @@ impl BindlessPlan {
     ///
     /// shortcut: all of them once a frame, else only for a plan not copied
     /// yet: the title writes constants before it points a slot at them.
-    /// Returns the title memory to bring up to date, by the same rule.
-    /// And whether it is all of it (and may be looked at less often where it
-    /// does not change) rather than what is new.
-    pub(crate) fn copy_constants(&self) -> (&[(Arc<crate::shadow::Shadow>, usize, usize)], bool) {
+    /// Returns the title memory to bring up to date, by the same rule, in two
+    /// lists, and whether it is all of it (and may be looked at less often
+    /// where it does not change) rather than what is new.
+    pub(crate) fn copy_constants(&self) -> ([&[(Arc<crate::shadow::Shadow>, usize, usize)]; 2], bool) {
         let frame = crate::queue::presented() + 1;
         // Counted for all plans: each is the one before with a few changes.
         static FRAME: AtomicU64 = AtomicU64::new(0);
         let all = FRAME.swap(frame, Ordering::AcqRel) != frame;
         let fresh = self.copied_in.swap(frame, Ordering::AcqRel) == 0;
-        let (bounces, reads) = match (all || cfg!(test), fresh) {
-            (true, _) => (&*self.bounces, &*self.reads),
-            (_, true) => (&self.fresh, &self.fresh_reads),
-            _ => return (&[], false),
-        };
-        if !bounces.is_empty() {
-            let started = std::time::Instant::now();
-            let bytes: u64 = bounces.iter().map(|b| u64::from(b.2)).sum();
-            #[cfg(feature = "diagnostics")]
-            {
-                use crate::copystat::{C, add};
-                add(C::Copies, bounces.len() as u64);
-                add(C::CopyBytes, bytes);
-            }
-            crate::host::in_parallel(bounces, 1024, copy_bounces);
-            let us = started.elapsed().as_micros() as u64;
-            crate::host::PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            crate::host::PREPARING[1].fetch_add(bytes, Ordering::Relaxed);
+        if all || in_test() {
+            let (planned, extra) = self.all_bounces();
+            copy_lists(&[&planned, extra]);
+            return ([&self.reads, &self.extra_reads], all);
         }
-        (reads, all)
+        if fresh {
+            copy_lists(&[&self.fresh]);
+            return ([&self.fresh_reads, &[]], false);
+        }
+        ([&[], &[]], false)
+    }
+
+    /// The misaligned constant buffers of all slots: the whole plan's, but
+    /// not those whose slice holds other constants by now, and these.
+    fn all_bounces(&self) -> (std::borrow::Cow<'_, [(usize, u64, u32)]>, &[(usize, u64, u32)]) {
+        if self.extra_bounces.is_empty() {
+            return (std::borrow::Cow::Borrowed(&self.bounces), &[]);
+        }
+        let others: std::collections::HashSet<usize> = self.extra_bounces.iter().map(|b| b.0).collect();
+        let planned: Vec<_> = self.bounces.iter().filter(|b| !others.contains(&b.0)).copied().collect();
+        (std::borrow::Cow::Owned(planned), &self.extra_bounces)
+    }
+}
+
+/// Copies constant buffers into their bounce slices.
+fn copy_lists(lists: &[&[(usize, u64, u32)]]) {
+    let count: usize = lists.iter().map(|l| l.len()).sum();
+    if count == 0 {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let bytes: u64 = lists.iter().copied().flatten().map(|b| u64::from(b.2)).sum();
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::Copies, count as u64);
+        add(C::CopyBytes, bytes);
+    }
+    for list in lists {
+        crate::host::in_parallel(list, 1024, copy_bounces);
+    }
+    let us = started.elapsed().as_micros() as u64;
+    crate::host::PREPARING[0].fetch_add(us, Ordering::Relaxed);
+    crate::host::PREPARING[1].fetch_add(bytes, Ordering::Relaxed);
+    if crate::telemetry::on() {
+        use crate::telemetry::{Count, add};
+        add(Count::Bounces, count as u64);
+        add(Count::BounceBytes, bytes);
+        add(Count::BounceTime, us);
     }
 }
 
@@ -569,6 +646,33 @@ static LACK_FRAMES: [[AtomicU64; 2]; 2] = [const { [const { AtomicU64::new(0) };
 fn reuse() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_PLAN_REUSE").is_none_or(|v| v != "0"))
+}
+
+/// Whether what slots newly read is kept beside the plan until it is built
+/// again in its turn ([`Lacking`]; `VYCE_PLAN_EXTRA=0`: the whole plan is
+/// built anew for it, as before: some 40 slots, every second frame, 12 ms
+/// each time with the heap locked against the recorders).
+fn plan_extra() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VYCE_PLAN_EXTRA").is_none_or(|v| v != "0"))
+}
+
+/// The most of it kept beside a plan.
+const LACKING_MOST: usize = 2048;
+
+#[cfg(test)]
+thread_local! {
+    /// This test's plans are made as the game's are.
+    static AS_IN_GAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether plans are made as tests want them: built whole whenever a slot
+/// was made, all of them copied each time.
+fn in_test() -> bool {
+    #[cfg(test)]
+    return !AS_IN_GAME.get();
+    #[cfg(not(test))]
+    false
 }
 
 /// A plan built some frames ago may read memory no slot views any more:
@@ -761,6 +865,9 @@ impl HostHeap {
         {
             *last = true;
         }
+        // The counter of taken slots counts the one kept null too, so a
+        // release never takes more off it than was put on.
+        let reserved = taken.iter().filter(|t| **t).count() as u64;
         let h = HostHeap {
             heap,
             cpu,
@@ -772,6 +879,7 @@ impl HostHeap {
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             kept_textures: Mutex::default(),
             next: Mutex::new((0, taken, usize::MAX)),
+            taken: AtomicU64::new(reserved),
             strides,
             bindless: Mutex::default(),
             recording: std::sync::atomic::AtomicBool::new(false),
@@ -958,6 +1066,8 @@ impl HostHeap {
             return None;
         };
         taken[first..first + n].fill(true);
+        let held = self.taken.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+        crate::telemetry::note(crate::telemetry::Gauge::Slots, held);
         #[cfg(feature = "diagnostics")]
         if !self.sampler {
             static MADE: AtomicU64 = AtomicU64::new(0);
@@ -988,6 +1098,8 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = at.saturating_add(n).min(self.spare) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
+            let held = slots.iter().filter(|&&t| t).count();
+            self.taken.fetch_sub(held as u64, Ordering::Relaxed);
             slots.fill(false);
         }
         guard.2 = usize::MAX;
@@ -1920,7 +2032,7 @@ impl HostHeap {
                 let (wrote, bounced) = old.map_or((&None, None), |o| (&o.write, o.bounce));
                 let new = made.as_ref().and_then(|m| m.1.as_ref());
                 let mut bits = 0u8;
-                let lacks = match (new, &planned) {
+                let mut lacks = match (new, &planned) {
                     (_, None) => true,
                     (Some(new), Some(reads)) => {
                         let lacking = [
@@ -1941,6 +2053,22 @@ impl HostHeap {
                         gone
                     }
                 };
+                // What it lacks goes beside it. (Its writes are used by
+                // tests only; what it copies for a slot gone is copied for
+                // nothing for some frames, into the slot's own slice.)
+                if plan_extra() && planned.is_some() && !(in_test() && bits & 1 != 0) {
+                    lacks = false;
+                    if bits & 2 != 0
+                        && let Some(bounce) = new.and_then(|n| n.bounce)
+                    {
+                        b.lacking.bounce(bounce);
+                    }
+                    if bits & 4 != 0
+                        && let Some(read) = new.and_then(|n| n.read.as_ref())
+                    {
+                        b.lacking.read(read);
+                    }
+                }
                 if bits != 0 {
                     LACKS[bits as usize].fetch_add(1, Ordering::Relaxed);
                     for (seen, only) in LACK_FRAMES.iter().zip([true, bits & 5 != 0]) {
@@ -2003,8 +2131,10 @@ impl HostHeap {
         b.dirty.extend(todo.map(|(i, _)| i));
         BACKLOG[0].store(b.dirty.len() as u64, Ordering::Relaxed);
         BACKLOG[1].store(b.record_pending.len() as u64, Ordering::Relaxed);
-        b.full.1 |= made_any && changed || b.loose && frame >= b.full.0 + LOOSE_FRAMES;
-        let remake = b.full.1 && b.full.0 != frame || cfg!(test);
+        b.full.1 |= made_any && changed
+            || b.loose && frame >= b.full.0 + LOOSE_FRAMES
+            || b.lacking.len() > LACKING_MOST;
+        let remake = b.full.1 && b.full.0 != frame || in_test();
         if !made_any && (!b.full.1 || !remake) && let Some(plan) = &b.plan {
             return Some(plan.clone());
         }
@@ -2017,6 +2147,8 @@ impl HostHeap {
                 bounces: plan.bounces.clone(),
                 fresh,
                 fresh_reads,
+                extra_reads: b.lacking.reads.clone(),
+                extra_bounces: b.lacking.bounces.clone(),
                 copied_in: AtomicU64::new(0),
                 _retained: plan._retained.clone(),
                 _extra: b.extra.clone(),
@@ -2027,6 +2159,7 @@ impl HostHeap {
         b.full = (frame, false);
         b.loose = false;
         b.extra.clear();
+        b.lacking.clear();
         let t_full = std::time::Instant::now();
         let (mut reads, mut writes, mut bounces, mut retained) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -2046,6 +2179,8 @@ impl HostHeap {
             bounces: Arc::new(bounces),
             fresh,
             fresh_reads,
+            extra_reads: Arc::default(),
+            extra_bounces: Arc::default(),
             copied_in: AtomicU64::new(0),
             _retained: Arc::new(retained),
             _extra: Vec::new(),
@@ -3929,6 +4064,102 @@ void main(uint3 id : SV_DispatchThreadID) {
             "only the written slot is made again"
         );
         assert_ne!(host_heap.made.lock().unwrap()[1], 0);
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(title_heap), 0);
+    }
+
+    /// In the game: a slot that comes to read memory outside the plan, or
+    /// constants that are elsewhere, does not build the whole plan again;
+    /// what it reads is brought up to date with the plan from then on, and
+    /// is in it once it is built again in its turn.
+    #[test]
+    fn what_a_plan_lacks_is_kept_beside_it() {
+        if host().is_none() || !plan_extra() {
+            return;
+        }
+        struct InGame;
+        impl Drop for InGame {
+            fn drop(&mut self) {
+                AS_IN_GAME.set(false);
+            }
+        }
+        AS_IN_GAME.set(true);
+        let _in_game = InGame;
+        let (title_heap, base) = make_shader_heap(16);
+        let mem = crate::resource::Memory::zeroed(1 << 20, 64 << 10).unwrap();
+        let cbv = |at: u64, slot: u64| {
+            create_cbv(
+                std::ptr::null(),
+                &[at as u32, (at >> 32) as u32, 256, 0],
+                base + slot * 32,
+            );
+        };
+        let at = mem.address();
+        let host_heap = heap(title_heap).host_arc().unwrap();
+        cbv(at, 0);
+        cbv(at + 0x30, 1);
+        let whole = host_heap.bindless_plan().unwrap();
+        assert_eq!((whole.reads.len(), whole.bounces.len()), (1, 1));
+        assert!(whole.extra_reads.is_empty() && whole.extra_bounces.is_empty());
+        let slice = whole.bounces[0].0;
+
+        // A read far from the plan's, and constants that moved.
+        cbv(at + (512 << 10), 2);
+        cbv(at + 0x1030, 1);
+        let plan = host_heap.bindless_plan().unwrap();
+        assert!(Arc::ptr_eq(&plan.reads, &whole.reads) && Arc::ptr_eq(&plan.bounces, &whole.bounces));
+        let far = (at as usize + (512 << 10), 256);
+        assert_eq!(plan.extra_reads.iter().map(|r| (r.1, r.2)).collect::<Vec<_>>(), [far]);
+        assert_eq!(*plan.extra_bounces, [(slice, at + 0x1030, 256)]);
+        // In this submission as new, ...
+        assert_eq!(plan.fresh_reads.iter().map(|r| (r.1, r.2)).collect::<Vec<_>>(), [far]);
+        assert_eq!(plan.fresh, [(slice, at + 0x1030, 256)]);
+        // ... and in the frames to come with the plan's, the old place of
+        // the constants left out.
+        let (planned, extra) = plan.all_bounces();
+        assert!(planned.is_empty());
+        assert_eq!(*extra, [(slice, at + 0x1030, 256)]);
+        // SAFETY: inside the memory.
+        unsafe {
+            ((at + 0x30) as *mut u32).write(1);
+            ((at + 0x1030) as *mut u32).write(2);
+            ((at + 0x2030) as *mut u32).write(3);
+        }
+        copy_lists(&[&planned, extra]);
+        // SAFETY: the slice, which nothing on the host GPU reads.
+        let held = || unsafe { (slice as *const u32).read_volatile() };
+        assert_eq!(held(), 2);
+
+        // Moved again, and the same read by another slot: one of each.
+        cbv(at + 0x2030, 1);
+        cbv(at + (512 << 10), 3);
+        let plan = host_heap.bindless_plan().unwrap();
+        assert!(Arc::ptr_eq(&plan.reads, &whole.reads));
+        assert_eq!(plan.extra_reads.len(), 1);
+        let (planned, extra) = plan.all_bounces();
+        copy_lists(&[&planned, extra]);
+        assert_eq!((extra.len(), held()), (1, 3));
+
+        // Built again in its turn: all in it, nothing beside it.
+        for _ in 0..LOOSE_FRAMES {
+            crate::queue::pass_frame();
+        }
+        cbv(at, 4);
+        let plan = host_heap.bindless_plan().unwrap();
+        assert!(!Arc::ptr_eq(&plan.reads, &whole.reads));
+        assert!(plan.extra_reads.is_empty() && plan.extra_bounces.is_empty());
+        assert_eq!(plan.reads.len(), 2);
+        assert_eq!(*plan.bounces, [(slice, at + 0x2030, 256)]);
+
+        // Too much beside it is a plan of its own.
+        let mut lacking = Lacking::default();
+        for i in 0..=LACKING_MOST {
+            lacking.bounce((i * 256, 0x1000, 16));
+            lacking.bounce((i * 256, 0x2000, 16));
+        }
+        assert!(lacking.len() > LACKING_MOST && lacking.len() == LACKING_MOST + 1);
+        assert!(lacking.bounces.iter().all(|b| b.1 == 0x2000));
 
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(title_heap), 0);
