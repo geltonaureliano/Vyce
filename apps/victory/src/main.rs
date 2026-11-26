@@ -112,6 +112,19 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// Translate shader containers into the shader cache ahead of a run, and
+    /// make the compute pipelines a file lists (for a new driver or build).
+    Warm {
+        /// Folders or files of containers (`.dxbc`).
+        paths: Vec<PathBuf>,
+        /// A file with the 16-digit hashes of the compute programs to make
+        /// pipelines of (any text around them is skipped).
+        #[arg(long)]
+        pipelines: Option<PathBuf>,
+        /// Worker threads (default: all logical cores but two).
+        #[arg(long)]
+        jobs: Option<usize>,
+    },
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -177,8 +190,62 @@ fn main() -> Result<()> {
             };
             run::run(&exe, unimplemented, strict, execute, console)
         }
+        #[cfg(windows)]
+        Command::Warm { paths, pipelines, jobs } => warm(&paths, pipelines.as_deref(), jobs),
+        #[cfg(not(windows))]
+        Command::Warm { .. } => anyhow::bail!("only on Windows"),
         Command::Config => show_config(),
     }
+}
+
+/// The caches of a run, filled without one.
+#[cfg(windows)]
+fn warm(paths: &[PathBuf], pipelines: Option<&std::path::Path>, jobs: Option<usize>) -> Result<()> {
+    let cfg = victory_core::Config::load()?;
+    victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    let mut containers = Vec::new();
+    for root in paths {
+        for entry in walkdir::WalkDir::new(root).sort_by_file_name().into_iter().filter_map(Result::ok) {
+            if entry.file_type().is_file() && entry.path().extension().is_some_and(|e| e == "dxbc") {
+                containers.push(std::fs::read(entry.path())?);
+            }
+        }
+    }
+    let text = pipelines.map(std::fs::read_to_string).transpose()?.unwrap_or_default();
+    let wanted: std::collections::HashSet<&str> = text
+        .split(|c: char| !c.is_ascii_hexdigit())
+        .filter(|w| w.len() == 16)
+        .collect();
+    let threads = jobs.unwrap_or_else(|| {
+        std::thread::available_parallelism().map_or(4, |n| n.get().saturating_sub(2).max(1))
+    });
+    println!(
+        "{} containers, {} compute pipelines wanted, {threads} threads",
+        containers.len(),
+        wanted.len()
+    );
+    let started = std::time::Instant::now();
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let warmed = victory_hle::modules::d3d12x::warm(
+        &containers,
+        |hash| wanted.contains(hash),
+        threads,
+        |_, of| {
+            let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n % 250 == 0 {
+                println!("{n} of {of}, {:.0} s", started.elapsed().as_secs_f64());
+            }
+        },
+    );
+    println!(
+        "{} translated, {} refused, {} pipelines made, {} refused by the host, {:.0} s",
+        warmed.translated,
+        warmed.refused,
+        warmed.pipelines,
+        warmed.failed,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 /// `MIN-MAX` lanes per wave, or one size `N`.

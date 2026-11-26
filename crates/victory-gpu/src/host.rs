@@ -504,6 +504,18 @@ impl Host {
         }
     }
 
+    /// Whether the host's buffer descriptors only read right through accesses
+    /// of their own kind ([`victory_shader::emit::Target::exact_views`]):
+    /// NVIDIA's. `VICTORY_EXACT_VIEWS=0` (or `1`) says otherwise, to compare.
+    pub(crate) fn exact_views(&self) -> bool {
+        static EXACT: OnceLock<bool> = OnceLock::new();
+        *EXACT.get_or_init(|| match std::env::var("VICTORY_EXACT_VIEWS").as_deref() {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => self.driver().is_some_and(|d| d.starts_with("10de ")),
+        })
+    }
+
     /// The most views a shader-visible heap of this host holds, if fewer than
     /// shaders are made for (NVIDIA: 1,000,000).
     fn most_views(&self) -> u32 {
@@ -1167,13 +1179,18 @@ impl Host {
                 victory_shader::emit::Target {
                     lanes_min: options.WaveLaneCountMin,
                     lanes_max: options.WaveLaneCountMax,
+                    exact_views: self.exact_views(),
                 }
             } else {
-                victory_shader::emit::Target::ANY
+                victory_shader::emit::Target {
+                    exact_views: self.exact_views(),
+                    ..victory_shader::emit::Target::ANY
+                }
             };
             tracing::info!(
                 lanes_min = target.lanes_min,
                 lanes_max = target.lanes_max,
+                exact_views = target.exact_views,
                 "host wave sizes"
             );
             if !target.runs(64) {
@@ -1966,6 +1983,20 @@ impl Host {
             handle.ptr += (slot * self.rtv_size) as usize;
             self.device
                 .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
+            handle
+        }
+    }
+
+    /// A null render target view of description `desc`, valid until it is
+    /// recorded: it holds its place among a draw's targets.
+    pub(crate) fn null_rtv(&self, desc: &D3D12_RENDER_TARGET_VIEW_DESC) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        // SAFETY: a slot of our heap; a null view of a format and dimension.
+        unsafe {
+            let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
+            handle.ptr += (slot * self.rtv_size) as usize;
+            self.device
+                .CreateRenderTargetView(None::<&ID3D12Resource>, Some(desc), handle);
             handle
         }
     }

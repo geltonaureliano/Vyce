@@ -15,6 +15,16 @@ param(
     [ValidateRange(0, 1048576)]
     [int]$ShaderLoopLimit = 0,
 
+    # The picture size the title renders for (its scene is 1/1.5 of it). 'keep' leaves its settings file alone.
+    [ValidatePattern('^(keep|\d{3,4}x\d{3,4})$')]
+    [string]$OutputSize = '1920x1080',
+
+    # 'light' turns off what costs most on a PC card, 'keep' changes nothing, 'original' restores the title's file.
+    [ValidateSet('light', 'keep', 'original')]
+    [string]$TitleSettings = 'light',
+
+    [string[]]$TitleArguments = @(),
+
     [switch]$NoDebugWindow
 )
 
@@ -64,6 +74,100 @@ if ($Action -eq 'Check') {
     if (-not (Test-Path -LiteralPath $config -PathType Leaf)) { Write-Warning 'Local victory.toml is missing.' }
     if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { Write-Host 'Selected build is not compiled yet.' }
     return
+}
+
+# The title's own settings file (plain XML). The first copy of it is kept beside it.
+function Find-TitleSettings {
+    $pattern = Join-Path $data '*\storage\settings\settings.xml'
+    Get-ChildItem -Path $pattern -File -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+}
+
+function Read-TitleSettings([string]$Path) {
+    $document = New-Object System.Xml.XmlDocument
+    $document.PreserveWhitespace = $true
+    $document.Load($Path)
+    $document
+}
+
+function Write-TitleSettings([string]$Path, [System.Xml.XmlDocument]$Document) {
+    $writer = [IO.StreamWriter]::new($Path, $false, [Text.UTF8Encoding]::new($false))
+    try { $Document.Save($writer) } finally { $writer.Dispose() }
+}
+
+# One settings file per console: the title writes its card's name into it.
+function Switch-TitleConsole([string]$Path, [string]$Console) {
+    $card = if ($Console -eq 'series-s') { 'Xbox Series S' } else { 'Xbox Series X' }
+    $current = (Read-TitleSettings $Path).DocumentElement.SelectSingleNode('videoCardDescription')
+    if ($null -eq $current -or $current.InnerText -eq $card) { return $true }
+    $folder = Split-Path -Parent $Path
+    Move-Item -LiteralPath $Path -Destination (Join-Path $folder "settings.$($current.InnerText).xml") -Force
+    $wanted = Join-Path $folder "settings.$card.xml"
+    if (-not (Test-Path -LiteralPath $wanted -PathType Leaf)) { return $false }
+    Copy-Item -LiteralPath $wanted -Destination $Path
+    $true
+}
+
+function Update-TitleSettings {
+    $file = Find-TitleSettings
+    if (-not $file) {
+        Write-Host 'Title settings: none yet (the title writes them on its first start).'
+        return
+    }
+    try {
+        if (-not (Switch-TitleConsole $file $ConsoleProfile)) {
+            Write-Host "Title settings: none for $ConsoleProfile yet."
+            return
+        }
+        $card = if ($ConsoleProfile -eq 'series-s') { 'Xbox Series S' } else { 'Xbox Series X' }
+        $original = Join-Path (Split-Path -Parent $file) "settings.$card.original.xml"
+        if (-not (Test-Path -LiteralPath $original -PathType Leaf)) { Copy-Item -LiteralPath $file -Destination $original }
+        if ($TitleSettings -eq 'original') {
+            Copy-Item -LiteralPath $original -Destination $file -Force
+        }
+        $values = [ordered]@{}
+        if ($TitleSettings -ne 'original' -and $OutputSize -ne 'keep') {
+            $width, $height = $OutputSize -split 'x'
+            $values['video/resolutionFullscreen/width'] = $width
+            $values['video/resolutionFullscreen/height'] = $height
+        }
+        if ($TitleSettings -eq 'light') {
+            # One host queue runs everything: the title's other queues only add waits.
+            $values['advancedGraphics/asyncComputeEnabled'] = 'false'
+            $values['advancedGraphics/transferQueuesEnabled'] = 'false'
+            # A smear at low frame rates.
+            $values['advancedGraphics/motionBlur'] = 'false'
+            # Fewer draws.
+            $values['advancedGraphics/lodScale'] = '0.700000'
+            $values['advancedGraphics/grassLod'] = '0.500000'
+            $values['advancedGraphics/smallCullThreshold'] = '2.000000'
+            $values['advancedGraphics/vehicleHDCount'] = '1'
+            $values['advancedGraphics/ssroSampleCount'] = '1'
+            $values['advancedGraphics/waterReflectionResX'] = '256'
+            $values['advancedGraphics/waterReflectionResY'] = '128'
+            $values['advancedGraphics/waterReflectionSSR'] = 'false'
+            $values['advancedGraphics/lensFlaresScreenResDivExponent'] = '3'
+        }
+        if ($values.Count -gt 0) {
+            $document = Read-TitleSettings $file
+            $changed = @()
+            foreach ($key in $values.Keys) {
+                $node = $document.DocumentElement.SelectSingleNode($key)
+                if ($null -eq $node -or -not $node.HasAttribute('value')) {
+                    Write-Warning "Title settings: no '$key' in the file."
+                } elseif ($node.GetAttribute('value') -ne $values[$key]) {
+                    $node.SetAttribute('value', $values[$key])
+                    $changed += "$(Split-Path -Leaf $key)=$($values[$key])"
+                }
+            }
+            if ($changed) {
+                Write-TitleSettings $file $document
+                Write-Host "Title settings changed: $($changed -join ', ')"
+            }
+        }
+        Copy-Item -LiteralPath $file -Destination (Join-Path $logDir "$stamp.settings.xml")
+    } catch {
+        Write-Warning "Title settings left as they are: $_"
+    }
 }
 
 if ($Action -eq 'Build' -and $missing) { throw ("Missing portable build dependencies: " + ($missing -join ', ')) }
@@ -123,6 +227,11 @@ try {
     }
 
     $stamp = (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss-fff') + "-$PID"
+    if (Get-Process -Name victory -ErrorAction SilentlyContinue) {
+        Write-Warning 'Another victory.exe is running: the title settings are left as they are.'
+    } else {
+        Update-TitleSettings
+    }
     $stdout = Join-Path $logDir "$stamp.log"
     $stderr = Join-Path $logDir "$stamp.err.log"
     Write-Host "Logs: $stdout and $stderr"
@@ -135,6 +244,7 @@ try {
         NoNewWindow = $true
         PassThru = $true
     }
+    if ($TitleArguments) { $launch.ArgumentList += @('--') + $TitleArguments }
     $process = Start-Process @launch
     if ($showMonitor) {
         try {
