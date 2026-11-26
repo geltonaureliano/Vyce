@@ -238,6 +238,12 @@ fn root_view(list: &HostList, address: u64, kind: u8) -> Option<u64> {
         }
         shadow.refresh(list, address, len);
         if kind == 2 {
+            // A write that is not declared does not come back from a card:
+            // up to the end of the title's buffer, or of the card.
+            if shadow.is_card() {
+                let end = crate::shadow::buffer_end(address).unwrap_or(u64::MAX);
+                len = len.max(shadow.left(address).min(end - address));
+            }
             shadow.gpu_writes(list, address, len);
         }
         return Some(gpu);
@@ -653,7 +659,10 @@ impl State {
     /// For shaders that reach memory by its address: the memory the roots
     /// lead to made reachable, and the bound heap's first slot of it (a
     /// heap of ours bound if the title bound none).
-    fn memory(&mut self, list: &HostList, compute: bool) -> Option<u32> {
+    fn memory(&mut self, list: &HostList, compute: bool, writes: bool) -> Option<u32> {
+        if writes {
+            crate::shadow::declare_cards(list);
+        }
         // How much a root view or a pointer leads to is not known.
         const REACH: u64 = 1 << 20;
         for root in self.roots_ref(compute) {
@@ -882,7 +891,8 @@ impl State {
         });
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
-        let memory = by_address.then(|| self.memory(list, compute)).flatten();
+        let writes = by_address && p.stages.iter().any(|s| s.translated().writes_memory);
+        let memory = by_address.then(|| self.memory(list, compute, writes)).flatten();
         if by_address && memory.is_none() {
             return no("no view of memory");
         }
@@ -1461,8 +1471,9 @@ impl State {
                     }
                     Some(view) => {
                         host.make_at(index, &view);
-                        if let Some(u) = used {
-                            readable(list, u, &view);
+                        match used {
+                            Some(u) => readable(list, u, &view),
+                            None => writable(list, &view),
                         }
                     }
                     None => {
@@ -2094,6 +2105,20 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
         }
         _ => {}
+    }
+}
+
+/// A table's entry that no used-resource entry names: a shader that indexes
+/// past those may write through it, and what it writes to a card only comes
+/// back if it is declared.
+fn writable(list: &HostList, view: &View) {
+    if matches!(view, View::Unordered(..) | View::Placed(true, ..))
+        && let Some((address, len)) = crate::descriptor::host::buffer_range(view)
+        && len > 0
+        && let crate::card::Held::By(shadow) = crate::card::held(address, address.saturating_add(len))
+    {
+        shadow.refresh(list, address, len);
+        shadow.gpu_writes(list, address, len);
     }
 }
 

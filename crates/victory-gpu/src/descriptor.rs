@@ -12,6 +12,8 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+pub(crate) mod strides;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -189,6 +191,12 @@ impl Drop for Heap {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
+        drop(heaps);
+        if self.memory.is_none()
+            && let Some(step) = increment(self.desc.kind)
+        {
+            crate::card::descriptors_gone(self.start, self.start + u64::from(step) * u64::from(self.desc.count.max(1)));
+        }
     }
 }
 
@@ -676,6 +684,8 @@ pub(crate) extern "system" fn create_heap(
         if placement.address.checked_add(size).is_none() {
             return E_INVALIDARG;
         }
+        #[cfg(windows)]
+        crate::card::descriptors(placement.address, placement.address + size);
         (placement.address, None)
     } else {
         match Memory::zeroed(size, 64) {

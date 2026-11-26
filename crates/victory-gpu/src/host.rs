@@ -58,6 +58,7 @@ struct InFlight {
 struct Finish {
     lists: Vec<std::sync::Arc<HostList>>,
     back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    cards: Option<crate::card::Plan>,
 }
 // SAFETY: host lists are free-threaded objects, run by one thread once
 // closed; the rest is ours and locked.
@@ -106,12 +107,15 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
-    /// Device-local VRAM card buffer engine (Wave64 GPU page hashing), lazily initialized.
-    card: OnceLock<Option<Mutex<crate::card::CardEngine>>>,
+    /// What looks after title memory on the card ([`crate::card`]), made with
+    /// the first such memory.
+    card: OnceLock<Option<Mutex<crate::card::Engine>>>,
     /// Immutable source for resetting each device-local indirect budget.
     indirect_zero: OnceLock<Option<ID3D12Resource>>,
     /// The host GPU's time around submissions, when asked for.
     clock: OnceLock<Option<crate::telemetry::Clock>>,
+    /// What the tables of strides and counts are sent with.
+    tables: Mutex<crate::descriptor::strides::TableSync>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -481,6 +485,7 @@ impl Host {
                 card: OnceLock::new(),
                 indirect_zero: OnceLock::new(),
                 clock: OnceLock::new(),
+                tables: Mutex::default(),
             })
         }
     }
@@ -537,22 +542,36 @@ impl Host {
         }
     }
 
-    fn card_engine(&self) -> Option<&Mutex<crate::card::CardEngine>> {
+    fn card_engine(&self) -> Option<&Mutex<crate::card::Engine>> {
         self.card
-            .get_or_init(|| match crate::card::CardEngine::new(self) {
-                Ok(engine) => {
-                    tracing::info!("VRAM card buffer engine ready (Wave64 GPU hashing)");
-                    Some(Mutex::new(engine))
-                }
+            .get_or_init(|| match crate::card::Engine::new(self) {
+                Ok(engine) => Some(Mutex::new(engine)),
                 Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "VRAM card buffer engine unavailable; falling back to host RAM"
-                    );
+                    tracing::warn!(error = %e, "no title memory on the card: what looks after it was not made");
                     None
                 }
             })
             .as_ref()
+    }
+
+    /// Notes what submission `submission`, whose shaders are known to write
+    /// `writes` (cards and title addresses, from and to), runs for cards.
+    fn prepare_cards(
+        &self,
+        reads: &[(std::sync::Arc<crate::card::Card>, usize, usize)],
+        writes: &[(std::sync::Arc<crate::card::Card>, usize, usize)],
+        title: bool,
+        submission: u64,
+    ) -> crate::card::Prepared {
+        let live = crate::card::live(&self.device);
+        if live.is_empty() {
+            return Default::default();
+        }
+        let Some(engine) = self.card_engine() else {
+            return Default::default();
+        };
+        let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+        engine.prepare(self, &live, reads, writes, title, submission, FINISHED.load(Ordering::Acquire))
     }
 
     pub(crate) fn card_ready(&self) -> bool {
@@ -1043,6 +1062,9 @@ enum Step {
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// Shaders write a range (address, bytes) of title memory in place that
+    /// is a card's, or may be when the list runs ([`crate::card::concerns`]).
+    DirectWrite(usize, usize),
     /// Brings a texture's staging buffer up to date and, when dirty, copies
     /// it into the host texture on the list's prelude: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
@@ -1256,10 +1278,10 @@ impl Host {
             if done.timed && let Some(clock) = self.telemetry_clock() {
                 clock.ran();
             }
-            if let Some(Finish { lists, back }) = done.finish.take() {
+            if let Some(Finish { lists, back, cards }) = done.finish.take() {
                 {
                     let runs: Vec<&HostList> = lists.iter().map(|l| &**l).collect();
-                    self.finish_submission(&runs, back);
+                    self.finish_submission(&runs, back, cards);
                 }
                 // Before its lists go: a list that goes with it waits for
                 // this fence, with `submitted` held here.
@@ -1411,6 +1433,11 @@ impl Host {
             self.prewarm(runs);
         }
         self.drain_in_flight_locked();
+        // With nothing of ours running and title memory holding what shaders
+        // wrote: title buffers onto cards, or off them.
+        if keep.is_some() {
+            crate::card::settle(self);
+        }
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -1437,55 +1464,66 @@ impl Host {
         }
         // The textures live (in `early`) until the submission is done.
         let first = early.record(self);
-        // Deduplicate GPU write ranges once before execution so VRAM card
-        // shadows get pre-uploaded / Wave64-hashed in the same GPU wait.
-        let mut card_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> =
-            Vec::new();
+        // After everything that writes descriptors for this submission.
+        let tables = if runs.is_empty() {
+            None
+        } else {
+            let finished = FINISHED.load(Ordering::Acquire);
+            crate::descriptor::strides::sync(self, &self.tables, this_submission, finished)
+        };
+        // What shaders write, each range once; what they read of cards of
+        // title buffers; what they write in place of memory that is a card's.
+        let mut card_writes: Vec<(std::sync::Arc<crate::card::Card>, usize, usize)> = Vec::new();
+        let mut card_reads: Vec<(std::sync::Arc<crate::card::Card>, usize, usize)> = Vec::new();
+        let mut in_place: Vec<(usize, usize)> = Vec::new();
         let mut cpu_back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-        // A copy is either a card's or not, so one set of ranges serves both.
-        let mut declared = std::collections::HashSet::new();
-        for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && declared.insert((std::sync::Arc::as_ptr(shadow) as usize, *address, *len))
-                {
-                    let target = if shadow.is_card() {
-                        &mut card_writes
-                    } else {
-                        &mut cpu_back
-                    };
-                    target.push((shadow.clone(), *address, *len));
+        {
+            // A copy is either a card's or not, so one set of ranges serves both.
+            let mut declared = std::collections::HashSet::new();
+            let mut note = |shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize| {
+                if !declared.insert((std::sync::Arc::as_ptr(shadow) as usize, address, len)) {
+                    return;
+                }
+                match shadow.card() {
+                    Some(card) => card_writes.push((card.clone(), address, address + len)),
+                    None => cpu_back.push((shadow.clone(), address, len)),
+                }
+            };
+            for list in runs {
+                for step in &list.deferred().copies {
+                    match step {
+                        Step::GpuWrite(shadow, address, len) => note(shadow, *address, *len),
+                        Step::DirectWrite(address, len) => in_place.push((*address, *len)),
+                        Step::Refresh(shadow, address, len) => {
+                            if let Some(card) = shadow.card().filter(|c| c.is_buffer()) {
+                                card_reads.push((card.clone(), *address, *address + *len));
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
-        }
-        for (shadow, address, len) in batch.bindless_writes.drain(..) {
-            if declared.insert((std::sync::Arc::as_ptr(&shadow) as usize, address, len)) {
-                let target = if shadow.is_card() {
-                    &mut card_writes
-                } else {
-                    &mut cpu_back
-                };
-                target.push((shadow, address, len));
+            for (shadow, address, len) in batch.bindless_writes.drain(..) {
+                note(&shadow, address, len);
             }
         }
         let recording = crate::telemetry::start();
-        let (card_before, card_plan, mut card_after) =
-            if self.card.get().and_then(|o| o.as_ref()).is_some() || !card_writes.is_empty() {
-                if let Some(engine_lock) = self.card_engine() {
-                    let mut engine = engine_lock.lock().unwrap_or_else(|e| e.into_inner());
-                    let (before, plan) = engine.record_before(self, &card_writes);
-                    let after = if plan.has_writes() {
-                        engine.record_after(self, &plan)
-                    } else {
-                        None
-                    };
-                    (before, Some(plan), after)
-                } else {
-                    (None, None, None)
-                }
-            } else {
-                (None, None, None)
-            };
+        // Lists of our own (a present) read no title memory.
+        let cards = if keep.is_some() || !card_writes.is_empty() {
+            self.prepare_cards(&card_reads, &card_writes, keep.is_some(), this_submission)
+        } else {
+            Default::default()
+        };
+        // Looked at before the next submission, which comes after this one
+        // has run.
+        for (address, len) in in_place {
+            crate::card::wrote_in_place(address, len);
+        }
+        let crate::card::Prepared {
+            before: card_before,
+            after: mut card_after,
+            plan: mut card_plan,
+        } = cards;
         crate::telemetry::stop(Count::Card, recording);
         let prepared = std::time::Instant::now();
         // Each run (prelude and list) is a submission of its own: the host
@@ -1503,11 +1541,8 @@ impl Host {
         let each = timing();
         #[cfg(not(feature = "diagnostics"))]
         let each = false;
-        let can_async = !cfg!(test)
-            && keep.is_some()
-            && !each
-            && async_submit()
-            && card_writes.is_empty();
+        let card_waits = card_plan.is_some() && !crate::card::unwaited();
+        let can_async = !cfg!(test) && keep.is_some() && !each && async_submit() && !card_waits;
         #[cfg(feature = "diagnostics")]
         let works = !no_work();
         #[cfg(not(feature = "diagnostics"))]
@@ -1516,7 +1551,7 @@ impl Host {
         let clock = if works && !each && !groups.is_empty() { self.telemetry_clock() } else { None };
         if crate::telemetry::on() {
             crate::telemetry::add(Count::Submissions, 1);
-            if keep.is_some() && async_submit() && !card_writes.is_empty() {
+            if keep.is_some() && async_submit() && card_waits {
                 crate::telemetry::add(Count::HeldByCard, 1);
             }
         }
@@ -1525,6 +1560,10 @@ impl Host {
             // SAFETY: a closed list, not running: the submission before this
             // one was waited for.
             unsafe { self.queue.ExecuteCommandLists(&[Some(clock.begin())]) };
+        }
+        if let Some(tables) = tables {
+            // SAFETY: a closed list.
+            unsafe { self.queue.ExecuteCommandLists(&[Some(tables)]) };
         }
         if let Some(first) = first {
             // SAFETY: a closed list.
@@ -1623,10 +1662,13 @@ impl Host {
             }
         }
         let _ = &firsts;
+        if !card_after_ran
+            && let Some(plan) = card_plan.take()
+            && let Some(engine) = self.card_engine()
+        {
+            engine.lock().unwrap_or_else(|e| e.into_inner()).abandon(plan);
+        }
         if async_signalled {
-            if let Some(plan) = card_plan {
-                plan.clear_pending();
-            }
             SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
             self.in_flight
                 .lock()
@@ -1640,6 +1682,7 @@ impl Host {
                     finish: Some(Finish {
                         lists: keep.map(<[_]>::to_vec).unwrap_or_default(),
                         back: cpu_back,
+                        cards: card_plan,
                     }),
                 });
             return;
@@ -1684,22 +1727,7 @@ impl Host {
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
-        let copying = std::time::Instant::now();
-        if let Some(plan) = card_plan {
-            if card_after_ran {
-                if let Some(engine_lock) = self.card_engine() {
-                    let mut engine = engine_lock.lock().unwrap_or_else(|e| e.into_inner());
-                    let written = engine.finish_back(self, plan, &mut submitted);
-                    COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
-                } else {
-                    plan.clear_pending();
-                }
-            } else {
-                plan.clear_pending();
-            }
-        }
-        COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
-        self.finish_submission(runs, cpu_back);
+        self.finish_submission(runs, cpu_back, card_plan);
         self.log_messages();
     }
 
@@ -1710,8 +1738,16 @@ impl Host {
         &self,
         runs: &[&HostList],
         back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+        cards: Option<crate::card::Plan>,
     ) {
         let copying = std::time::Instant::now();
+        if let Some(plan) = cards
+            && let Some(engine) = self.card_engine()
+        {
+            let stored = engine.lock().unwrap_or_else(|e| e.into_inner()).finish(self, plan);
+            COPY_BACK[1].fetch_add(stored as u64, Ordering::Relaxed);
+            crate::telemetry::add(Count::CardReturned, stored as u64);
+        }
         if back.len() <= 1 {
             for (shadow, address, len) in &back {
                 let written = shadow.copy_back(*address, *len);
@@ -2487,6 +2523,15 @@ impl HostList {
         }
     }
 
+    /// Shaders of the list write `[address, address + len)` of title memory
+    /// in place ([`Step::DirectWrite`]).
+    pub(crate) fn defer_direct_write(&self, address: usize, len: usize) {
+        let mut deferred = self.deferred();
+        if deferred.gpu_written.insert((0, address, len)) {
+            deferred.copies.push(Step::DirectWrite(address, len));
+        }
+    }
+
     /// A wait for a memory value.
     pub(crate) fn note_wait(&self, wait: crate::memwait::Wait) {
         let mut deferred = self.deferred();
@@ -2959,6 +3004,9 @@ impl HostList {
                         add(C::RunUs, started.elapsed().as_micros() as u64);
                     }
                 }
+                // Found on the card itself (`Host::prepare_cards`).
+                Step::GpuWrite(shadow, ..) if shadow.is_card() => {}
+                Step::DirectWrite(..) => {}
                 Step::GpuWrite(shadow, address, len) => {
                     // The shaders start from the title's data.
                     batch.flush();
@@ -3018,6 +3066,9 @@ struct Batch {
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        if shadow.is_card() {
+            return;
+        }
         let end = address + len;
         if shadow.is_sparse() {
             // It stands for far more memory than a list reads.
@@ -3114,6 +3165,9 @@ impl Batch {
                 });
                 PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
                 PREPARING[1].fetch_add(copied.into_inner(), Ordering::Relaxed);
+            }
+            if writes {
+                self.bindless_writes.extend(plan.card_writes.iter().cloned());
             }
             // shortcut: what shaders write through directly indexed slots into
             // copied memory stays in the copy (title memory used in place
@@ -3445,7 +3499,7 @@ unsafe extern "C" {
 /// so `safe_copy` can copy mapped memory in pure user mode without kernel
 /// syscalls and recover cleanly if a page is unmapped.
 #[cfg(target_arch = "x86_64")]
-fn ensure_safe_copy_veh() {
+pub(crate) fn ensure_safe_copy_veh() {
     use windows_sys::Win32::Foundation::{
         EXCEPTION_ACCESS_VIOLATION, EXCEPTION_IN_PAGE_ERROR, NTSTATUS,
     };
@@ -3476,6 +3530,19 @@ fn ensure_safe_copy_veh() {
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
             ctx.Rip = (&raw const victory_safe_copy_fault) as u64;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        // The same for the merge of what shaders wrote.
+        if let Some(out) = crate::card::fault_at(rip) {
+            const WRITE: usize = 1;
+            if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+                && r.NumberParameters >= 2
+                && r.ExceptionInformation[0] == WRITE
+                && crate::watch::try_open_guarded(r.ExceptionInformation[1])
+            {
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            ctx.Rip = out as u64;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         EXCEPTION_CONTINUE_SEARCH
@@ -3870,6 +3937,21 @@ impl Meter {
         let count = |what| crate::telemetry::take(what) as f64 / frames;
         let time = |what| crate::telemetry::take(what) as f64 / 1e3 / frames;
         let prewarm_ms = PREWARM_US.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+        // Of cards: megabytes compared on the CPU, sent, compared on the
+        // GPU, that came back and that were stored; submissions, waits,
+        // faults and pages no list declared.
+        let cards = [
+            count(Count::CardScanned) / 1e6,
+            count(Count::CardUploaded) / 1e6,
+            count(Count::CardCompared) / 1e6,
+            count(Count::CardFetched) / 1e6,
+            count(Count::CardReturned) / 1e6,
+            count(Count::CardSubmissions),
+            count(Count::CardWaits),
+            count(Count::CardFaults),
+            count(Count::CardUndeclared),
+        ];
+        let stride_kb = count(Count::StrideBytes) / 1e3;
         if self.telemetry && [fps, ms, draws, gpu, cpu, back_ms, dropped].into_iter().all(f64::is_finite) {
             // Keep one complete sample together with respect to other stderr writers.
             // A closed or unavailable monitor output must not interrupt rendering.
@@ -3892,6 +3974,11 @@ impl Meter {
                  \"snapshot_ms\":{:.2},\"steps_ms\":{:.2},\"card_record_ms\":{:.2},\"submit_ms\":{:.2},\
                  \"prewarm_ms\":{prewarm_ms:.2},\"vram_mb\":{},\"vram_budget_mb\":{},\
                  \"shared_mb\":{},\"card_mb\":{},\
+                 \"card_scanned_mb\":{:.2},\"card_uploaded_mb\":{:.2},\"card_compared_mb\":{:.2},\
+                 \"card_fetched_mb\":{:.2},\"card_returned_mb\":{:.2},\
+                 \"card_submissions_per_frame\":{:.2},\"card_waits_per_frame\":{:.2},\
+                 \"card_faults_per_frame\":{:.2},\"card_undeclared_per_frame\":{:.2},\
+                 \"stride_kb\":{:.2},\
                  \"dropped_per_frame\":{dropped:.2},\"pipelines_building\":{}}}",
                 self.frames_total,
                 count(Count::Submissions),
@@ -3907,6 +3994,16 @@ impl Meter {
                 local.1 >> 20,
                 shared.0 >> 20,
                 crate::card::bytes() >> 20,
+                cards[0],
+                cards[1],
+                cards[2],
+                cards[3],
+                cards[4],
+                cards[5],
+                cards[6],
+                cards[7],
+                cards[8],
+                stride_kb,
                 crate::pipeline::making(),
             );
         }

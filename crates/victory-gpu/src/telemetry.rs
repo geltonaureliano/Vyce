@@ -39,9 +39,29 @@ pub(crate) enum Count {
     Gpu,
     /// The submissions timed so.
     GpuTimed,
+    /// Bytes of strides and counts sent to the tables shaders read
+    /// ([`crate::descriptor::strides`]).
+    StrideBytes,
+    /// Of cards ([`crate::card`]): bytes of title memory compared with their
+    /// side on the CPU, and of those sent to video memory.
+    CardScanned,
+    CardUploaded,
+    /// Bytes of video memory hashed and compared after submissions, bytes of
+    /// the pages that had changed, and of those stored into title memory.
+    CardCompared,
+    CardFetched,
+    CardReturned,
+    /// Submissions with such a compare, and compares run again and waited
+    /// for (more pages had changed than one run takes).
+    CardSubmissions,
+    CardWaits,
+    /// Writes of the title to guarded blocks.
+    CardFaults,
+    /// Pages shaders wrote that no list had declared.
+    CardUndeclared,
 }
 
-const COUNTS: usize = Count::GpuTimed as usize + 1;
+const COUNTS: usize = Count::CardUndeclared as usize + 1;
 static TOTALS: [AtomicU64; COUNTS] = [const { AtomicU64::new(0) }; COUNTS];
 
 pub(crate) fn add(what: Count, n: u64) {
@@ -51,6 +71,12 @@ pub(crate) fn add(what: Count, n: u64) {
 /// Takes what was counted since the last time.
 pub(crate) fn take(what: Count) -> u64 {
     TOTALS[what as usize].swap(0, Ordering::Relaxed)
+}
+
+/// What was counted since it was last taken.
+#[cfg(test)]
+pub(crate) fn total(what: Count) -> u64 {
+    TOTALS[what as usize].load(Ordering::Relaxed)
 }
 
 /// The time now, if measurements are on.

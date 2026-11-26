@@ -1,1268 +1,1023 @@
-//! Large title buffers resident in device-local VRAM (`D3D12_HEAP_TYPE_DEFAULT`)
-//! with GPU-side Wave64 64 KiB page hashing (`CARD_COMPARE`) for copy-back.
+//! Title memory in the host GPU's own memory ("cards").
 //!
-//! Instead of keeping large buffers (4–75+ MiB) in system RAM (`L0`) over PCIe
-//! and taking multi-megabyte CPU snapshots + CPU diffs every submission:
-//! - Shaders read and write `Shadow::buffer` directly in GDDR6 VRAM.
-//! - `CardState::staging` (`L0` WRITE_BACK, mapped as `Shadow::data`) receives
-//!   CPU title-memory updates and simultaneously serves as the exact
-//!   pre-submission snapshot (zero snapshot `memcpy` in `Shadow::writing`!).
-//! - Before a submission (`card_before`), only CPU-modified ranges are uploaded
-//!   via `CopyBufferRegion` and re-hashed on the GPU (if the buffer has hashes).
-//! - At the end of a submission (`card_after`), `CARD_COMPARE` dispatches one
-//!   64-thread workgroup per declared 64 KiB page in VRAM (64 coalesced
-//!   1024-byte bursts per page, 64x less sequential latency than 1 thread/page),
-//!   writing a 4-byte dirty flag per page to a small readback buffer.
-//! - After the fence (`card_back`), ONLY pages flagged dirty are copied from
-//!   VRAM to a readback buffer and merged into title memory + `staging`.
+//! The console's GPU and CPU share memory; here a shader's access to title
+//! memory crosses the bus, where a random read is 50 times and a write 100
+//! times as slow as in video memory (RTX 2070 SUPER, 2026-11-25). So some of
+//! the title's memory is on the card: every view, address and argument the
+//! host GPU gets in it is one of a buffer in video memory, and what either
+//! side writes is brought to the other around each submission:
+//!
+//! - What the title's threads wrote before a submission's call is in video
+//!   memory when its lists run. Which 64 KiB blocks they wrote is known by
+//!   guards ([`track`]) or the kernel's write watch; of those, the dwords
+//!   that differ from the card's side in system memory (`staging`, what the
+//!   GPU has) go up, whatever views the lists use. What they write while the
+//!   lists run arrives with the next submission.
+//! - What shaders wrote is in title memory before the submission's
+//!   bottom-of-pipe writes, read-backs and fences ([`engine`]): pages that
+//!   changed are found and fetched by the GPU, and of them the dwords that
+//!   differ from the card's side are stored ([`merge`]), nothing else.
+//! - CPU work of ours (title copies, fills, texture uploads, waits for
+//!   values) reads and writes title memory, before a submission's lists run
+//!   or after they did, when it is current.
+//!
+//! So a card's bytes, its side and title memory are the same between
+//! submissions, but for what the title wrote since. What makes it hold:
+//!
+//! 1. Every way the host GPU reaches a range goes through [`held`] first
+//!    (`shadow::find`, `find_reaching`, `for_view`): inside one card, it gets
+//!    the card. A range that meets a card and is not inside it is refused
+//!    the memory in place ([`find`]).
+//! 2. Which pages are looked at after a submission is what its lists declare
+//!    (`Shadow::gpu_writes`): unordered access views in tables (used or not:
+//!    shaders index past the used ones), root views up to the buffer's end,
+//!    query results, and the unordered access slots of heaps indexed
+//!    directly by shaders that may write. A write none of these told stays
+//!    in video memory, where later shaders see it (only dwords the title
+//!    changed are written over), and is put back by the next look at all of
+//!    the card ([`Card::sweep_due`]), which counts it.
+//! 3. One submission at a time is prepared, after the one before was
+//!    finished (`Host::execute_inner`), so the card's side does not change
+//!    while the GPU runs.
+//!
+//! `VICTORY_CARDS=0`: title memory stays where it was: in place, or copied.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Interface;
 
 use crate::host::Host;
+use crate::shadow::Shadow;
+use crate::telemetry::{Count, add};
 use crate::watch::PAGE;
 
-/// Wave64 / 64-thread-per-page 64 KiB hashing compute shader (`cs_5_1`).
-/// One workgroup (`SV_GroupID.x`) hashes one 64 KiB buffer-relative piece using
-/// 64 threads reading coalesced 1024-byte strides (64 iterations per page).
-const CARD_COMPARE_HLSL: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
-cbuffer Span : register(b0) {
-    uint first;    // first 64 KiB piece index
-    uint pad0;     // reserved (0)
-    uint size;     // buffer size in bytes (multiple of 65536)
-    uint pieces;   // number of pieces in this dispatch
-    uint out_at;   // byte offset in `differs` for gid.x == 0
-    uint compare;  // 0: store hashes; 1: compare only; 2: compare and store new hash
-};
-ByteAddressBuffer now : register(t0);
-RWByteAddressBuffer hashes : register(u0);
-RWByteAddressBuffer differs : register(u1);
+mod big;
+mod engine;
+mod merge;
+pub(crate) mod track;
+mod written;
 
-groupshared uint4 s_acc[64];
+pub(crate) use big::{concerns, note, registered, settle, unregistered};
+pub(crate) use engine::{Engine, Plan, Prepared};
+#[cfg(target_arch = "x86_64")]
+pub(crate) use merge::fault_at;
 
-uint4 hash_mix(uint4 a, uint4 b) {
-    uint4 m = (a ^ (b * uint4(0x27D4EB2Fu, 0x165667B1u, 0x9E3779B9u, 0x85EBCA6Bu)))
-            * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-    return m.yzwx ^ (m >> 15);
-}
+/// The unit title memory is watched in.
+const PIECE: usize = PAGE;
+/// The unit shader writes are found in: the kernel's page.
+const LEAF: usize = 4 << 10;
+/// Those of a piece.
+const LEAVES: usize = PIECE / LEAF;
 
-[RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
-    if (gid.x >= pieces) return;
-    uint piece = first + gid.x;
-    uint lo = piece * 65536u;
-    uint hi = min(lo + 65536u, size);
+/// Bytes a card's buffer goes on past its memory: a root view has no size,
+/// and a program reading past the end of what it was given stops the host
+/// GPU where the buffer ends.
+const TAIL: u64 = 1 << 20;
 
-    uint4 h = uint4(
-        0x9E3779B9u ^ (tid * 0x85EBCA6Bu),
-        0x85EBCA6Bu ^ (tid * 0xC2B2AE35u),
-        0xC2B2AE35u ^ (tid * 0x27D4EB2Fu),
-        0x27D4EB2Fu ^ (tid * 0x165667B1u)
-    );
-    [loop]
-    for (uint at = lo + tid * 16u; at < hi; at += 1024u) {
-        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
-    }
-    s_acc[tid] = h;
-    GroupMemoryBarrierWithGroupSync();
-
-    // Preserve the original 32, 16, 8, 4, 2, 1 reduction tree. In each
-    // stage each thread reads four disjoint slots and writes only its own.
-    // Keep the two intermediate digests in registers between levels.
-    if (tid < 16u) {
-        uint4 a = hash_mix(s_acc[tid], s_acc[tid + 32u]);
-        uint4 b = hash_mix(s_acc[tid + 16u], s_acc[tid + 48u]);
-        s_acc[tid] = hash_mix(a, b);
-    }
-    GroupMemoryBarrierWithGroupSync();
-
-    if (tid < 4u) {
-        uint4 a = hash_mix(s_acc[tid], s_acc[tid + 8u]);
-        uint4 b = hash_mix(s_acc[tid + 4u], s_acc[tid + 12u]);
-        s_acc[tid] = hash_mix(a, b);
-    }
-    GroupMemoryBarrierWithGroupSync();
-
-    if (tid == 0u) {
-        uint4 a = hash_mix(s_acc[0], s_acc[2]);
-        uint4 b = hash_mix(s_acc[1], s_acc[3]);
-        uint4 final_h = hash_mix(a, b);
-        if (compare != 0u) {
-            uint4 prev = hashes.Load4(piece * 16u);
-            differs.Store(out_at + gid.x * 4u, any(final_h != prev) ? 1u : 0u);
-            if (compare == 2u) {
-                hashes.Store4(piece * 16u, final_h);
-            }
-        } else {
-            hashes.Store4(piece * 16u, final_h);
-        }
-    }
-}
-"#;
-
-/// Bytes currently allocated in VRAM for card buffers (`[0]`) and their hash
-/// tables (`[1]`).
-static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
-
-/// Bytes of video memory the card buffers and their hash tables take.
-pub(crate) fn bytes() -> u64 {
-    CARD_BYTES.iter().map(|b| b.load(Ordering::Relaxed)).sum()
-}
-
-/// Card buffers with pending CPU→VRAM uploads (`dirty_up`).
-static DIRTY_CARDS: Mutex<Vec<Weak<CardState>>> = Mutex::new(Vec::new());
-
-/// Whether VRAM card buffers are enabled (`VICTORY_CARD_BUFFERS=0` disables).
+/// Whether cards are used (`VICTORY_CARDS=0` turns them off). Tests make
+/// theirs.
 pub(crate) fn enabled() -> bool {
-    if cfg!(test) {
-        return false;
-    }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").is_none_or(|v| v != "0"))
+    static ON: OnceLock<bool> = OnceLock::new();
+    !cfg!(test) && *ON.get_or_init(|| std::env::var_os("VICTORY_CARDS").is_none_or(|v| v != "0"))
 }
 
-/// `(min_bytes, max_total_bytes)` for card buffers:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (default 4 MiB) and
-/// `VICTORY_CARD_BUFFERS_MB` (default 2048 MiB).
+/// Whether the title's 32-bit GPU heap is a card (`VICTORY_CARD_HEAP=0`: in
+/// place as before).
+fn heap_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    enabled() && *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_HEAP").is_none_or(|v| v != "0"))
+}
+
+/// Whether big buffers the title made in its private memory are cards
+/// (`VICTORY_CARD_BUFFERS=0`: in place as before).
+fn buffers_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    enabled() && *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").is_none_or(|v| v != "0"))
+}
+
+/// The least bytes of such a buffer, and the most of all of them
+/// (`VICTORY_CARD_BUFFERS_MIN_MB`, 4; `VICTORY_CARD_BUFFERS_MB`, 1024).
 fn limits() -> (u64, u64) {
-    static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    static LIMITS: OnceLock<(u64, u64)> = OnceLock::new();
     *LIMITS.get_or_init(|| {
         let mb = |name: &str, default: u64| {
-            std::env::var(name)
-                .ok()
-                .and_then(|v| v.trim().parse::<u64>().ok())
-                .unwrap_or(default)
-                << 20
+            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
         };
         (
             mb("VICTORY_CARD_BUFFERS_MIN_MB", 4).max(1 << 20),
-            mb("VICTORY_CARD_BUFFERS_MB", 2048),
+            mb("VICTORY_CARD_BUFFERS_MB", 1024),
         )
     })
 }
 
-pub(crate) fn hash_table_bytes(size: u64) -> u64 {
-    ((size / PAGE as u64 + 1) * 16).next_multiple_of(256)
+/// Whether a submission whose shaders write cards is finished when it is
+/// waited for, as others are (`VICTORY_CARD_ASYNC=0`: waited for at once).
+pub(crate) fn unwaited() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_ASYNC").is_none_or(|v| v != "0"))
 }
 
-/// Per-`Shadow` state when a buffer lives in device-local VRAM (`DEFAULT`).
-pub(crate) struct CardState {
-    /// CPU-mapped staging mirror (`L0` WRITE_BACK; `Shadow::data` points here).
-    pub(crate) staging: ID3D12Resource,
-    /// Device-local VRAM buffer (`DEFAULT`, `ALLOW_UNORDERED_ACCESS`; same COM
-    /// resource as `Shadow::buffer`).
-    pub(crate) vram: ID3D12Resource,
-    /// Buffer width in bytes (multiple of `PAGE`).
-    pub(crate) size: u64,
-    /// Lazily created `DEFAULT` UAV buffer holding 16-byte hashes per 64 KiB piece.
+/// The most frames between two looks at all of a card, for writes no list
+/// declared; `VICTORY_CARD_SWEEP=0`: never, `n`: every `n` frames.
+fn sweeps() -> Option<u64> {
+    static EVERY: OnceLock<Option<u64>> = OnceLock::new();
+    *EVERY.get_or_init(|| {
+        match std::env::var("VICTORY_CARD_SWEEP").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+            Some(0) => None,
+            Some(n) => Some(n),
+            None => Some(SWEEP_MOST),
+        }
+    })
+}
+
+/// Looks at all of a card are this many frames apart once none found a
+/// write that was not declared for some time.
+const SWEEP_MOST: u64 = 32;
+/// Looks without one after which they are twice as far apart.
+const SWEEP_CLEAN: u32 = 16;
+
+/// Whether the title's descriptor heaps are left out of cards: its threads
+/// write them all over, and no shader reads them as data (translated ones
+/// index the host's heaps). `VICTORY_CARD_DESCRIPTORS=1` takes them as any
+/// memory.
+fn skip_descriptors() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_DESCRIPTORS").is_none_or(|v| v != "1"))
+}
+
+/// Bytes of video memory cards take, and their hashes.
+static BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes of video memory the cards take.
+pub(crate) fn bytes() -> u64 {
+    BYTES.load(Ordering::Relaxed)
+}
+
+/// How a card learns what the title wrote.
+enum Told {
+    /// Its view is guarded.
+    Guarded(&'static track::Track),
+    /// The memory is write-watched.
+    Written(Mutex<written::Written>),
+    /// Every piece, every time.
+    #[cfg(test)]
+    Nothing,
+}
+
+pub(crate) struct Card {
+    /// The title memory it stands for.
+    from: usize,
+    to: usize,
+    /// The 64 KiB line its buffers start at, and the bytes of the pieces it
+    /// has from there.
+    base: usize,
+    size: usize,
+    /// The device's address: a submission looks after its own device's.
+    device: usize,
+    heap: ID3D12Heap,
+    /// All of it, from `base` on.
+    buffer: ID3D12Resource,
+    gpu: u64,
+    /// What the GPU has, on the CPU's side: in system memory, mapped.
+    staging: ID3D12Resource,
+    side: usize,
+    /// Where `base` is for writing back: the title's address, or a view of
+    /// our own, which neither faults nor tells of a write.
+    back: usize,
+    own_view: bool,
+    told: Told,
+    /// A hash for each quarter of a page ([`engine`]), and whether they are
+    /// those of what the card has.
     hashes: Mutex<Option<ID3D12Resource>>,
-    /// True once `hashes` exists and has been populated for the whole buffer.
-    hashes_ready: AtomicBool,
-    /// Buffer-relative byte ranges `[from, to)` written to `staging` by the CPU
-    /// that must be copied to `vram` (and re-hashed if `hashes_ready`) before
-    /// the next GPU submission.
-    dirty_up: Mutex<Vec<(usize, usize)>>,
-    /// Deduplication flag for [`DIRTY_CARDS`].
-    queued: AtomicBool,
+    hashed: AtomicBool,
+    /// What was taken into `side` and not sent.
+    unsent: Mutex<Vec<(u32, u32)>>,
+    /// It is not handed out any more: the title mapped other memory there,
+    /// or something reaches the memory otherwise.
+    dead: AtomicBool,
+    /// Of those, the title's memory is another's now: nothing is put back.
+    gone: AtomicBool,
+    /// No one tells what the title writes: it is let go.
+    untold: AtomicBool,
+    sweep: Mutex<Sweep>,
 }
 
-// SAFETY: D3D12 resources are free-threaded; mutable fields are synchronized.
-unsafe impl Send for CardState {}
+/// When a card was looked at whole.
+struct Sweep {
+    /// The frame to look in next, and how many frames later again.
+    next: u64,
+    every: u64,
+    /// Looks in a row without an undeclared write.
+    clean: u32,
+}
+
+// SAFETY: D3D12 objects are free-threaded; the mappings are persistent and
+// written by the thread that prepares or finishes a submission.
+unsafe impl Send for Card {}
 // SAFETY: as above.
-unsafe impl Sync for CardState {}
+unsafe impl Sync for Card {}
 
-impl Drop for CardState {
+impl Drop for Card {
     fn drop(&mut self) {
-        CARD_BYTES[0].fetch_sub(self.size, Ordering::Relaxed);
-        let hashes = self.hashes.get_mut().ok().and_then(Option::take);
-        if hashes.is_some() {
-            CARD_BYTES[1].fetch_sub(hash_table_bytes(self.size), Ordering::Relaxed);
+        if let Told::Guarded(t) = &self.told {
+            t.end();
         }
-        crate::host::retire((self.staging.clone(), self.vram.clone(), hashes));
+        let hashes = self.hashes.get_mut().unwrap_or_else(|e| e.into_inner()).take();
+        BYTES.fetch_sub(self.local_bytes(hashes.is_some()), Ordering::Relaxed);
+        if self.own_view {
+            use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+            // SAFETY: our view, used by no one else.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.back as *mut _ }) };
+        }
+        crate::host::retire((self.buffer.clone(), self.staging.clone(), hashes, self.heap.clone()));
     }
 }
 
-impl CardState {
-    /// Allocates a VRAM card buffer for `size` bytes (must be a multiple of
-    /// `PAGE`) if enabled and within VRAM budget.
-    pub(crate) fn try_new(host: &Host, staging: &ID3D12Resource, size: u64) -> Option<Arc<Self>> {
-        if !enabled() {
-            return None;
-        }
-        let (min_bytes, max_bytes) = limits();
-        if size < min_bytes || size >= (1 << 30) || size % PAGE as u64 != 0 {
-            return None;
-        }
-        if !host.card_ready() {
-            return None;
-        }
-        if let Some([(used, budget), _]) = crate::host::video_memory()
-            && budget > 0
-            && used.saturating_add(size) > budget * 75 / 100
-        {
-            return None;
-        }
-        if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > max_bytes {
-            CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
-            return None;
-        }
-        Self::new_unchecked(host, staging, size, true)
-    }
+/// Where a card's memory is, besides at the title's address.
+struct Place {
+    /// `base` in a view of ours (the title's address otherwise).
+    back: usize,
+    own_view: bool,
+    told: Told,
+}
 
-    /// Creates a `CardState` directly (used by `try_new` and WARP unit tests).
-    pub(crate) fn new_unchecked(
-        host: &Host,
-        staging: &ID3D12Resource,
-        size: u64,
-        counted: bool,
-    ) -> Option<Arc<Self>> {
-        let Some(vram) = host.uav_buffer(size) else {
-            if counted {
-                CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+impl Card {
+    /// A card for title memory `[from, to)`, with what it holds still to be
+    /// sent. `None` without the memory for it.
+    fn new(host: &Host, from: usize, to: usize, place: Place) -> Option<Arc<Card>> {
+        let base = from & !(PIECE - 1);
+        let size = to.next_multiple_of(PIECE) - base;
+        let made = Self::memory(host, base, size);
+        let (heap, buffer, gpu, staging, side) = match made {
+            Some(m) => m,
+            None => {
+                if place.own_view {
+                    use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+                    // SAFETY: the view made for this card.
+                    unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: place.back as *mut _ }) };
+                }
+                if let Told::Guarded(t) = &place.told {
+                    t.end();
+                }
+                return None;
             }
-            return None;
         };
-        if !counted {
-            CARD_BYTES[0].fetch_add(size, Ordering::Relaxed);
-        }
-        Some(Arc::new(Self {
-            staging: staging.clone(),
-            vram,
+        let card = Arc::new(Card {
+            from,
+            to,
+            base,
             size,
+            device: host.device.as_raw() as usize,
+            heap,
+            buffer,
+            gpu,
+            staging,
+            side,
+            back: place.back,
+            own_view: place.own_view,
+            told: place.told,
             hashes: Mutex::new(None),
-            hashes_ready: AtomicBool::new(false),
-            dirty_up: Mutex::new(Vec::new()),
-            queued: AtomicBool::new(false),
-        }))
+            hashed: AtomicBool::new(false),
+            // All of it: whatever the memory held when it was made.
+            unsent: Mutex::new(vec![(0, size as u32)]),
+            dead: AtomicBool::new(false),
+            gone: AtomicBool::new(false),
+            untold: AtomicBool::new(false),
+            sweep: Mutex::new(Sweep { next: 0, every: 1, clean: 0 }),
+        });
+        BYTES.fetch_add(card.local_bytes(false), Ordering::Relaxed);
+        let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+        live.retain(|c| c.strong_count() > 0);
+        live.push(Arc::downgrade(&card));
+        Some(card)
     }
 
-    /// Notes that CPU copied new bytes into `staging[from..to]`.
-    pub(crate) fn mark_dirty(self: &Arc<Self>, from: usize, to: usize) {
+    /// Video memory and the side in system memory.
+    #[allow(clippy::type_complexity)] // taken apart at once
+    fn memory(
+        host: &Host,
+        base: usize,
+        size: usize,
+    ) -> Option<(ID3D12Heap, ID3D12Resource, u64, ID3D12Resource, usize)> {
+        let (staging, side) = host.shared_buffer(size as u64)?;
+        crate::host::name(&staging, || format!("the CPU's side of title memory {base:#x}+{size:#x}"));
+        let bytes = size as u64 + TAIL;
+        let desc = D3D12_HEAP_DESC {
+            SizeInBytes: bytes,
+            Properties: D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            },
+            Alignment: 0,
+            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+        };
+        let mut heap: Option<ID3D12Heap> = None;
+        // SAFETY: plain creation of a heap, which starts as zeros.
+        if let Err(error) = unsafe { host.device.CreateHeap(&desc, &mut heap) } {
+            tracing::warn!(%error, bytes, "no video memory for a card");
+            return None;
+        }
+        let heap = heap?;
+        // Shaders are at it all the time: the last to leave video memory.
+        // SAFETY: a live heap, one priority for it.
+        unsafe {
+            if let Ok(device) = host.device.cast::<ID3D12Device1>()
+                && let Ok(pageable) = heap.cast::<ID3D12Pageable>()
+            {
+                let _ = device.SetResidencyPriority(1, &Some(pageable), &D3D12_RESIDENCY_PRIORITY_HIGH);
+            }
+        }
+        let buffer = part_of(host, &heap, 0, bytes)?;
+        crate::host::name(&buffer, || format!("title memory {base:#x}+{size:#x} on the card"));
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Some((heap, buffer, gpu, staging, side as usize))
+    }
+
+    fn local_bytes(&self, hashes: bool) -> u64 {
+        self.size as u64 + TAIL + if hashes { engine::hash_bytes(self.size) } else { 0 }
+    }
+
+    /// Where the title memory it stands for starts and ends.
+    pub(crate) fn span(&self) -> (u64, u64) {
+        (self.from as u64, self.to as u64)
+    }
+
+    /// The title address its buffer starts at.
+    pub(crate) fn base(&self) -> u64 {
+        self.base as u64
+    }
+
+    pub(crate) fn buffer(&self) -> &ID3D12Resource {
+        &self.buffer
+    }
+
+    pub(crate) fn gpu(&self) -> u64 {
+        self.gpu
+    }
+
+    pub(crate) fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
+    }
+
+    /// Whether it is a title buffer's ([`big`]).
+    pub(crate) fn is_buffer(&self) -> bool {
+        matches!(self.told, Told::Written(_))
+    }
+
+    /// The card's memory from 64 KiB line `shift` of it on, as a buffer (for
+    /// views whose elements do not fall on multiples of their size from its
+    /// start).
+    pub(crate) fn from_line(&self, host: &Host, shift: u64) -> Option<(ID3D12Resource, u64)> {
+        let buffer = part_of(host, &self.heap, shift, self.size as u64 + TAIL - shift)?;
+        crate::host::name(&buffer, || format!("title memory {:#x} on the card", self.base as u64 + shift));
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Some((buffer, gpu))
+    }
+
+    /// The pieces it has.
+    fn pieces(&self) -> usize {
+        self.size / PIECE
+    }
+
+    /// The pages of title memory `[from, to)`, cut to the card: first and
+    /// past the last.
+    fn leaves_of(&self, from: usize, to: usize) -> Option<(usize, usize)> {
+        let (from, to) = (from.max(self.from), to.min(self.to));
+        (from < to).then(|| ((from - self.base) / LEAF, (to - self.base).div_ceil(LEAF)))
+    }
+
+    fn hashes(&self) -> Option<ID3D12Resource> {
+        self.hashes.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn hashed(&self) -> bool {
+        self.hashed.load(Ordering::Acquire)
+    }
+
+    fn set_hashed(&self) {
+        self.hashed.store(true, Ordering::Release);
+    }
+
+    /// Memory for the hashes, if it has none.
+    fn make_hashes(&self, host: &Host) -> Option<()> {
+        let mut hashes = self.hashes.lock().unwrap_or_else(|e| e.into_inner());
+        if hashes.is_none() {
+            let bytes = engine::hash_bytes(self.size);
+            let made = host.uav_buffer(bytes)?;
+            crate::host::name(&made, || format!("hashes of title memory {:#x}", self.base));
+            BYTES.fetch_add(bytes, Ordering::Relaxed);
+            *hashes = Some(made);
+        }
+        Some(())
+    }
+
+    /// Takes what the title changed since the last time into the side: the
+    /// ranges of it (offset, bytes) to send, in order. `reads`: title memory
+    /// (from, to) the submission's lists are known to read.
+    fn pull(&self, reads: &[(usize, usize)]) -> Vec<(u32, u32)> {
+        let mut runs = std::mem::take(&mut *self.unsent.lock().unwrap_or_else(|e| e.into_inner()));
+        let again = !runs.is_empty();
+        let frame = crate::queue::presented();
+        let pieces: Vec<(usize, u16)> = match &self.told {
+            Told::Guarded(t) => t.take().into_iter().map(|p| (p, u16::MAX)).collect(),
+            Told::Written(w) => {
+                let reads: Vec<(usize, usize)> = reads
+                    .iter()
+                    .filter_map(|&(a, b)| self.leaves_of(a, b))
+                    .map(|(a, b)| (a / LEAVES, b.div_ceil(LEAVES)))
+                    .collect();
+                let taken = w.lock().unwrap_or_else(|e| e.into_inner()).take(self.base, &reads, frame);
+                taken.unwrap_or_else(|| {
+                    // No one tells what the title writes there any more.
+                    self.untold.store(true, Ordering::Release);
+                    (0..self.pieces()).map(|p| (p, u16::MAX)).collect()
+                })
+            }
+            #[cfg(test)]
+            Told::Nothing => (0..self.pieces()).map(|p| (p, u16::MAX)).collect(),
+        };
+        if pieces.is_empty() {
+            return runs;
+        }
+        let found: Mutex<Vec<(usize, Vec<(u32, u32)>)>> = Mutex::default();
+        let scanned = AtomicU64::new(0);
+        crate::host::in_parallel(&pieces, 128, |part| {
+            thread_local! {
+                static READ: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0; PIECE]);
+            }
+            READ.with_borrow_mut(|read| {
+                let mut mine = Vec::new();
+                for &(piece, leaves) in part {
+                    let mut runs = Vec::new();
+                    if leaves == u16::MAX {
+                        self.pull_part(piece * PIECE, PIECE, read, &mut runs);
+                    } else {
+                        for k in (0..LEAVES).filter(|k| leaves >> k & 1 != 0) {
+                            self.pull_part(piece * PIECE + k * LEAF, LEAF, read, &mut runs);
+                        }
+                    }
+                    scanned.fetch_add(u64::from(leaves.count_ones()) * LEAF as u64, Ordering::Relaxed);
+                    if !runs.is_empty() {
+                        mine.push((piece, runs));
+                    }
+                }
+                found.lock().unwrap_or_else(|e| e.into_inner()).extend(mine);
+            });
+        });
+        add(Count::CardScanned, scanned.into_inner());
+        let mut found = found.into_inner().unwrap_or_else(|e| e.into_inner());
+        found.sort_unstable_by_key(|f| f.0);
+        let changed: Vec<usize> = found.iter().map(|f| f.0).collect();
+        match &self.told {
+            Told::Guarded(t) => t.looked(&changed),
+            Told::Written(w) => w.lock().unwrap_or_else(|e| e.into_inner()).looked(&changed, frame),
+            #[cfg(test)]
+            Told::Nothing => {}
+        }
+        runs.extend(found.into_iter().flat_map(|f| f.1));
+        // Copies are cheap (0.1 us each), but not for any number.
+        const MOST: usize = 1 << 14;
+        if runs.len() > MOST {
+            join_near(&mut runs, 256);
+        } else if again {
+            join_near(&mut runs, 0);
+        }
+        runs
+    }
+
+    /// The `n` bytes from `offset` on of [`Card::pull`]; `read` has room for
+    /// them.
+    fn pull_part(&self, offset: usize, n: usize, read: &mut [u8], runs: &mut Vec<(u32, u32)>) {
+        let start = self.base + offset;
+        let (from, to) = (start.max(self.from), (start + n).min(self.to));
         if from >= to {
             return;
         }
-        {
-            let mut dirty = self.dirty_up.lock().unwrap_or_else(|e| e.into_inner());
-            dirty.push((from, to));
+        let (at, n) = (from - self.base, to - from);
+        // SAFETY: this part of the side's mapping, which one thread at a time
+        // looks at; the GPU reads it only in lists that have run.
+        let side = unsafe { std::slice::from_raw_parts_mut((self.side + at) as *mut u8, n) };
+        if self.own_view {
+            // Through our own view, which nothing unmaps.
+            // SAFETY: inside that view.
+            unsafe { merge::differing((self.back + at) as *const u8, side, at as u32, runs) };
+            return;
         }
-        if !self.queued.swap(true, Ordering::AcqRel) {
-            DIRTY_CARDS
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(Arc::downgrade(self));
-        }
-    }
-
-    /// Ensures the GPU hash table exists; returns `(hashes_resource, needs_full_init)`.
-    fn ensure_hashes(&self, host: &Host) -> Option<(ID3D12Resource, bool)> {
-        let mut h = self.hashes.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(res) = h.as_ref() {
-            return Some((res.clone(), !self.hashes_ready.load(Ordering::Acquire)));
-        }
-        let bytes = hash_table_bytes(self.size);
-        let res = host.uav_buffer(bytes)?;
-        crate::host::name(&res, || format!("card hashes {bytes:#x}"));
-        CARD_BYTES[1].fetch_add(bytes, Ordering::Relaxed);
-        *h = Some(res.clone());
-        Some((res, true))
-    }
-
-    fn take_dirty_up(&self) -> Vec<(usize, usize)> {
-        self.queued.store(false, Ordering::Release);
-        let mut dirty = self.dirty_up.lock().unwrap_or_else(|e| e.into_inner());
-        if dirty.is_empty() {
-            return Vec::new();
-        }
-        let mut ranges = std::mem::take(&mut *dirty);
-        merge_byte_ranges(&mut ranges);
-        ranges
-    }
-
-    pub(crate) fn total_pieces(&self) -> u32 {
-        (self.size / PAGE as u64) as u32
-    }
-}
-
-/// Merges overlapping or adjacent `[from, to)` ranges in place.
-fn merge_byte_ranges(ranges: &mut Vec<(usize, usize)>) {
-    if ranges.len() <= 1 {
-        return;
-    }
-    ranges.sort_unstable();
-    let mut out = 0usize;
-    for i in 1..ranges.len() {
-        let (a, b) = ranges[i];
-        if a <= ranges[out].1 {
-            ranges[out].1 = ranges[out].1.max(b);
-        } else {
-            out += 1;
-            ranges[out] = (a, b);
-        }
-    }
-    ranges.truncate(out + 1);
-}
-
-/// Converts byte ranges `[from, to)` into sorted, merged 64 KiB piece runs `(first_piece, count)`.
-fn byte_ranges_to_piece_runs(ranges: &[(usize, usize)], max_pieces: u32) -> Vec<(u32, u32)> {
-    if ranges.is_empty() || max_pieces == 0 {
-        return Vec::new();
-    }
-    let mut spans: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
-    for &(from, to) in ranges {
-        if from >= to {
-            continue;
-        }
-        let first = (from / PAGE) as u32;
-        let end = (to.div_ceil(PAGE) as u32).min(max_pieces);
-        if first < end {
-            spans.push((first, end));
-        }
-    }
-    if spans.is_empty() {
-        return Vec::new();
-    }
-    spans.sort_unstable();
-    let mut out: Vec<(u32, u32)> = Vec::with_capacity(spans.len());
-    for (a, b) in spans {
-        if let Some(last) = out.last_mut()
-            && a <= last.0 + last.1
-        {
-            let end = (last.0 + last.1).max(b);
-            last.1 = end - last.0;
-        } else {
-            out.push((a, b - a));
-        }
-    }
-    out
-}
-
-/// Per-submission plan built in `card_before` and consumed in `card_after` + `card_back`.
-pub(crate) struct CardPlan {
-    entries: Vec<CardWriteEntry>,
-    total_pieces: u32,
-}
-
-struct CardWriteEntry {
-    shadow: Arc<crate::shadow::Shadow>,
-    card: Arc<CardState>,
-    hashes: ID3D12Resource,
-    /// Original declared title ranges `(address, len)` for clearing `pending`.
-    declared: Vec<(usize, usize)>,
-    /// Merged 64 KiB buffer-relative piece runs `(first_piece, count)`.
-    runs: Vec<(u32, u32)>,
-    /// First dword index in `differs` for this entry.
-    out_start: u32,
-}
-
-impl CardPlan {
-    pub(crate) fn has_writes(&self) -> bool {
-        self.total_pieces > 0
-    }
-
-    pub(crate) fn clear_pending(self) {
-        for entry in &self.entries {
-            entry.shadow.finish_card_pending(&entry.declared);
-        }
-    }
-}
-
-/// Per-`Host` reusable GPU pipelines, command lists, and readback scratch buffers
-/// for VRAM card buffer uploads, Wave64 hashing, and dirty-page fetch.
-pub(crate) struct CardEngine {
-    root_sig: ID3D12RootSignature,
-    pso: ID3D12PipelineState,
-    before_alloc: ID3D12CommandAllocator,
-    before_list: ID3D12GraphicsCommandList,
-    after_alloc: ID3D12CommandAllocator,
-    after_list: ID3D12GraphicsCommandList,
-    fetch_alloc: ID3D12CommandAllocator,
-    fetch_list: ID3D12GraphicsCommandList,
-    differs_gpu: ID3D12Resource,
-    differs_rb: (ID3D12Resource, usize, u64),
-    dummy_uav: ID3D12Resource,
-    fetch_rb: Option<(ID3D12Resource, usize, u64)>,
-}
-
-// SAFETY: accessed only under `Host::submitted` lock or `CardEngine` mutex;
-// D3D12 interfaces are free-threaded.
-unsafe impl Send for CardEngine {}
-
-impl CardEngine {
-    pub(crate) fn new(host: &Host) -> windows::core::Result<Self> {
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: valid HLSL source and entry point.
-        unsafe {
-            D3DCompile(
-                CARD_COMPARE_HLSL.as_ptr().cast(),
-                CARD_COMPARE_HLSL.len(),
-                windows::core::s!("card_compare_wave64"),
-                None,
-                None,
-                windows::core::s!("main"),
-                windows::core::s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-        }
-        let code = code.ok_or_else(windows::core::Error::empty)?;
-        // SAFETY: valid compiled DXBC blob from D3DCompile.
-        let bytecode = unsafe {
-            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
-        };
-        // SAFETY: bytecode embeds `[RootSignature(RS)]`.
-        let root_sig: ID3D12RootSignature =
-            unsafe { host.device.CreateRootSignature(0, bytecode)? };
-        let pso_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::ManuallyDrop::new(Some(root_sig.clone())),
-            CS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: bytecode.as_ptr().cast(),
-                BytecodeLength: bytecode.len(),
-            },
-            ..Default::default()
-        };
-        // SAFETY: valid compute pipeline description.
-        let pso_res: windows::core::Result<ID3D12PipelineState> =
-            unsafe { host.device.CreateComputePipelineState(&pso_desc) };
-        // Release our extra ref from `ManuallyDrop` above even on error.
-        drop(std::mem::ManuallyDrop::into_inner(pso_desc.pRootSignature));
-        let pso = pso_res?;
-
-        let make_pair = || -> windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
-            // SAFETY: plain direct command allocator and list creation.
-            unsafe {
-                let alloc: ID3D12CommandAllocator = host
-                    .device
-                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-                let list: ID3D12GraphicsCommandList = host.device.CreateCommandList(
-                    0,
-                    D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    &alloc,
-                    None,
-                )?;
-                list.Close()?;
-                Ok((alloc, list))
+        let read = &mut read[..n];
+        if !crate::host::read_into(from as *const u8, read) {
+            // What of it is not there is left as it was.
+            for k in (0..n).step_by(LEAF) {
+                let end = (k + LEAF).min(n);
+                if !crate::host::read_into((from + k) as *const u8, &mut read[k..end]) {
+                    read[k..end].copy_from_slice(&side[k..end]);
+                }
             }
-        };
-        let (before_alloc, before_list) = make_pair()?;
-        let (after_alloc, after_list) = make_pair()?;
-        let (fetch_alloc, fetch_list) = make_pair()?;
-
-        let init_diff_bytes = 256 << 10; // 65,536 pieces (4 GiB of ranges)
-        let differs_gpu = host
-            .uav_buffer(init_diff_bytes)
-            .ok_or_else(windows::core::Error::empty)?;
-        let (rb_res, rb_ptr) = host
-            .readback_buffer(init_diff_bytes)
-            .ok_or_else(windows::core::Error::empty)?;
-        let dummy_uav = host
-            .uav_buffer(256)
-            .ok_or_else(windows::core::Error::empty)?;
-        crate::host::name(&differs_gpu, || "card differs gpu".into());
-        crate::host::name(&rb_res, || "card differs readback".into());
-        crate::host::name(&dummy_uav, || "card dummy uav".into());
-
-        Ok(Self {
-            root_sig,
-            pso,
-            before_alloc,
-            before_list,
-            after_alloc,
-            after_list,
-            fetch_alloc,
-            fetch_list,
-            differs_gpu,
-            differs_rb: (rb_res, rb_ptr as usize, init_diff_bytes),
-            dummy_uav,
-            fetch_rb: None,
-        })
+        }
+        // SAFETY: as long as the side.
+        unsafe { merge::differing(read.as_ptr(), side, at as u32, runs) };
     }
 
-    fn ensure_differs_capacity(&mut self, host: &Host, needed_bytes: u64) -> bool {
-        if needed_bytes <= self.differs_rb.2 {
-            return true;
+    /// What [`Card::pull`] gave was not sent.
+    fn put_back(&self, runs: &[(u32, u32)]) {
+        self.unsent.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(runs);
+    }
+
+    /// Page `leaf` as the GPU has it, after a shader changed it: what differs
+    /// from the side goes into title memory and the side. The bytes stored.
+    fn put_back_page(&self, leaf: usize, page: &[u8]) -> usize {
+        let start = leaf * LEAF;
+        if start + LEAF > self.size || page.len() < LEAF {
+            return 0;
         }
-        let size = needed_bytes.next_multiple_of(256 << 10);
-        let Some(gpu) = host.uav_buffer(size) else {
+        let from = (self.from - self.base).max(start).next_multiple_of(4);
+        let to = (self.to - self.base).min(start + LEAF) & !3;
+        if from >= to || self.gone.load(Ordering::Acquire) {
+            return 0;
+        }
+        // SAFETY: this page's part of the side's mapping; a page is merged by
+        // one thread, with no submission being prepared.
+        let side = unsafe { std::slice::from_raw_parts_mut((self.side + from) as *mut u8, to - from) };
+        merge::put_back(self.back + from, &page[from - start..to - start], side)
+    }
+
+    /// Whether it is the turn of a look at all of it ([`sweeps`]).
+    fn sweep_due(&self) -> bool {
+        let Some(most) = sweeps() else { return false };
+        let frame = crate::queue::presented() + 1;
+        let mut s = self.sweep.lock().unwrap_or_else(|e| e.into_inner());
+        if s.next > frame {
             return false;
-        };
-        let Some((rb, ptr)) = host.readback_buffer(size) else {
-            return false;
-        };
-        let old_gpu = std::mem::replace(&mut self.differs_gpu, gpu);
-        let old_rb = std::mem::replace(&mut self.differs_rb, (rb, ptr as usize, size));
-        crate::host::retire((old_gpu, old_rb.0));
+        }
+        s.next = frame + s.every.min(most);
         true
     }
 
-    fn ensure_fetch_capacity(&mut self, host: &Host, needed_bytes: u64) -> Option<(ID3D12Resource, usize)> {
-        if let Some((ref res, ptr, cap)) = self.fetch_rb
-            && needed_bytes <= cap
-        {
-            return Some((res.clone(), ptr));
-        }
-        let size = needed_bytes.next_multiple_of(8 << 20);
-        let (rb, ptr) = host.readback_buffer(size)?;
-        crate::host::name(&rb, || format!("card fetch readback {size:#x}"));
-        if let Some((old, _, _)) = self.fetch_rb.replace((rb.clone(), ptr as usize, size)) {
-            crate::host::retire(old);
-        }
-        Some((rb, ptr as usize))
-    }
-
-    /// Dispatches `CARD_COMPARE` for `count` contiguous 64 KiB pieces starting at `first`.
-    unsafe fn dispatch_hash(
-        &self,
-        list: &ID3D12GraphicsCommandList,
-        vram: &ID3D12Resource,
-        hashes: &ID3D12Resource,
-        differs: &ID3D12Resource,
-        first: u32,
-        size: u32,
-        count: u32,
-        out_at_bytes: u32,
-        compare: u32,
-    ) {
-        if count == 0 {
+    /// It was looked at whole; `found`: a write no list had declared.
+    fn swept(&self, found: bool) {
+        let mut s = self.sweep.lock().unwrap_or_else(|e| e.into_inner());
+        if found {
+            (s.every, s.clean) = (1, 0);
             return;
         }
-        let constants = [first, 0u32, size, count, out_at_bytes, compare];
-        // SAFETY: caller ensures `list` is open with `root_sig` and `pso` bound
-        // and all 3 buffers are live with valid states.
-        unsafe {
-            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-            list.SetComputeRootShaderResourceView(1, vram.GetGPUVirtualAddress());
-            list.SetComputeRootUnorderedAccessView(2, hashes.GetGPUVirtualAddress());
-            list.SetComputeRootUnorderedAccessView(3, differs.GetGPUVirtualAddress());
-            list.Dispatch(count, 1, 1);
+        s.clean += 1;
+        if s.clean >= SWEEP_CLEAN {
+            (s.every, s.clean) = ((s.every * 2).min(SWEEP_MOST), 0);
         }
     }
 
-    /// Uploads all CPU-modified `Card` ranges to VRAM, initializes hashes for
-    /// any `Card` shadow about to be written by shaders, and re-hashes uploaded
-    /// pieces of hashed shadows. Returns `(optional before command list, CardPlan)`.
-    pub(crate) fn record_before(
-        &mut self,
-        host: &Host,
-        writes: &[(Arc<crate::shadow::Shadow>, usize, usize)],
-    ) -> (Option<ID3D12CommandList>, CardPlan) {
-        // 1. Drain all card shadows with pending CPU -> VRAM uploads.
-        let mut dirty_cards: Vec<(Arc<CardState>, Vec<(usize, usize)>)> = Vec::new();
-        {
-            let mut q = DIRTY_CARDS.lock().unwrap_or_else(|e| e.into_inner());
-            for weak in q.drain(..) {
-                if let Some(card) = weak.upgrade() {
-                    let ranges = card.take_dirty_up();
-                    if !ranges.is_empty() {
-                        dirty_cards.push((card, ranges));
-                    }
-                }
-            }
-        }
-
-        // 2. Group declared `Step::GpuWrite` ranges by `Card` shadow and ensure
-        //    each written card shadow has its hash table allocated.
-        let mut entries: Vec<CardWriteEntry> = Vec::new();
-        let mut need_full_hash: Vec<(Arc<CardState>, ID3D12Resource)> = Vec::new();
-        let mut total_pieces = 0u32;
-
-        for (shadow, address, len) in writes {
-            let Some(card) = shadow.card_state() else {
-                continue;
-            };
-            if let Some(entry) = entries.iter_mut().find(|e| Arc::ptr_eq(&e.shadow, shadow)) {
-                entry.declared.push((*address, *len));
-            } else if let Some((hashes, full_init)) = card.ensure_hashes(host) {
-                if full_init {
-                    need_full_hash.push((card.clone(), hashes.clone()));
-                }
-                entries.push(CardWriteEntry {
-                    shadow: shadow.clone(),
-                    card: card.clone(),
-                    hashes,
-                    declared: vec![(*address, *len)],
-                    runs: Vec::new(),
-                    out_start: 0,
-                });
-            }
-        }
-
-        for entry in &mut entries {
-            let mut byte_ranges = Vec::with_capacity(entry.declared.len());
-            for &(addr, len) in &entry.declared {
-                let (from, to) = entry.shadow.inside_offsets(addr, len);
-                if from < to {
-                    byte_ranges.push((from, to));
-                }
-            }
-            entry.runs = byte_ranges_to_piece_runs(&byte_ranges, entry.card.total_pieces());
-            entry.out_start = total_pieces;
-            total_pieces += entry.runs.iter().map(|&(_, c)| c).sum::<u32>();
-        }
-
-        // Also check which dirty-uploaded shadows already have hashes (so we
-        // re-hash their newly uploaded pieces after CopyBufferRegion).
-        let mut rehash_uploads: Vec<(Arc<CardState>, ID3D12Resource, Vec<(u32, u32)>)> = Vec::new();
-        for (card, ranges) in &dirty_cards {
-            // Skip partial rehash if this card is already getting a full hash below.
-            if need_full_hash.iter().any(|(c, _)| Arc::ptr_eq(c, card)) {
-                continue;
-            }
-            if card.hashes_ready.load(Ordering::Acquire)
-                && let Some(hashes) = card
-                    .hashes
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone()
-            {
-                let runs = byte_ranges_to_piece_runs(ranges, card.total_pieces());
-                if !runs.is_empty() {
-                    rehash_uploads.push((card.clone(), hashes, runs));
-                }
-            }
-        }
-
-        let plan = CardPlan {
-            entries,
-            total_pieces,
-        };
-
-        if dirty_cards.is_empty() && need_full_hash.is_empty() {
-            return (None, plan);
-        }
-
-        // SAFETY: allocator & list are idle under `Host::submitted`.
-        let list = unsafe {
-            if self.before_alloc.Reset().is_err()
-                || self.before_list.Reset(&self.before_alloc, None).is_err()
-            {
-                return (None, plan);
-            }
-            &self.before_list
-        };
-
-        // Step A: Copy dirty staging ranges -> VRAM.
-        for (card, ranges) in &dirty_cards {
-            for &(from, to) in ranges {
-                // SAFETY: both buffers cover `[from, to)`; implicit COMMON promotion.
-                unsafe {
-                    list.CopyBufferRegion(
-                        &card.vram,
-                        from as u64,
-                        &card.staging,
-                        from as u64,
-                        (to - from) as u64,
-                    );
-                }
-            }
-        }
-
-        // Step B: Transition uploaded VRAM buffers COPY_DEST -> NON_PIXEL_SHADER_RESOURCE
-        // (or COMMON if no hashing follows).
-        let mut to_srv = Vec::new();
-        let mut to_common = Vec::new();
-        for (card, _) in &dirty_cards {
-            let will_hash = need_full_hash.iter().any(|(c, _)| Arc::ptr_eq(c, card))
-                || rehash_uploads.iter().any(|(c, _, _)| Arc::ptr_eq(c, card));
-            let after = if will_hash {
-                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-            } else {
-                D3D12_RESOURCE_STATE_COMMON
-            };
-            to_srv.push(transition_barrier(
-                &card.vram,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                after,
-            ));
-            if will_hash {
-                to_common.push(transition_barrier(
-                    &card.vram,
-                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                    D3D12_RESOURCE_STATE_COMMON,
-                ));
-            }
-        }
-        if !to_srv.is_empty() {
-            // SAFETY: valid resource transitions.
-            unsafe { list.ResourceBarrier(&to_srv) };
-            drop_barriers(to_srv);
-        }
-
-        // Step C: Dispatch Wave64 CARD_COMPARE (compare = 0) to store hashes.
-        if !need_full_hash.is_empty() || !rehash_uploads.is_empty() {
-            // SAFETY: live root signature and PSO.
-            unsafe {
-                list.SetComputeRootSignature(&self.root_sig);
-                list.SetPipelineState(&self.pso);
-            }
-            for (card, hashes) in &need_full_hash {
-                // SAFETY: buffer is readable as SRV (either transitioned above or COMMON).
-                unsafe {
-                    self.dispatch_hash(
-                        list,
-                        &card.vram,
-                        hashes,
-                        &self.dummy_uav,
-                        0,
-                        card.size as u32,
-                        card.total_pieces(),
-                        0,
-                        0,
-                    );
-                }
-                card.hashes_ready.store(true, Ordering::Release);
-            }
-            for (card, hashes, runs) in &rehash_uploads {
-                for &(first, count) in runs {
-                    // SAFETY: buffer is in NON_PIXEL_SHADER_RESOURCE.
-                    unsafe {
-                        self.dispatch_hash(
-                            list,
-                            &card.vram,
-                            hashes,
-                            &self.dummy_uav,
-                            first,
-                            card.size as u32,
-                            count,
-                            0,
-                            0,
-                        );
-                    }
-                }
-            }
-            // Flush hash UAV writes and return transitioned VRAM buffers to COMMON.
-            to_common.push(uav_barrier());
-        }
-
-        if !to_common.is_empty() {
-            // SAFETY: valid barriers.
-            unsafe { list.ResourceBarrier(&to_common) };
-            drop_barriers(to_common);
-        }
-
-        // SAFETY: close command list.
-        if unsafe { list.Close() }.is_err() {
-            return (None, plan);
-        }
-        (list.cast().ok(), plan)
-    }
-
-    /// Records the post-submission GPU hash compare (`compare = 2`) and copies
-    /// the tiny `differs` array to `differs_rb` (runs in the same GPU wait!).
-    pub(crate) fn record_after(&mut self, host: &Host, plan: &CardPlan) -> Option<ID3D12CommandList> {
-        if plan.total_pieces == 0 {
-            return None;
-        }
-        let needed_bytes = u64::from(plan.total_pieces) * 4;
-        if !self.ensure_differs_capacity(host, needed_bytes) {
-            return None;
-        }
-        // SAFETY: allocator & list are idle under `Host::submitted`.
-        unsafe {
-            self.after_alloc.Reset().ok()?;
-            self.after_list.Reset(&self.after_alloc, None).ok()?;
-            // Global UAV barrier ensures all shader writes from `runs` are visible.
-            self.after_list.ResourceBarrier(&[uav_barrier()]);
-            self.after_list.SetComputeRootSignature(&self.root_sig);
-            self.after_list.SetPipelineState(&self.pso);
-
-            for entry in &plan.entries {
-                let mut out_idx = entry.out_start;
-                for &(first, count) in &entry.runs {
-                    self.dispatch_hash(
-                        &self.after_list,
-                        &entry.card.vram,
-                        &entry.hashes,
-                        &self.differs_gpu,
-                        first,
-                        entry.card.size as u32,
-                        count,
-                        out_idx * 4,
-                        2, // compare against previous hash AND store updated hash
-                    );
-                    out_idx += count;
-                }
-            }
-
-            let to_copy = [transition_barrier(
-                &self.differs_gpu,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )];
-            self.after_list.ResourceBarrier(&to_copy);
-            drop_barriers(to_copy);
-
-            self.after_list.CopyBufferRegion(
-                &self.differs_rb.0,
-                0,
-                &self.differs_gpu,
-                0,
-                needed_bytes,
+    /// A shader wrote page `leaf`, which no list had declared.
+    fn note_undeclared(&self, leaf: usize) {
+        static COUNT: AtomicU64 = AtomicU64::new(0);
+        let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if count <= 16 || count.is_power_of_two() {
+            tracing::info!(
+                count,
+                at = format_args!("{:#x}", self.base + leaf * LEAF),
+                "shaders wrote a page of title memory no list had declared"
             );
-
-            let back_common = [transition_barrier(
-                &self.differs_gpu,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-                D3D12_RESOURCE_STATE_COMMON,
-            )];
-            self.after_list.ResourceBarrier(&back_common);
-            drop_barriers(back_common);
-
-            self.after_list.Close().ok()?;
-            self.after_list.cast().ok()
         }
     }
+}
 
-    /// Reads the `differs` results after the submission fence completes, fetches
-    /// ONLY the 64 KiB pages the GPU actually modified, and merges them into
-    /// title memory + `staging`. Returns total bytes written to title memory.
-    pub(crate) fn finish_back(
-        &mut self,
-        host: &Host,
-        plan: CardPlan,
-        submitted: &mut u64,
-    ) -> usize {
-        if plan.entries.is_empty() {
-            return 0;
+/// A buffer over `[offset, offset + len)` of a card's heap.
+fn part_of(host: &Host, heap: &ID3D12Heap, offset: u64, len: u64) -> Option<ID3D12Resource> {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: len,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    };
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: a live heap that holds the range.
+    let made = unsafe {
+        host.device.CreatePlacedResource(heap, offset, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+    };
+    if let Err(error) = made {
+        tracing::warn!(%error, offset, len, "no buffer over a card's memory");
+        return None;
+    }
+    let buffer = buffer?;
+    // Descriptor slots and lists hold the buffer: it holds its heap.
+    const KEY: windows::core::GUID = windows::core::GUID::from_u128(0x2f4b_8d11_6e0a_4c3f_9a57_71c0_3d1e_55a2);
+    // SAFETY: a live object; the interface is referenced until the buffer
+    // is destroyed.
+    let held = unsafe { buffer.SetPrivateDataInterface(&KEY, heap) };
+    if let Err(error) = held {
+        tracing::warn!(%error, "a card's buffer does not hold its heap");
+        return None;
+    }
+    Some(buffer)
+}
+
+/// Joins runs (offset, bytes), in order, less than `gap` bytes apart.
+fn join_near(runs: &mut Vec<(u32, u32)>, gap: u32) {
+    runs.sort_unstable();
+    let mut out: Vec<(u32, u32)> = Vec::with_capacity(runs.len());
+    for &(at, len) in runs.iter() {
+        match out.last_mut() {
+            Some((a, l)) if at <= *a + *l + gap => *l = (*l).max(at + len - *a),
+            _ => out.push((at, len)),
         }
-        // SAFETY: GPU finished writing `differs_rb` before the fence returned.
-        let differs: &[u32] = if plan.total_pieces > 0 {
-            unsafe {
-                std::slice::from_raw_parts(
-                    self.differs_rb.1 as *const u32,
-                    plan.total_pieces as usize,
-                )
-            }
-        } else {
-            &[]
-        };
+    }
+    *runs = out;
+}
 
-        // Collect coalesced runs of dirty 64 KiB pieces per entry.
-        struct DirtyRun {
-            entry_idx: usize,
-            first_piece: u32,
-            count: u32,
-            rb_offset: u64,
+/// Every card there is, for submissions to look after: as long as a list or
+/// a slot still names one.
+static LIVE: Mutex<Vec<Weak<Card>>> = Mutex::new(Vec::new());
+
+/// The cards of a device.
+pub(crate) fn live(device: &ID3D12Device) -> Vec<Arc<Card>> {
+    let device = device.as_raw() as usize;
+    let live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    live.iter().filter_map(Weak::upgrade).filter(|c| c.device == device).collect()
+}
+
+/// Cards handed out, by where their memory starts.
+static OWNED: Mutex<BTreeMap<u64, Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+
+/// [`OWNED`], to look up without a lock: in order of their starts, apart
+/// from one another.
+struct Route {
+    from: u64,
+    to: u64,
+    shadow: Weak<Shadow>,
+}
+
+/// The routes now. Old ones are never freed (a few hundred bytes each time
+/// a card comes or goes): a thread may be reading them.
+static ROUTES: AtomicPtr<Vec<Route>> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Makes `map` the routes.
+fn publish(map: &BTreeMap<u64, Arc<Shadow>>) {
+    let routes: Vec<Route> = map
+        .values()
+        .filter_map(|s| {
+            let (from, to) = s.card()?.span();
+            Some(Route { from, to, shadow: Arc::downgrade(s) })
+        })
+        .collect();
+    ROUTES.store(Box::into_raw(Box::new(routes)), Ordering::Release);
+}
+
+/// What a range of title memory is to the cards.
+pub(crate) enum Held {
+    /// No card has any of it.
+    Not,
+    /// Inside this one.
+    By(Arc<Shadow>),
+    /// It meets this one and is not inside it.
+    Across(Arc<Shadow>),
+}
+
+/// Which card has `[address, end)`.
+pub(crate) fn held(address: u64, end: u64) -> Held {
+    // SAFETY: routes are never freed.
+    match unsafe { ROUTES.load(Ordering::Acquire).as_ref() } {
+        Some(routes) => held_in(routes, address, end),
+        None => Held::Not,
+    }
+}
+
+fn held_in(routes: &[Route], address: u64, end: u64) -> Held {
+    let i = routes.partition_point(|r| r.from <= address);
+    if let Some(r) = i.checked_sub(1).map(|k| &routes[k])
+        && address < r.to
+        && let Some(s) = r.shadow.upgrade()
+    {
+        return if end <= r.to { Held::By(s) } else { Held::Across(s) };
+    }
+    match routes.get(i) {
+        Some(r) if r.from < end => r.shadow.upgrade().map_or(Held::Not, Held::Across),
+        _ => Held::Not,
+    }
+}
+
+/// The card `[address, end)` is inside, made now if it is to be one.
+/// `Err`: no card has it, and its memory must not be used in place.
+pub(crate) fn find(address: u64, end: u64) -> Result<Option<Arc<Shadow>>, ()> {
+    match held(address, end) {
+        Held::By(s) => Ok(Some(s)),
+        Held::Not => Ok(heap(address, end)),
+        Held::Across(s) => {
+            across(&s, address, end);
+            // Those that can be are gone now.
+            match held(address, end) {
+                Held::By(s) => Ok(Some(s)),
+                Held::Not => Ok(None),
+                Held::Across(_) => Err(()),
+            }
         }
-        let mut dirty_runs: Vec<DirtyRun> = Vec::new();
-        let mut total_bytes = 0u64;
+    }
+}
 
-        for (entry_idx, entry) in plan.entries.iter().enumerate() {
-            let mut out_idx = entry.out_start as usize;
-            let mut cur: Option<(u32, u32)> = None;
-            for &(first, count) in &entry.runs {
-                for k in 0..count {
-                    let piece = first + k;
-                    if differs.get(out_idx).copied().unwrap_or(0) != 0 {
-                        match &mut cur {
-                            Some((s, c)) if *s + *c == piece => *c += 1,
-                            Some((s, c)) => {
-                                let bytes = u64::from(*c) * PAGE as u64;
-                                dirty_runs.push(DirtyRun {
-                                    entry_idx,
-                                    first_piece: *s,
-                                    count: *c,
-                                    rb_offset: total_bytes,
-                                });
-                                total_bytes += bytes;
-                                cur = Some((piece, 1));
-                            }
-                            None => cur = Some((piece, 1)),
-                        }
-                    }
-                    out_idx += 1;
-                }
-            }
-            if let Some((s, c)) = cur {
-                let bytes = u64::from(c) * PAGE as u64;
-                dirty_runs.push(DirtyRun {
-                    entry_idx,
-                    first_piece: s,
-                    count: c,
-                    rb_offset: total_bytes,
-                });
-                total_bytes += bytes;
-            }
+/// The card `address` is in, for a view without a size, of a title buffer
+/// that ends at `end` (if it is in one): whatever the view reaches, as far
+/// as the card goes.
+pub(crate) fn find_reaching(address: u64, end: Option<u64>) -> Option<Arc<Shadow>> {
+    match find(address, end.unwrap_or(address + 1)) {
+        Ok(card) => card,
+        // The title's heap, which is never in place.
+        Err(()) => match held(address, address + 1) {
+            Held::By(s) => Some(s),
+            _ => None,
+        },
+    }
+}
+
+/// A range that meets a card (`s`, the first of them) and is not inside it
+/// was asked for. The title's buffers among such cards go back to their
+/// place: what reaches them as part of something else reaches them there.
+fn across(s: &Arc<Shadow>, address: u64, end: u64) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= 64 || count.is_power_of_two() {
+        let (from, to) = s.card().map_or((0, 0), |c| c.span());
+        tracing::info!(
+            count,
+            address = format_args!("{address:#x}"),
+            len = end - address,
+            card = format_args!("{from:#x}..{to:#x}"),
+            "title memory asked for goes past a card"
+        );
+    }
+    let mut owned = OWNED.lock().unwrap_or_else(|e| e.into_inner());
+    let over: Vec<u64> = owned
+        .iter()
+        .filter(|(_, s)| {
+            s.card().is_some_and(|c| c.is_buffer() && c.span().0 < end && address < c.span().1)
+        })
+        .map(|(k, _)| *k)
+        .collect();
+    for key in over {
+        if let Some(shadow) = owned.remove(&key) {
+            big::never(&shadow);
+            let_go(&owned, shadow);
         }
+    }
+}
 
-        let mut written = 0usize;
-        if total_bytes > 0
-            && let Some((fetch_res, fetch_ptr)) = self.ensure_fetch_capacity(host, total_bytes)
-        {
-            let ok = unsafe {
-                self.fetch_alloc.Reset().is_ok()
-                    && self.fetch_list.Reset(&self.fetch_alloc, None).is_ok()
+/// The title's 32-bit GPU heap: not looked for yet, a card, or never one.
+static HEAP: AtomicU8 = AtomicU8::new(0);
+const HEAP_MADE: u8 = 1;
+const HEAP_REFUSED: u8 = 2;
+
+/// The card of the title's 32-bit GPU heap, if `[address, end)` lies in it:
+/// the one view of 64 to 512 MiB below 4 GiB (the runtime shows Grand Theft
+/// Auto VI's 185 MiB by one view, `xmem`'s `map_whole`). Made the first time
+/// something asks for memory in it, before any of it was handed out in
+/// place: pages the host GPU has open cannot be guarded.
+fn heap(address: u64, end: u64) -> Option<Arc<Shadow>> {
+    const LEAST: usize = 64 << 20;
+    const MOST: usize = 512 << 20;
+    if end > 1 << 32 || !heap_enabled() {
+        return None;
+    }
+    match HEAP.load(Ordering::Acquire) {
+        0 => {}
+        // Made by another thread since this one looked.
+        HEAP_MADE => {
+            return match held(address, end) {
+                Held::By(s) => Some(s),
+                _ => None,
             };
-            if ok {
-                for run in &dirty_runs {
-                    let entry = &plan.entries[run.entry_idx];
-                    // SAFETY: `vram` is in COMMON (promotes to COPY_SOURCE, decays to COMMON).
-                    unsafe {
-                        self.fetch_list.CopyBufferRegion(
-                            &fetch_res,
-                            run.rb_offset,
-                            &entry.card.vram,
-                            u64::from(run.first_piece) * PAGE as u64,
-                            u64::from(run.count) * PAGE as u64,
-                        );
-                    }
-                }
-                if unsafe { self.fetch_list.Close() }.is_ok()
-                    && let Ok(cmd) = self.fetch_list.cast::<ID3D12CommandList>()
-                {
-                    host.execute_and_wait_locked(cmd, submitted);
-
-                    // Group dirty runs by entry so distinct shadows merge in parallel.
-                    let mut per_entry: Vec<(usize, Vec<(u32, u32, usize)>)> = Vec::new();
-                    for run in &dirty_runs {
-                        let ptr = fetch_ptr + run.rb_offset as usize;
-                        if let Some(g) = per_entry.iter_mut().find(|(i, _)| *i == run.entry_idx) {
-                            g.1.push((run.first_piece, run.count, ptr));
-                        } else {
-                            per_entry.push((run.entry_idx, vec![(run.first_piece, run.count, ptr)]));
-                        }
-                    }
-                    let total_written = AtomicU64::new(0);
-                    crate::host::in_parallel(&per_entry, 4, |chunk| {
-                        for (entry_idx, runs) in chunk {
-                            let entry = &plan.entries[*entry_idx];
-                            let n = entry.shadow.merge_card_pieces(&entry.card, runs);
-                            total_written.fetch_add(n as u64, Ordering::Relaxed);
-                        }
-                    });
-                    written = total_written.into_inner() as usize;
-                }
-            }
         }
-
-        // Clear all declared pending ranges on each card shadow.
-        for entry in &plan.entries {
-            entry.shadow.finish_card_pending(&entry.declared);
+        _ => return None,
+    }
+    let (start, len, section, offset) = crate::watch::view_of(address as usize, end as usize)?;
+    if !(LEAST..=MOST).contains(&len) || !len.is_multiple_of(PIECE) {
+        return None;
+    }
+    let mut owned = OWNED.lock().unwrap_or_else(|e| e.into_inner());
+    if HEAP.load(Ordering::Acquire) != 0 {
+        return owned.get(&(start as u64)).cloned();
+    }
+    // Settled once and for all: a thread that meets the memory while this one
+    // works waits for the lock above, and none uses it in place before.
+    let made = crate::host::host()
+        .filter(|h| h.card_ready())
+        .and_then(|host| guarded(host, start, len, section, offset));
+    match &made {
+        Some(shadow) => {
+            owned.insert(start as u64, shadow.clone());
+            publish(&owned);
+            HEAP.store(HEAP_MADE, Ordering::Release);
+            tracing::info!(start = format_args!("{start:#x}"), len, "title memory on the card");
         }
-        written
+        None => {
+            HEAP.store(HEAP_REFUSED, Ordering::Release);
+            tracing::warn!(start = format_args!("{start:#x}"), len, "the title's heap is not on the card");
+        }
+    }
+    made
+}
+
+/// A card of the view of title memory `[start, start + len)`, which shows
+/// the bytes of `section` from `offset` on.
+fn guarded(host: &Host, start: usize, len: usize, section: usize, offset: u64) -> Option<Arc<Shadow>> {
+    use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+    // SAFETY: a section the runtime told us of, alive while it has views;
+    // the stretch is inside it.
+    let view = unsafe {
+        MapViewOfFile(section as _, FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, len)
+    };
+    if view.Value.is_null() {
+        let error = std::io::Error::last_os_error();
+        tracing::warn!(%error, start = format_args!("{start:#x}"), len, "no second view of title memory for a card");
+        return None;
+    }
+    let back = view.Value as usize;
+    crate::watch::give_up(start, len);
+    let Some(t) = track::Track::new(start, len / PIECE) else {
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        // SAFETY: the view just made.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: back as *mut _ }) };
+        return None;
+    };
+    let place = Place { back, own_view: true, told: Told::Guarded(t) };
+    let card = Card::new(host, start, start + len, place)?;
+    // Pages shown at other addresses already, and descriptors.
+    for at in crate::watch::shown_twice(start, len) {
+        track::shown_elsewhere(at);
+    }
+    for &(from, to) in DESCRIPTORS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        track::skip(from, to, true);
+    }
+    Some(Shadow::on_card(card))
+}
+
+/// The title's descriptor heaps in memory of its own (from, to).
+static DESCRIPTORS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// A descriptor heap is in title memory `[from, to)`.
+pub(crate) fn descriptors(from: u64, to: u64) {
+    if !skip_descriptors() {
+        return;
+    }
+    let (from, to) = (from as usize, to as usize);
+    DESCRIPTORS.lock().unwrap_or_else(|e| e.into_inner()).push((from, to));
+    track::skip(from, to, true);
+}
+
+/// It is gone.
+pub(crate) fn descriptors_gone(from: u64, to: u64) {
+    if !skip_descriptors() {
+        return;
+    }
+    let (from, to) = (from as usize, to as usize);
+    let mut all = DESCRIPTORS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = all.iter().position(|d| *d == (from, to)) {
+        all.swap_remove(i);
+    }
+    let left = all.clone();
+    drop(all);
+    track::skip(from, to, false);
+    // Another heap over some of the same memory.
+    for (a, b) in left.into_iter().filter(|(a, b)| *a < to && from < *b) {
+        track::skip(a, b, true);
     }
 }
 
-fn transition_barrier(
-    resource: &ID3D12Resource,
-    before: D3D12_RESOURCE_STATES,
-    after: D3D12_RESOURCE_STATES,
-) -> D3D12_RESOURCE_BARRIER {
-    D3D12_RESOURCE_BARRIER {
-        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-                pResource: std::mem::ManuallyDrop::new(Some(resource.clone())),
-                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                StateBefore: before,
-                StateAfter: after,
-            }),
-        },
+/// The title mapped or unmapped memory in `[start, end)`: cards there are no
+/// longer its.
+pub(crate) fn remapped(start: u64, end: u64) {
+    // SAFETY: routes are never freed.
+    let routes = unsafe { ROUTES.load(Ordering::Acquire).as_ref() };
+    if !routes.is_some_and(|r| r.iter().any(|r| r.from < end && start < r.to)) {
+        return;
+    }
+    let mut owned = OWNED.lock().unwrap_or_else(|e| e.into_inner());
+    let over: Vec<u64> = owned
+        .iter()
+        .filter(|(_, s)| s.card().is_some_and(|c| c.span().0 < end && start < c.span().1))
+        .map(|(k, _)| *k)
+        .collect();
+    for key in over {
+        let Some(shadow) = owned.remove(&key) else { continue };
+        if let Some(card) = shadow.card() {
+            card.gone.store(true, Ordering::Release);
+        }
+        big::never(&shadow);
+        let_go(&owned, shadow);
+        tracing::info!(start = format_args!("{key:#x}"), "title memory on the card was mapped anew");
     }
 }
 
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
-    D3D12_RESOURCE_BARRIER {
-        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                pResource: std::mem::ManuallyDrop::new(None),
-            }),
-        },
+/// A card taken out of `owned` is handed out no more. Lists and slots that
+/// name it keep it, and submissions look after it, until they go.
+fn let_go(owned: &BTreeMap<u64, Arc<Shadow>>, shadow: Arc<Shadow>) {
+    publish(owned);
+    if let Some(card) = shadow.card() {
+        card.dead.store(true, Ordering::Release);
+        // What no list declared comes back with the next submission, all of
+        // it: it is read in place from now on.
+        card.sweep.lock().unwrap_or_else(|e| e.into_inner()).next = 0;
+        moved(card.span());
     }
+    crate::shadow::card_died(&shadow);
+    crate::host::retire(shadow);
 }
 
-fn drop_barriers(barriers: impl IntoIterator<Item = D3D12_RESOURCE_BARRIER>) {
-    for b in barriers {
-        if b.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION {
-            // SAFETY: we constructed this TRANSITION barrier with `ManuallyDrop`.
-            let t = unsafe { std::mem::ManuallyDrop::into_inner(b.Anonymous.Transition) };
-            let _ = std::mem::ManuallyDrop::into_inner(t.pResource);
+/// Title memory that came onto a card or off one, lately (from, to), and how
+/// many times that happened: slots made for it are made again.
+static MOVED: Mutex<(Vec<(u64, u64)>, u64)> = Mutex::new((Vec::new(), 0));
+/// The second of [`MOVED`].
+static MOVES: AtomicU64 = AtomicU64::new(0);
+const MOVED_KEPT: usize = 256;
+
+fn moved(span: (u64, u64)) {
+    let mut m = MOVED.lock().unwrap_or_else(|e| e.into_inner());
+    if m.0.len() == MOVED_KEPT {
+        m.0.remove(0);
+    }
+    m.0.push(span);
+    m.1 += 1;
+    MOVES.store(m.1, Ordering::Release);
+}
+
+/// How often title memory came onto a card or off one: descriptor slots
+/// made over it before are made again (`HostHeap::forget_moved`).
+pub(crate) fn moves() -> u64 {
+    MOVES.load(Ordering::Acquire)
+}
+
+/// What of it came or went since the first `seen` (`None`: not known any
+/// more), and how often it happened.
+pub(crate) fn moved_since(seen: u64) -> (Option<Vec<(u64, u64)>>, u64) {
+    let m = MOVED.lock().unwrap_or_else(|e| e.into_inner());
+    let n = (m.1 - seen) as usize;
+    ((n <= m.0.len()).then(|| m.0[m.0.len() - n..].to_vec()), m.1)
+}
+
+/// The cards of buffers with bytes in `[from, to)`, alive.
+fn buffers_over(from: usize, to: usize) -> Vec<Arc<Card>> {
+    if moves() == 0 {
+        return Vec::new();
+    }
+    let live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    live.iter()
+        .filter_map(Weak::upgrade)
+        .filter(|c| c.is_buffer() && c.from < to && from < c.to)
+        .collect()
+}
+
+/// Title memory `[at, at + len)` is looked at with the next submission: the
+/// host GPU wrote it in place, or the title committed it anew.
+pub(crate) fn wrote_in_place(at: usize, len: usize) {
+    for card in buffers_over(at, at.saturating_add(len)) {
+        if let (Told::Written(w), Some((a, b))) = (&card.told, card.leaves_of(at, at.saturating_add(len))) {
+            w.lock().unwrap_or_else(|e| e.into_inner()).force(a / LEAVES, b.div_ceil(LEAVES));
         }
     }
+}
+
+/// The kernel may write title memory `[at, at + len)` for a while.
+pub(crate) fn kernel_will_write(at: usize, len: usize) {
+    track::opening(at, len, true);
+    for card in buffers_over(at, at.saturating_add(len)) {
+        if let (Told::Written(w), Some((a, b))) = (&card.told, card.leaves_of(at, at.saturating_add(len))) {
+            w.lock().unwrap_or_else(|e| e.into_inner()).pin(a / LEAVES, b.div_ceil(LEAVES));
+        }
+    }
+}
+
+/// Shaders reach title memory by its address ([`crate::memory`]), whose map
+/// shows a window as it was when first reached, and whose writes no list
+/// declares: the title's buffers stay in place from now on.
+pub(crate) fn by_address() {
+    static ONCE: AtomicBool = AtomicBool::new(false);
+    if !ONCE.swap(true, Ordering::AcqRel) {
+        big::stop();
+    }
+}
+
+/// The memory of every card handed out.
+pub(crate) fn all() -> Vec<Arc<Shadow>> {
+    // SAFETY: routes are never freed.
+    let routes = unsafe { ROUTES.load(Ordering::Acquire).as_ref() };
+    routes.map_or(Vec::new(), |r| r.iter().filter_map(|r| r.shadow.upgrade()).collect())
+}
+
+/// For device-removed reports: the cards' host addresses, title addresses
+/// and lengths.
+pub(crate) fn places() -> Vec<(u64, u64, u64)> {
+    let live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    live.iter()
+        .filter_map(Weak::upgrade)
+        .map(|c| (c.gpu, c.base as u64, c.size as u64))
+        .collect()
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    type Digest = [u32; 4];
-    const MULTIPLIERS: Digest = [0x0100_0193, 0x9E37_79B1, 0x85EB_CA77, 0xC2B2_AE3D];
-
-    fn permute(words: Digest) -> Digest {
-        std::array::from_fn(|i| words[(i + 1) % 4] ^ (words[i] >> 15))
-    }
-
-    fn mix(a: Digest, b: Digest) -> Digest {
-        let salt = [0x27D4_EB2F, 0x1656_67B1, 0x9E37_79B9, 0x85EB_CA6B];
-        permute(std::array::from_fn(|i| {
-            (a[i] ^ b[i].wrapping_mul(salt[i])).wrapping_mul(MULTIPLIERS[i])
-        }))
-    }
-
-    fn legacy_tree(mut slots: [Digest; 64]) -> Digest {
-        for stride in [32, 16, 8, 4, 2, 1] {
-            for i in 0..stride {
-                slots[i] = mix(slots[i], slots[i + stride]);
-            }
-        }
-        slots[0]
-    }
-
-    fn random_word(state: &mut u32) -> u32 {
-        *state ^= *state << 13;
-        *state ^= *state >> 17;
-        *state ^= *state << 5;
-        *state
-    }
-
-    #[test]
-    fn grouped_hash_retains_the_legacy_reduction_tree() {
-        let mut state = 0x5b4e_712d;
-        for _ in 0..1024 {
-            let mut lanes = std::array::from_fn(|_| std::array::from_fn(|_| random_word(&mut state)));
-            let expected = legacy_tree(lanes);
-            for i in 0..16 {
-                lanes[i] = mix(
-                    mix(lanes[i], lanes[i + 32]),
-                    mix(lanes[i + 16], lanes[i + 48]),
-                );
-            }
-            for i in 0..4 {
-                lanes[i] = mix(
-                    mix(lanes[i], lanes[i + 8]),
-                    mix(lanes[i + 4], lanes[i + 12]),
-                );
-            }
-            assert_eq!(mix(mix(lanes[0], lanes[2]), mix(lanes[1], lanes[3])), expected);
-        }
-    }
-
-    fn legacy_page_digest(page: &[u8]) -> Digest {
-        assert_eq!(page.len(), PAGE);
-        let initial = [0x9E37_79B9, 0x85EB_CA6B, 0xC2B2_AE35, 0x27D4_EB2F];
-        let salt = [0x85EB_CA6B, 0xC2B2_AE35, 0x27D4_EB2F, 0x1656_67B1];
-        legacy_tree(std::array::from_fn(|tid| {
-            let mut digest = std::array::from_fn(|i| initial[i] ^ (tid as u32).wrapping_mul(salt[i]));
-            for at in (tid * 16..PAGE).step_by(1024) {
-                digest = permute(std::array::from_fn(|i| {
-                    let start = at + i * 4;
-                    let word = u32::from_le_bytes(page[start..start + 4].try_into().unwrap());
-                    (digest[i] ^ word).wrapping_mul(MULTIPLIERS[i])
-                }));
-            }
-            digest
-        }))
-    }
-
-    fn compare_gpu_hashes(host: &Host) {
-        let engine = CardEngine::new(host).expect("hash pipeline");
-        let pages = 8;
-        let size = pages * PAGE;
-        let hash_bytes = (pages * size_of::<Digest>()) as u64;
-        let (input, input_ptr) = host.shared_buffer(size as u64).expect("test hash input");
-        let hashes = host.uav_buffer(hash_bytes).expect("test hash output");
-        let (readback, readback_ptr) = host.readback_buffer(hash_bytes).expect("test readback");
-
-        let mut bytes = vec![0u8; size];
-        bytes[PAGE..2 * PAGE].fill(0xff);
-        bytes[3 * PAGE - 1] = 0x80;
-        let mut state = 0xc843_751e;
-        for word in bytes[3 * PAGE..].chunks_exact_mut(4) {
-            word.copy_from_slice(&random_word(&mut state).to_le_bytes());
-        }
-        let expected: Vec<_> = bytes.chunks_exact(PAGE).map(legacy_page_digest).collect();
-
-        // SAFETY: Dedicated queue and resources for a bounded test dispatch.
-        // The null event waits synchronously for the signalled fence value.
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), input_ptr, size);
-            let queue: ID3D12CommandQueue = host.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                ..Default::default()
-            }).expect("test queue");
-            let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("test fence");
-            let alloc: ID3D12CommandAllocator = host.device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-                .expect("test allocator");
-            let list: ID3D12GraphicsCommandList = host.device
-                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &engine.pso)
-                .expect("test command list");
-            list.SetComputeRootSignature(&engine.root_sig);
-            engine.dispatch_hash(
-                &list, &input, &hashes, &engine.dummy_uav, 0, size as u32, pages as u32, 0, 0,
-            );
-            let barrier = [transition_barrier(
-                &hashes,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )];
-            list.ResourceBarrier(&barrier);
-            drop_barriers(barrier);
-            list.CopyBufferRegion(&readback, 0, &hashes, 0, hash_bytes);
-            list.Close().expect("close test command list");
-            queue.ExecuteCommandLists(&[Some(list.cast().expect("cast test list"))]);
-            queue.Signal(&fence, 1).expect("signal test fence");
-            fence.SetEventOnCompletion(1, Default::default()).expect("wait for test fence");
-            host.device.GetDeviceRemovedReason().expect("hash ran successfully");
-            assert_eq!(std::slice::from_raw_parts(readback_ptr.cast::<Digest>(), pages), expected);
-        }
-    }
-
-    #[test]
-    fn warp_card_hash_bytes_match_the_legacy_tree() {
-        if let Some(host) = Host::new_warp() {
-            compare_gpu_hashes(&host);
-            println!("validated hash bits on WARP");
-        }
-    }
-
-    #[test]
-    #[ignore = "requires a local D3D12 hardware adapter"]
-    fn hardware_card_hash_bytes_match_the_legacy_tree() {
-        compare_gpu_hashes(crate::host::host().expect("D3D12 host device"));
-    }
-
-    #[test]
-    fn range_helpers_merge_and_convert_pieces() {
-        let mut r = vec![(100, 200), (50, 120), (300, 400), (200, 300)];
-        merge_byte_ranges(&mut r);
-        assert_eq!(r, vec![(50, 400)]);
-
-        let runs = byte_ranges_to_piece_runs(
-            &[(0, 10), (PAGE - 1, PAGE + 1), (3 * PAGE, 4 * PAGE)],
-            8,
-        );
-        assert_eq!(runs, vec![(0, 2), (3, 1)]);
-    }
-
-    #[test]
-    fn warp_card_roundtrip_upload_wave64_hash_and_concurrent_merge() {
-        let Some(host) = Host::new_warp() else {
-            return;
-        };
-        let mut engine = CardEngine::new(&host).expect("CardEngine should build on WARP");
-        let pages = 4usize;
-        let size = (pages * PAGE) as u64;
-        let mut title = vec![0u8; size as usize];
-        for (i, b) in title.iter_mut().enumerate() {
-            *b = ((i.wrapping_mul(31) ^ (i >> 8)) & 0xFF) as u8;
-        }
-        let base = title.as_ptr() as usize;
-
-        let (staging, staging_ptr) = host.shared_buffer(size).expect("staging buffer");
-        let card = CardState::new_unchecked(&host, &staging, size, false).expect("card buffer");
-        let shadow = crate::shadow::Shadow::new_card_test(
-            card.clone(),
-            staging_ptr,
-            base as u64,
-            size,
-        );
-        let mut submitted = 0u64;
-
-        // Phase 1: Initial CPU copy -> upload to VRAM + Wave64 hash, no GPU writes.
-        shadow.copy_for_test(base, base + size as usize);
-        shadow.writing(base, size as usize);
-        let (before, plan) = engine.record_before(&host, &[(shadow.clone(), base, size as usize)]);
-        assert!(before.is_some(), "initial upload + hash must emit before list");
-        assert_eq!(plan.total_pieces, pages as u32);
-        let after = engine.record_after(&host, &plan).expect("after list");
-        host.execute_and_wait_locked(before.unwrap(), &mut submitted);
-        host.execute_and_wait_locked(after, &mut submitted);
-
-        let differs_1 = unsafe {
-            std::slice::from_raw_parts(engine.differs_rb.1 as *const u32, pages).to_vec()
-        };
-        assert_eq!(differs_1, vec![0, 0, 0, 0]);
-        let written_1 = engine.finish_back(&host, plan, &mut submitted);
-        assert_eq!(written_1, 0);
-
-        // Phase 2: GPU writes 4 bytes on page 2 while CPU concurrently writes
-        // 4 different bytes on the same page 2.
-        let (patch_buf, patch_ptr) = host.shared_buffer(256).expect("patch buffer");
-        let gpu_bytes = [0xDEu8, 0xAD, 0xBE, 0xEF];
-        unsafe { std::ptr::copy_nonoverlapping(gpu_bytes.as_ptr(), patch_ptr, 4) };
-        unsafe {
-            let alloc: ID3D12CommandAllocator = host
-                .device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-                .expect("alloc");
-            let list: ID3D12GraphicsCommandList = host
-                .device
-                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
-                .expect("list");
-            list.CopyBufferRegion(
-                &card.vram,
-                (2 * PAGE + 128) as u64,
-                &patch_buf,
-                0,
-                4,
-            );
-            list.Close().expect("close");
-            let cmd: ID3D12CommandList = list.cast().expect("cast");
-            // Execute immediately after record_before while alloc stays alive.
-            shadow.writing(base, size as usize);
-            let (before2, plan2) =
-                engine.record_before(&host, &[(shadow.clone(), base, size as usize)]);
-            assert!(before2.is_none(), "no CPU dirty uploads expected in phase 2");
-            let after2 = engine.record_after(&host, &plan2).expect("after2");
-            // Simulate concurrent CPU modification on page 2 while GPU runs.
-            title[2 * PAGE + 256..2 * PAGE + 260].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
-            host.execute_and_wait_locked(cmd, &mut submitted);
-            drop((list, alloc));
-            host.execute_and_wait_locked(after2, &mut submitted);
-
-            let differs_2 =
-                std::slice::from_raw_parts(engine.differs_rb.1 as *const u32, pages).to_vec();
-            assert_eq!(differs_2, vec![0, 0, 1, 0], "only page 2 should differ");
-            let written_2 = engine.finish_back(&host, plan2, &mut submitted);
-            assert_eq!(written_2, 4, "tight dirty span should write exactly 4 GPU bytes");
-            assert_eq!(&title[2 * PAGE + 128..2 * PAGE + 132], &gpu_bytes);
-            assert_eq!(&title[2 * PAGE + 256..2 * PAGE + 260], &[0x11, 0x22, 0x33, 0x44]);
-
-            // Phase 3: Next submission uploads merged concurrent CPU write on page 2
-            // back to VRAM and re-hashes page 2 so subsequent compare reports 0 diffs.
-            shadow.writing(base, size as usize);
-            let (before3, plan3) =
-                engine.record_before(&host, &[(shadow.clone(), base, size as usize)]);
-            assert!(
-                before3.is_some(),
-                "concurrent CPU write must queue page 2 for re-upload and re-hash"
-            );
-            let after3 = engine.record_after(&host, &plan3).expect("after3");
-            host.execute_and_wait_locked(before3.unwrap(), &mut submitted);
-            host.execute_and_wait_locked(after3, &mut submitted);
-            let written_3 = engine.finish_back(&host, plan3, &mut submitted);
-            assert_eq!(written_3, 0, "after re-upload + re-hash, 0 bytes should differ");
-
-            // Read back page 2 directly from VRAM and verify both GPU and CPU writes exist there.
-            let (rb, rb_ptr) = host.readback_buffer(PAGE as u64).expect("verify rb");
-            let v_alloc: ID3D12CommandAllocator = host
-                .device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-                .expect("v_alloc");
-            let v_list: ID3D12GraphicsCommandList = host
-                .device
-                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &v_alloc, None)
-                .expect("v_list");
-            v_list.CopyBufferRegion(&rb, 0, &card.vram, (2 * PAGE) as u64, PAGE as u64);
-            v_list.Close().expect("v_close");
-            let v_cmd: ID3D12CommandList = v_list.cast().expect("v_cast");
-            host.execute_and_wait_locked(v_cmd, &mut submitted);
-            let vram_page2 = std::slice::from_raw_parts(rb_ptr, PAGE);
-            assert_eq!(&vram_page2[128..132], &gpu_bytes);
-            assert_eq!(&vram_page2[256..260], &[0x11, 0x22, 0x33, 0x44]);
-        }
-    }
-}
+mod tests;

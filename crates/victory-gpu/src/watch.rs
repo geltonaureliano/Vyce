@@ -196,6 +196,44 @@ fn observe_writes<T>(
     Some((now, report(j, first, last)))
 }
 
+/// For who keeps when each 64 KiB page of write-watched `[start, end)` (whole
+/// pages) was last looked at: this asking's number, the kernel's pages
+/// (addresses, 4 KiB each) written since anyone last asked, and the pages
+/// others' askings found written before (page number, asking). `None` if the
+/// memory is not write-watched.
+pub(crate) fn watched(start: usize, end: usize) -> Option<(u64, Vec<usize>, Vec<(usize, u64)>)> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    let mut count = (last - first) * PAGE / KERNEL_PAGE;
+    j.found.resize(count.max(j.found.len()), 0);
+    let mut granularity = 0;
+    // SAFETY: the answer buffer holds `count` entries.
+    let failed = unsafe {
+        GetWriteWatch(
+            WRITE_WATCH_FLAG_RESET,
+            (first * PAGE) as *const _,
+            (last - first) * PAGE,
+            j.found.as_mut_ptr().cast(),
+            &mut count,
+            &mut granularity,
+        )
+    } != 0;
+    if failed {
+        return None;
+    }
+    let others = j.pages(first, last);
+    j.asked += 1;
+    let now = j.asked;
+    let Journal { written, found, .. } = j;
+    for hits in found[..count].chunk_by(|a, b| *a / PAGE == *b / PAGE) {
+        written.insert(hits[0] / PAGE, now);
+    }
+    Some((now, found[..count].to_vec(), others))
+}
+
 /// Same as [`writes`] for memory already known to be guarded `MEM_MAPPED`
 /// view memory: skips the `GetWriteWatch` syscall (which always fails on
 /// mapped views).
@@ -321,6 +359,28 @@ pub(crate) fn stretch(at: usize, end: usize, reach: usize) -> Option<(usize, usi
     Some((start_in, stop.min(high), section, from + (start_in - start) as u64))
 }
 
+/// The one view of title memory that shows all of `[at, end)`: its start, its
+/// length, the section and the offset in it.
+pub(crate) fn view_of(at: usize, end: usize) -> Option<(usize, usize, usize, u64)> {
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let (&start, &(len, section, offset)) = views.as_ref()?.by_addr.range(..=at).next_back()?;
+    (end <= start + len).then_some((start, len, section, offset))
+}
+
+/// Of the blocks of the view at `[start, start + len)`, those whose page is
+/// shown at another address too.
+pub(crate) fn shown_twice(start: usize, len: usize) -> Vec<usize> {
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(views) = views.as_ref() else { return Vec::new() };
+    (start..start + len).step_by(BLOCK).filter(|&at| views.shown(at).len() > 1).collect()
+}
+
+/// Blocks of `[start, start + len)` are guarded here no longer (a card's
+/// track does from now on): they are writable.
+pub(crate) fn give_up(start: usize, len: usize) {
+    open(&mut guards(), start, start + len);
+}
+
 /// Diagnostics: how `[at, at + len)` is made of views of physical pages:
 /// the views, their sections, the longest view, and the runs of views that
 /// follow one another in their section too (one run: the range is one
@@ -433,8 +493,16 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     }
     if !others.is_empty() {
         let mut g = guards();
-        for a in others {
+        for &a in &others {
             open_here(&mut g, a, a + BLOCK);
+        }
+        drop(g);
+        // A card's blocks: a write through the new view does not fault.
+        for k in 0..len / BLOCK {
+            crate::card::track::shown_elsewhere(at + k * BLOCK);
+        }
+        for a in others {
+            crate::card::track::shown_elsewhere(a);
         }
     }
 }
@@ -465,7 +533,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             for block in first..=last {
                 let open = block < last && !g.clean.contains(&block) && !g.holes.contains(&block);
                 if open {
-                    if g.protected.contains(&block) {
+                    if crate::card::track::tracked(block * BLOCK) {
+                        note_tracked(block, &mut written);
+                    } else if g.protected.contains(&block) {
                         g.clean.insert(block);
                         written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
                     } else {
@@ -503,7 +573,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             && !g.holes.contains(&block)
             && (!check_each || mapped(block * BLOCK));
         if open {
-            if g.pinned(block) {
+            if crate::card::track::tracked(block * BLOCK) {
+                note_tracked(block, &mut written);
+            } else if g.pinned(block) {
                 // The kernel may be writing it: left writable, reported
                 // written at every check until the pin ends.
                 written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
@@ -523,6 +595,14 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
     }
     Some(written)
+}
+
+/// A block a card's track guards, met by a copy of the same memory (one that
+/// goes past the card): its protection is the track's, so it is reported
+/// written at every check.
+fn note_tracked(block: usize, written: &mut Vec<usize>) {
+    written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+    bump_region_epochs(block * BLOCK, (block + 1) * BLOCK);
 }
 
 /// Scans `[start, end)` jumping over unmapped holes; returns the first
@@ -733,12 +813,24 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     true
 }
 
+/// Before the title's kernel reads into its own memory `[at, at + len)`,
+/// which may land after the call that asked for them returned: as
+/// [`writing`], and a card's blocks stay open for a while too.
+pub fn kernel_will_write(at: usize, len: usize) {
+    if len != 0 {
+        crate::card::kernel_will_write(at, len);
+        writing(at, len);
+    }
+}
+
 /// Before our own write into title memory `[at, at + len)` through the
 /// kernel (which does not fault into our handler): opens its guarded blocks.
-/// The runtime calls it (as `kernel_will_write`) before the title's kernel
-/// reads into its own memory.
-pub fn writing(at: usize, len: usize) {
+pub(crate) fn writing(at: usize, len: usize) {
     if len == 0 {
+        return;
+    }
+    // A card's view: no other guards are over it.
+    if crate::card::track::opening(at, len, false) {
         return;
     }
     let (first, last) = (at / BLOCK, (at + len).div_ceil(BLOCK));
@@ -848,6 +940,7 @@ pub fn title_memory_written(at: usize, len: usize) {
                 j.written.insert(page, now);
             }
         }
+        crate::card::track::written(at, len);
         crate::resource::textures_rewritten(at as u64, (at + len) as u64);
     }
 }
@@ -856,6 +949,16 @@ pub fn title_memory_written(at: usize, len: usize) {
 /// made it read-write). Called both by our own VEH handler and by
 /// `host::safe_copy`'s VEH handler on write faults.
 pub(crate) fn try_open_guarded(at: usize) -> bool {
+    // Without a lock: the thread may be in the middle of anything.
+    use crate::card::track::Fault;
+    match crate::card::track::fault(at) {
+        Fault::No => {}
+        Fault::Opened => return true,
+        Fault::Shared => {
+            open(&mut guards(), at, at + 1);
+            return true;
+        }
+    }
     let mut g = guards();
     if open(&mut g, at, at + 1) {
         #[cfg(feature = "diagnostics")]
@@ -890,7 +993,7 @@ pub(crate) fn try_open_guarded(at: usize) -> bool {
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
-fn install() {
+pub(crate) fn install() {
     use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
     use windows_sys::Win32::System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,

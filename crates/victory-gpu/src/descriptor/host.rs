@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+use super::strides::StrideTable;
 use super::{VIEW_TAG, View, stale_views, view_at};
 use crate::host::{Host, host};
 
@@ -45,7 +46,7 @@ pub(crate) struct HostHeap {
     next: Mutex<(u32, Vec<bool>, usize)>,
     /// Per-slot element byte stride (`u32`) for structured buffers whose
     /// stride shader analysis could not recover statically.
-    strides: Option<StrideTable>,
+    strides: Option<Arc<StrideTable>>,
     /// Populated buffer, constant-buffer, and placed-texture slots (`< count`)
     /// tracked for bindless `ResourceDescriptorHeap[]` materialization.
     bindless: Mutex<Bindless>,
@@ -63,65 +64,10 @@ pub(crate) struct HostHeap {
     rewrites_seen: AtomicU64,
     /// The views of memory by address made ([`crate::memory::fill`]).
     memory_seen: Mutex<u64>,
-}
-
-/// The dword of the stride table the element counts start at.
-const COUNTS_AT: u32 = victory_shader::emit::OWN_SLOTS;
-
-struct StrideTable {
-    _resource: ID3D12Resource,
-    ptr: usize,
-    gpu: u64,
-    len: u32,
-}
-
-impl StrideTable {
-    /// The element counts follow the strides, from [`COUNTS_AT`] dwords on
-    /// (where shaders, which know no heap's size, look for them).
-    fn new(device: &ID3D12Device, len: u32) -> Option<Self> {
-        let bytes = ((u64::from(COUNTS_AT) + u64::from(len)) * 4).max(4);
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: bytes,
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            ..Default::default()
-        };
-        let mut resource: Option<ID3D12Resource> = None;
-        let mut p = std::ptr::null_mut();
-        // SAFETY: plain committed upload buffer creation and persistent CPU map.
-        let gpu = unsafe {
-            device
-                .CreateCommittedResource(
-                    &D3D12_HEAP_PROPERTIES {
-                        Type: D3D12_HEAP_TYPE_UPLOAD,
-                        ..Default::default()
-                    },
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
-                    None,
-                    &mut resource,
-                )
-                .ok()?;
-            let res = resource.as_ref()?;
-            res.Map(0, None, Some(&mut p)).ok()?;
-            std::ptr::write_bytes(p.cast::<u8>(), 0, bytes as usize);
-            res.GetGPUVirtualAddress()
-        };
-        Some(Self {
-            _resource: resource?,
-            ptr: p as usize,
-            gpu,
-            len,
-        })
-    }
+    /// [`crate::card::moves`] as last looked at ([`HostHeap::forget_moved`]),
+    /// and the lock of that look.
+    moves_seen: AtomicU64,
+    moves_looked: Mutex<u64>,
 }
 
 impl Drop for HostHeap {
@@ -216,6 +162,10 @@ struct Bindless {
     /// The frame (plus one) the plan's lists of everything were last made in,
     /// and whether slots changed since.
     full: (u64, bool),
+    /// The slots with a range on a card that shaders may write, and those
+    /// ranges merged (`None`: the slots changed since).
+    card_slots: BTreeMap<u32, (Arc<crate::shadow::Shadow>, usize, usize)>,
+    card_writes: Option<Arc<Vec<(Arc<crate::shadow::Shadow>, usize, usize)>>>,
 }
 
 /// Time for making changed slots, at submission and at recording: an eighth
@@ -233,6 +183,31 @@ const SLOT_CHUNK: usize = 512;
 const URGENT: usize = 2048;
 
 impl Bindless {
+    /// Slot `index` may write `range` of a card, or none.
+    fn card_slot(&mut self, index: u32, range: &Range) {
+        let same = same_range(&self.card_slots.get(&index).cloned(), range);
+        if same {
+            return;
+        }
+        self.card_writes = None;
+        match range {
+            Some(r) => {
+                self.card_slots.insert(index, r.clone());
+            }
+            None => {
+                self.card_slots.remove(&index);
+            }
+        }
+    }
+
+    /// What slots may write of cards, merged.
+    fn card_ranges(&mut self) -> Arc<Vec<(Arc<crate::shadow::Shadow>, usize, usize)>> {
+        let slots = &self.card_slots;
+        self.card_writes
+            .get_or_insert_with(|| Arc::new(merged(slots.values().cloned().collect(), 0)))
+            .clone()
+    }
+
     /// The slot-making budget, refilled for the time passed since.
     fn budget(&mut self) -> &mut [u64; 2] {
         let now = std::time::Instant::now();
@@ -260,11 +235,13 @@ struct SlotUse {
     read: Option<(Arc<crate::shadow::Shadow>, usize, usize)>,
     /// What shaders may write through it.
     write: Option<(Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// As `write`, on a card ([`crate::card`]), whatever its length.
+    card_write: Option<(Arc<crate::shadow::Shadow>, usize, usize)>,
     /// A misaligned constant buffer: bounce slice, title address, bytes.
     bounce: Option<(usize, u64, u32)>,
     /// The host resource it views.
     retained: Option<ID3D12Resource>,
-    /// The title memory it views in place.
+    /// The title memory it views in place, or on a card.
     direct: Option<Arc<crate::shadow::Shadow>>,
     /// It views a placed texture: the texture's object (0 for none), made
     /// again when the texture is evicted.
@@ -368,6 +345,8 @@ pub(crate) struct BindlessPlan {
     /// The unordered access slots' ranges (up to [`WRITE_CAP`] each), merged:
     /// copied back after a submission whose shaders may write memory.
     pub(crate) writes: Arc<Vec<(Arc<crate::shadow::Shadow>, usize, usize)>>,
+    /// The unordered access slots' ranges on cards, merged.
+    pub(crate) card_writes: Arc<Vec<(Arc<crate::shadow::Shadow>, usize, usize)>>,
     /// Misaligned constant buffers: bounce slice, title address, bytes.
     bounces: Arc<Vec<(usize, u64, u32)>>,
     /// Of them, those new in this plan.
@@ -771,6 +750,8 @@ impl HostHeap {
             recheck_at: AtomicU64::new(u64::MAX),
             rewrites_seen: AtomicU64::new(0),
             memory_seen: Mutex::new(0),
+            moves_seen: AtomicU64::new(0),
+            moves_looked: Mutex::new(0),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1113,21 +1094,14 @@ impl HostHeap {
     /// (zeros for anything else), for shaders: a size query of a structured
     /// buffer of some strides crashes the AMD driver's compiler.
     fn set_stride_count(&self, index: u32, stride: u32, count: u32) {
-        if let Some(t) = &self.strides
-            && index < t.len
-        {
-            // SAFETY: `t.ptr` points to a live mapped UPLOAD buffer of
-            // `COUNTS_AT + t.len` dwords.
-            unsafe {
-                *(t.ptr as *mut u32).add(index as usize) = stride;
-                *(t.ptr as *mut u32).add((COUNTS_AT + index) as usize) = count;
-            }
+        if let Some(t) = &self.strides {
+            t.set(index, stride, count);
         }
     }
 
     /// GPU virtual address of the per-slot element byte stride table.
     pub(crate) fn stride_table_gpu(&self) -> Option<u64> {
-        self.strides.as_ref().map(|t| t.gpu)
+        self.strides.as_ref().map(|t| t.gpu())
     }
 
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
@@ -1171,6 +1145,9 @@ impl HostHeap {
                 );
             }
             return None;
+        }
+        if for_draw {
+            self.forget_moved();
         }
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
@@ -1232,6 +1209,71 @@ impl HostHeap {
         Some(view)
     }
 
+    /// Marks unmade the slots made over title memory that came onto a card
+    /// or off one since ([`crate::card::moved_since`]), and returns them.
+    /// They are made again before lists that use them run: a draw's table
+    /// when it is recorded, a heap shaders index directly at its submission.
+    /// A shader writing through the old view would write where nothing
+    /// looks ([`crate::card`]).
+    fn forget_moved(&self) -> Vec<u32> {
+        let moves = crate::card::moves();
+        if self.sampler || self.moves_seen.load(Ordering::Acquire) == moves {
+            return Vec::new();
+        }
+        // One thread looks; the others wait for it, then find nothing new.
+        let mut looked = self.moves_looked.lock().unwrap_or_else(|e| e.into_inner());
+        let (spans, now) = crate::card::moved_since(*looked);
+        if now == *looked {
+            self.moves_seen.store(now, Ordering::Release);
+            return Vec::new();
+        }
+        let started = std::time::Instant::now();
+        // The slots made, then what they view, with no lock held.
+        let slots: Vec<(u32, u64)> = {
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            made.iter()
+                .enumerate()
+                .filter(|(_, key)| **key != 0)
+                .map(|(i, key)| (i as u32, *key))
+                .collect()
+        };
+        let meets = |address: u64, len: u64| {
+            let end = address.saturating_add(len.max(1));
+            spans.as_ref().is_none_or(|s| s.iter().any(|&(from, to)| from < end && address < to))
+        };
+        let over: Vec<(u32, u64)> = slots
+            .into_iter()
+            .filter(|&(_, key)| match view_at(key as u32, (key >> 32) as u32) {
+                Some(View::Constant(address, size)) => meets(address, u64::from(size.min(65_536))),
+                Some(view) => buffer_range(&view).is_some_and(|(address, len)| meets(address, len)),
+                None => false,
+            })
+            .collect();
+        let mut forgot = Vec::with_capacity(over.len());
+        {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            for (i, key) in over {
+                // Made anew meanwhile: by what is there now.
+                if made[i as usize] == key {
+                    made[i as usize] = 0;
+                    forgot.push(i);
+                }
+            }
+        }
+        *looked = now;
+        self.moves_seen.store(now, Ordering::Release);
+        if !forgot.is_empty() {
+            let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+            for &i in &forgot {
+                if b.slots.contains_key(&i) {
+                    b.dirty.insert(i);
+                }
+            }
+        }
+        tracing::debug!(slots = forgot.len(), us = started.elapsed().as_micros() as u64, "slots over memory that moved to or from a card");
+        forgot
+    }
+
     fn track_bindless(&self, index: u32, entry: (u32, u32), placed: bool) {
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
         if b.slots.insert(index, entry) != Some(entry) {
@@ -1272,6 +1314,7 @@ impl HostHeap {
         b.busy.remove(&index);
         b.unmapped_slots.remove(&index);
         b.direct_slots.remove(&index);
+        b.card_slot(index, &None);
         b.recorded.remove(&index);
         if entry.is_none_or(|e| b.slots.get(&index) == Some(&e)) {
             b.slots.remove(&index);
@@ -1726,6 +1769,7 @@ impl HostHeap {
             b.checked.1 != epochs.1 && b.looked[0] != frame
         };
         let live = evictions.then(crate::resource::placed_live);
+        let moved = self.forget_moved();
         let (mut todo, check, remade, exempt) = {
             let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
             let b = &mut *b;
@@ -1777,6 +1821,12 @@ impl HostHeap {
             }
             if b.dirty.is_empty() {
                 b.recent.clear();
+            }
+            // Over memory that came onto a card or off one: made now.
+            for &i in &moved {
+                if b.dirty.remove(&i) {
+                    urgent.push(i);
+                }
             }
             while dirty.len() < 4 * SLOT_CHUNK
                 && let Some(i) = b.dirty.pop_first()
@@ -1950,6 +2000,7 @@ impl HostHeap {
                     b.busy.remove(&index);
                     b.unmapped_slots.remove(&index);
                     b.direct_slots.remove(&index);
+                    b.card_slot(index, &None);
                 }
                 Some((_, Some(u))) => {
                     fresh.extend(u.bounce);
@@ -1974,6 +2025,7 @@ impl HostHeap {
                     } else {
                         b.direct_slots.remove(&index);
                     }
+                    b.card_slot(index, &u.card_write);
                     b.uses.insert(index, u);
                 }
                 Some((e, None)) => self.drop_bindless(&mut b, index, Some(e)),
@@ -1994,12 +2046,14 @@ impl HostHeap {
         if !made_any && (!b.full.1 || !remake) && let Some(plan) = &b.plan {
             return Some(plan.clone());
         }
+        let card_writes = b.card_ranges();
         // All of it is copied by the first submission of a frame only: the
         // later ones take what is new.
         if !remake && let Some(plan) = &b.plan {
             let plan = Arc::new(BindlessPlan {
                 reads: plan.reads.clone(),
                 writes: plan.writes.clone(),
+                card_writes,
                 bounces: plan.bounces.clone(),
                 fresh,
                 fresh_reads,
@@ -2029,6 +2083,7 @@ impl HostHeap {
         let plan = Arc::new(BindlessPlan {
             reads: Arc::new(merged(reads, READ_GAP)),
             writes: Arc::new(merged(writes, 0)),
+            card_writes,
             bounces: Arc::new(bounces),
             fresh,
             fresh_reads,
@@ -2081,8 +2136,9 @@ impl HostHeap {
                     Some(res) => slot.retained = Some(res),
                     None => return unmapped(&view, address, u64::from(capped)),
                 }
+                slot.at = (address, address + u64::from(capped));
                 match reads.pop() {
-                    Some((s, _, _)) if s.is_direct() => slot.direct = Some(s),
+                    Some((s, _, _)) if s.is_direct() || s.is_card() => slot.direct = Some(s),
                     read => slot.read = read,
                 }
                 slot.bounce = bounces.pop();
@@ -2119,10 +2175,18 @@ impl HostHeap {
                 if !valid_title_address(address, len) {
                     return unmapped(&view, address, len);
                 }
+                slot.at = (address, address.saturating_add(len.max(1)));
                 slot.retained = self.ensure_buffer_slot(index, key, &view);
                 if let Some(shadow) = crate::shadow::find(address, len) {
                     let clamped = len.min(shadow.left(address)) as usize;
-                    if shadow.is_direct() {
+                    if shadow.is_card() {
+                        // Submissions look after all of the card, for what
+                        // shaders read; what they write is noted.
+                        if clamped > 0 && matches!(view, View::Unordered(..) | View::Placed(true, ..)) {
+                            slot.card_write = Some((shadow.clone(), address as usize, clamped));
+                        }
+                        slot.direct = Some(shadow);
+                    } else if shadow.is_direct() {
                         slot.direct = Some(shadow);
                     } else if clamped > 0 {
                         slot.read = Some((shadow.clone(), address as usize, clamped));
