@@ -12,8 +12,8 @@
 //! descriptor heaps, [`root`] root signatures, [`query`] query heaps,
 //! [`signature`] command signatures, [`pipeline`] pipeline states,
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
-//! share, [`console`] which console model the title sees. Planned:
-//! `present` (swap chain).
+//! share, [`console`] which console model the title sees, [`loading`] how
+//! far a load of the title's has come. Planned: `present` (swap chain).
 
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
@@ -36,6 +36,8 @@ mod host;
 #[cfg(windows)]
 mod indirect;
 pub mod list;
+#[cfg(windows)]
+pub mod loading;
 #[cfg(windows)]
 mod memwait;
 #[cfg(windows)]

@@ -21,6 +21,8 @@ extern "system" fn create_device(
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
+    #[cfg(windows)]
+    victory_gpu::loading::start();
     device::create(adapter, parameters, iid, out)
 }
 
@@ -37,11 +39,12 @@ fn host_gpu_failed(what: &str) -> ! {
 }
 
 /// Keeps the host's translations of the title's shaders in `dir` (a
-/// folder of the cache) across runs, and its compiled pipelines beside it
-/// (`pipelines`).
+/// folder of the cache) across runs, and beside it its compiled pipelines
+/// (`pipelines`) and how its loads went (`loads.txt`).
 pub fn use_shader_cache(dir: std::path::PathBuf) {
     #[cfg(windows)]
     {
+        victory_gpu::loading::use_history(dir.with_file_name("loads.txt"));
         victory_gpu::pipeline::use_pipeline_cache(dir.with_file_name("pipelines"));
         victory_gpu::shader_cache::use_shader_cache(dir);
     }

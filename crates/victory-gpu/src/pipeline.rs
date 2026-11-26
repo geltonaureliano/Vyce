@@ -74,6 +74,10 @@ pub(crate) struct Shader {
     /// ([`crate::ambient::REFLECTED`]).
     #[cfg(windows)]
     pub(crate) ends_reflections: bool,
+    /// It is the title's temporal resolve, whose groups say how large the
+    /// scene is (looked for only for the session panel).
+    #[cfg(windows)]
+    pub(crate) resolves_scene: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -144,6 +148,11 @@ impl std::fmt::Debug for Shader {
     }
 }
 
+/// The name of the title's temporal resolve (Grand Theft Auto VI), which runs
+/// in groups of 8 by 8 pixels.
+#[cfg(windows)]
+const RESOLVE: &[u8] = b"CS_TAA2_Resolve";
+
 /// Every container seen, by full content hash.
 static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
 
@@ -204,6 +213,11 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 ends_reflections: bytes
                     .windows(crate::ambient::REFLECTED.len())
                     .any(|w| w == crate::ambient::REFLECTED),
+                #[cfg(windows)]
+                resolves_scene: crate::telemetry::on()
+                    && bytes
+                        .windows(RESOLVE.len())
+                        .any(|w| w == RESOLVE),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
@@ -412,6 +426,19 @@ pub(crate) fn peek_host_pipeline<'a>(this: This) -> Option<&'a host::HostPipelin
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
     make::waiting()
+}
+
+/// Host pipelines that were queued and are done with.
+#[cfg(windows)]
+pub(crate) fn finished() -> u64 {
+    make::finished()
+}
+
+/// Whether host pipelines are made anew in this run, not loaded (a new
+/// driver or build).
+#[cfg(windows)]
+pub(crate) fn cold() -> bool {
+    library::cold()
 }
 
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
@@ -732,7 +759,14 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
 /// Saves the pipeline cache now if anything was added (at the end of a run).
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
-    library::save(true);
+    library::save_now();
+}
+
+/// Has the pipeline cache saved soon, in the background, if anything was
+/// added (a load of the title's ended).
+#[cfg(windows)]
+pub(crate) fn save_pipeline_cache_soon() {
+    library::save_soon();
 }
 
 #[cfg(test)]

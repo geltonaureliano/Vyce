@@ -604,7 +604,7 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            let ms = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, code(0));
+            let ms = MeshStream::new(code(0));
             let made = match depth_with_bounds {
                 Some(depth) => stream_pipeline(
                     &host.device, &root, ms, code(1), g,
@@ -761,7 +761,79 @@ struct VertexStream {
     topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
 }
 
+/// A mesh pipeline's first stage. The type of primitive is what the host
+/// derives from the mesh shader anyway, given: a pipeline library keeps it
+/// with the pipeline and compares it, so that a stream without it loads
+/// nothing, not even what it made itself, and every mesh pipeline was
+/// compiled again in every run. What was stored so loads with it: a mesh
+/// pipeline's name in the library stays what it was.
+#[repr(C)]
+struct MeshStream {
+    ms: Sub<D3D12_SHADER_BYTECODE>,
+    topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+}
+
+impl MeshStream {
+    fn new(ms: D3D12_SHADER_BYTECODE) -> MeshStream {
+        MeshStream {
+            ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
+            // No other mesh shader translates (`mesh_prologue`).
+            topology: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+                D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            ),
+        }
+    }
+}
+
 /// The stream form used by mesh pipelines and vertex pipelines with depth bounds.
+#[repr(C)]
+struct Stream<S, D> {
+    root: Sub<*mut std::ffi::c_void>,
+    stages: S,
+    ps: Sub<D3D12_SHADER_BYTECODE>,
+    blend: Sub<D3D12_BLEND_DESC>,
+    mask: Sub<u32>,
+    raster: Sub<D3D12_RASTERIZER_DESC>,
+    depth: Sub<D>,
+    targets: Sub<D3D12_RT_FORMAT_ARRAY>,
+    dsv: Sub<DXGI_FORMAT>,
+    samples: Sub<DXGI_SAMPLE_DESC>,
+}
+
+impl<S, D> Stream<S, D> {
+    fn new(
+        root: &ID3D12RootSignature,
+        stages: S,
+        ps: D3D12_SHADER_BYTECODE,
+        g: &GraphicsState,
+        depth: Sub<D>,
+    ) -> Stream<S, D> {
+        Stream {
+            root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
+            stages,
+            ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
+            mask: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
+                g.sample_mask,
+            ),
+            raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
+            depth,
+            targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
+            dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
+            samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
+        }
+    }
+
+    fn desc(&mut self) -> D3D12_PIPELINE_STATE_STREAM_DESC {
+        D3D12_PIPELINE_STATE_STREAM_DESC {
+            SizeInBytes: size_of_val(self),
+            pPipelineStateSubobjectStream: std::ptr::from_mut(self).cast(),
+        }
+    }
+}
+
 fn stream_pipeline<S, D>(
     device: &ID3D12Device,
     root: &ID3D12RootSignature,
@@ -771,38 +843,8 @@ fn stream_pipeline<S, D>(
     depth: Sub<D>,
     (name, shaders): (&str, &[Arc<Shader>]),
 ) -> windows::core::Result<ID3D12PipelineState> {
-    #[repr(C)]
-    struct Stream<S, D> {
-        root: Sub<*mut std::ffi::c_void>,
-        stages: S,
-        ps: Sub<D3D12_SHADER_BYTECODE>,
-        blend: Sub<D3D12_BLEND_DESC>,
-        mask: Sub<u32>,
-        raster: Sub<D3D12_RASTERIZER_DESC>,
-        depth: Sub<D>,
-        targets: Sub<D3D12_RT_FORMAT_ARRAY>,
-        dsv: Sub<DXGI_FORMAT>,
-        samples: Sub<DXGI_SAMPLE_DESC>,
-    }
-    let mut stream = Stream {
-        root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
-        stages,
-        ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
-        mask: Sub(
-            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
-            g.sample_mask,
-        ),
-        raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
-        depth,
-        targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
-        dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
-        samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
-    };
-    let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
-        SizeInBytes: size_of_val(&stream),
-        pPipelineStateSubobjectStream: (&raw mut stream).cast(),
-    };
+    let mut stream = Stream::new(root, stages, ps, g, depth);
+    let desc = stream.desc();
     let device = device.cast::<ID3D12Device2>()?;
     super::library::pipeline(
         name,
@@ -981,6 +1023,181 @@ mod tests {
                 assert!(state.depth.StencilEnable.as_bool());
                 assert_eq!(state.depth_bounds, bounds);
             }
+        }
+    }
+
+    /// A DXBC container that holds `parts`.
+    fn container(parts: &[([u8; 4], &[u8])]) -> Vec<u8> {
+        let table = 0x20 + 4 * parts.len();
+        let total = table + parts.iter().map(|(_, d)| 8 + d.len()).sum::<usize>();
+        let mut out = b"DXBC".to_vec();
+        out.extend([0; 16]);
+        for v in [1, total as u32, parts.len() as u32] {
+            out.extend(v.to_le_bytes());
+        }
+        let mut at = table;
+        for (_, data) in parts {
+            out.extend((at as u32).to_le_bytes());
+            at += 8 + data.len();
+        }
+        for (name, data) in parts {
+            out.extend(name);
+            out.extend((data.len() as u32).to_le_bytes());
+            out.extend(*data);
+        }
+        out
+    }
+
+    /// A signature part of one float4 in row 0 with a system value.
+    fn signature(name: &[u8], system_value: u32) -> Vec<u8> {
+        let words = [1, 8, 0, 40, 0, system_value, 3, 0, 0xf, 0];
+        let mut out: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        out.extend(name);
+        out
+    }
+
+    /// The translation of a program of ours that writes what `output` says.
+    fn translated(
+        stage: victory_shader::HwStage,
+        io: victory_shader::native::StageIo,
+        code: &[u32],
+        output: &[u8],
+    ) -> Vec<u8> {
+        use victory_shader::{Container, NativeProgram, emit, io as inputs, ir, resource, structure};
+        let native = NativeProgram {
+            stage,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io,
+            code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let bytes = container(&[(*b"OSG1", output)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let io = inputs::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        emit::emit(&c, &native, &p, &st, &io, &res, emit::Target::ANY).unwrap().dxil
+    }
+
+    /// Every lane exports a vertex and a triangle.
+    fn mesh_shader() -> Vec<u8> {
+        let io = victory_shader::native::StageIo::Ms(victory_shader::native::MeshIo {
+            outputs: vec![],
+            clip_cntl: 0,
+            threads: 32,
+            max_vertices: 32,
+            max_primitives: 32,
+            topology: 2,
+            lds_bytes: 0,
+        });
+        let code = [
+            0x7e00_0280, // v_mov_b32 v0, 0
+            0x7e02_02f2, // v_mov_b32 v1, 1.0
+            0x7e04_02ff,
+            0x0020_0400, // v_mov_b32 v2, 0x200400
+            0xf800_0941,
+            0x0000_0002, // exp prim v2, off, off, off done
+            0xf800_08cf,
+            0x0100_0000, // exp pos0 v0, v0, v0, v1 done
+            0xbf81_0000, // s_endpgm
+        ];
+        translated(victory_shader::HwStage::Ms, io, &code, &signature(b"SV_Position\0", 1))
+    }
+
+    fn pixel_shader() -> Vec<u8> {
+        let io = victory_shader::native::StageIo::Ps {
+            inputs: vec![],
+            input_addr: 0,
+            db_shader_control: 0,
+            patches: vec![],
+        };
+        let code = [
+            0x7e00_0280, // v_mov_b32 v0, 0
+            0xf800_080f,
+            0x0000_0000, // exp mrt0 v0, v0, v0, v0 done
+            0xbf81_0000, // s_endpgm
+        ];
+        translated(victory_shader::HwStage::Ps, io, &code, &signature(b"SV_Target\0", 64))
+    }
+
+    fn bytecode(code: &[u8]) -> D3D12_SHADER_BYTECODE {
+        D3D12_SHADER_BYTECODE {
+            pShaderBytecode: code.as_ptr().cast(),
+            BytecodeLength: code.len(),
+        }
+    }
+
+    /// Mesh pipelines come back from a library and from its bytes, by the
+    /// streams they were made from.
+    #[test]
+    fn mesh_pipelines_load_from_a_library() {
+        use windows::core::{HSTRING, PCWSTR};
+        let Some(host) = host().filter(|h| h.mesh_shaders()) else {
+            eprintln!("skipped: no host mesh shaders");
+            return;
+        };
+        let (ms, ps) = (mesh_shader(), pixel_shader());
+        let (root, _) = root_signature(&host.device, &[], &[], false).unwrap();
+        let device = host.device.cast::<ID3D12Device2>().unwrap();
+        let empty = |bytes: &[u8]| -> ID3D12PipelineLibrary1 {
+            let device = host.device.cast::<ID3D12Device1>().unwrap();
+            // SAFETY: the bytes outlive the library in every use below.
+            let library: ID3D12PipelineLibrary = unsafe { device.CreatePipelineLibrary(bytes) }.unwrap();
+            library.cast().unwrap()
+        };
+        let mut color = GraphicsState::default();
+        color.depth.DepthEnable = false.into();
+        color.targets.NumRenderTargets = 1;
+        color.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let depth_only = GraphicsState {
+            depth_format: DXGI_FORMAT_D32_FLOAT,
+            ..GraphicsState::default()
+        };
+        let library = empty(&[]);
+        let cases = [
+            ("color", &color, bytecode(&ps)),
+            ("depth", &depth_only, D3D12_SHADER_BYTECODE::default()),
+        ];
+        let depth = |g: &GraphicsState| Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth);
+        for (name, g, ps) in &cases {
+            let mut stream = Stream::new(&root, MeshStream::new(bytecode(&ms)), *ps, g, depth(g));
+            let wide = HSTRING::from(*name);
+            // SAFETY: the stream holds whole subobjects pointing at live data.
+            unsafe {
+                let desc = stream.desc();
+                let pso: ID3D12PipelineState = device.CreatePipelineState(&desc).unwrap();
+                library.StorePipeline(PCWSTR(wide.as_ptr()), &pso).unwrap();
+                let again: windows::core::Result<ID3D12PipelineState> =
+                    library.LoadPipeline(PCWSTR(wide.as_ptr()), &desc);
+                again.unwrap_or_else(|e| panic!("{name}: {e}"));
+            }
+        }
+        // As runs before this stored them: a stream without a topology.
+        let without = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, bytecode(&ms));
+        let mut without = Stream::new(&root, without, bytecode(&ps), &color, depth(&color));
+        // SAFETY: as above.
+        unsafe {
+            let pso: ID3D12PipelineState = device.CreatePipelineState(&without.desc()).unwrap();
+            library.StorePipeline(windows::core::w!("before"), &pso).unwrap();
+        }
+        // SAFETY: a buffer of the size the library asks for.
+        let bytes = unsafe {
+            let mut bytes = vec![0u8; library.GetSerializedSize()];
+            library.Serialize(&mut bytes).unwrap();
+            bytes
+        };
+        let next_run = empty(&bytes);
+        let before = ("before", &color, bytecode(&ps));
+        for (name, g, ps) in cases.iter().chain([&before]) {
+            let mut stream = Stream::new(&root, MeshStream::new(bytecode(&ms)), *ps, g, depth(g));
+            let wide = HSTRING::from(*name);
+            // SAFETY: as above.
+            let loaded: windows::core::Result<ID3D12PipelineState> =
+                unsafe { next_run.LoadPipeline(PCWSTR(wide.as_ptr()), &stream.desc()) };
+            loaded.unwrap_or_else(|e| panic!("{name}: {e}"));
         }
     }
 }

@@ -65,6 +65,33 @@ pub(crate) fn stop(what: Count, started: Option<Instant>) {
     }
 }
 
+/// What the title last showed, sizes as width and height in one word: the
+/// picture, the planes it was put together from, and the scene its temporal
+/// resolve made of it (0 until there was one).
+static PICTURE: AtomicU64 = AtomicU64::new(0);
+static PLANES: AtomicU64 = AtomicU64::new(0);
+static SCENE: AtomicU64 = AtomicU64::new(0);
+
+/// A picture of this size, of so many planes, is presented.
+pub(crate) fn note_picture(width: u32, height: u32, planes: u64) {
+    if on() {
+        PICTURE.store(u64::from(width) << 32 | u64::from(height), Ordering::Relaxed);
+        PLANES.store(planes, Ordering::Relaxed);
+    }
+}
+
+/// The title's temporal resolve is dispatched for a scene of this size.
+pub(crate) fn note_scene(width: u32, height: u32) {
+    SCENE.store(u64::from(width) << 32 | u64::from(height), Ordering::Relaxed);
+}
+
+/// The picture's width, height and planes, and the scene's width and height.
+pub(crate) fn picture() -> [u64; 5] {
+    let [picture, scene] = [&PICTURE, &SCENE].map(|s| s.load(Ordering::Relaxed));
+    let low = |v: u64| v & u64::from(u32::MAX);
+    [picture >> 32, low(picture), PLANES.load(Ordering::Relaxed), scene >> 32, low(scene)]
+}
+
 /// Two lists that take the host GPU's time around a submission. One pair
 /// does: a submission runs only after the one before it has.
 pub(crate) struct Clock {

@@ -220,6 +220,13 @@ pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
 }
 
+/// Pipelines that were queued and are done with: made, refused or lost.
+static FINISHED: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn finished() -> u64 {
+    FINISHED.load(Ordering::Relaxed)
+}
+
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
@@ -454,10 +461,9 @@ fn worker(i: usize, screen: bool) -> bool {
                     // A watchdog already accounted for and replaced this worker.
                     return;
                 }
+                FINISHED.fetch_add(1, Ordering::Relaxed);
                 if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                     drained();
-                } else {
-                    super::library::save(false);
                 }
             }
         });
@@ -490,6 +496,7 @@ pub(super) fn worker_lost(id: u32) {
             }
             if queue.workers == 0 { queue.fail_waiting() } else { 0 }
         };
+        FINISHED.fetch_add(failed + 1, Ordering::Relaxed);
         let finished = WAITING.fetch_sub(failed + 1, Ordering::Relaxed) == failed + 1;
         wake_waiters();
         if finished {
@@ -501,8 +508,7 @@ pub(super) fn worker_lost(id: u32) {
 /// The most pipelines waiting at once since the workers last ran out.
 static PEAK: AtomicU64 = AtomicU64::new(0);
 
-/// The workers ran out of work: logged after a batch of 10 or more, and
-/// the cache saved (at most every 20 s).
+/// The workers ran out of work: logged after a batch of 10 or more.
 fn drained() {
     use super::library::{EARLY, LOADED, MADE};
     if PEAK.swap(0, Ordering::Relaxed) >= 10 {
@@ -513,7 +519,6 @@ fn drained() {
             "host pipelines all made"
         );
     }
-    super::library::save(false);
 }
 
 #[cfg(test)]

@@ -112,3 +112,75 @@ vista) ou VICTORY_PLAN_REUSE=0 (plano de descritores anterior).
 
 Para abrir o painel de uma sessão já em execução sem reiniciar o jogo,
 execute scripts\vyce-monitor.ps1 e passe -GamePid, -StdoutLog e -StderrLog.
+
+## Progresso do carregamento
+
+A imagem do jogo e o painel mostram em que etapa o jogo está, quanto já
+carregou e quanto falta.
+
+| Na imagem, abaixo do FPS | Quando |
+| --- | --- |
+| INICIANDO 35%  ~1 MIN | Do início do processo até o primeiro menu |
+| CARREGANDO 43%  ~3 MIN | Na tela de carregamento, a primeira e as seguintes |
+| FALTAM 231 PIPELINES  ~2 MIN | No mundo, enquanto muitos pipelines ainda são criados: faltam objetos e o FPS fica baixo |
+
+Em menus e vídeos a linha some. Ela também aparece no título da janela.
+
+A porcentagem compara este carregamento com os anteriores do mesmo tipo,
+guardados em Vyce-data\cache\loads.txt (os seis últimos de cada): o tempo que
+passou e quanto já foi lido do disco. O que acertou mais das outras vezes
+pesa mais. A porcentagem nunca volta e fica em 99% até o mundo aparecer.
+
+Sem um carregamento anterior para comparar, ou com os caches frios depois de
+trocar de build ou de driver, a linha fica assim:
+CARREGANDO ~43%?  HA 3:25. A porcentagem é um palpite, tirado dos tempos das
+primeiras sessões, e o tempo é o que já passou. Na vez seguinte o ? some.
+
+VYCE_LOADING=0 esconde a linha na imagem (VICTORY_FPS=0 esconde só o FPS).
+Apagar loads.txt recomeça o histórico. Linhas estragadas do arquivo são
+ignoradas.
+
+Com a telemetria ligada, o log de erros recebe uma linha VYCE_LOADING por
+segundo, mesmo quando nenhum quadro é apresentado:
+
+| Campo | Significado |
+| --- | --- |
+| t_s | Segundos desde o início do processo |
+| stage | start (início), idle (menu ou vídeo), load (primeira tela de carregamento), again (as seguintes), world (no mundo) |
+| percent, left_s | Porcentagem e segundos que faltam; null fora de um carregamento |
+| known | false: a porcentagem é um palpite, sem carregamento anterior parecido |
+| elapsed_s, next_s | Segundos nesta etapa; segundos que o mundo costuma levar (antes de ele começar a carregar) |
+| read_mb, read_of_mb, read_mb_s | MiB lidos neste carregamento, quantos o anterior leu, MiB por segundo (média de 10 s) |
+| readers | Leitores parados à espera do disco, em média nos últimos 10 s (há um por processador lógico) |
+| reads, bytes_mb, written_mb, queued, files | Leituras de arquivos, MiB lidos e MiB entregues ao jogo desde o início, leituras na fila, arquivos abertos |
+| frames, work | Quadros apresentados; desenhos executados e descartados |
+| pipelines_waiting, pipelines_done, pipelines_left_s | Pipelines na fila, concluídos, e segundos até a fila acabar (no mundo, quando ela diminui) |
+| shaders, cold | Shaders usados; true quando a maioria dos shaders ou pipelines é criada de novo (build ou driver novo) |
+
+Para saber se o disco é o limite: readers em 4 ou mais com menos de 60 MB/s é
+espera pelo disco. Abaixo de 1, quem trabalha é o próprio jogo. Ao fim de cada
+carregamento o log traz a linha "a load is done" com a duração, o que foi lido
+e os oito arquivos mais lidos.
+
+## Pipelines guardados entre sessões
+
+Os pipelines prontos ficam em Vyce-data\cache\pipelines\host-pipelines.bin e
+são carregados na sessão seguinte. Isso agora vale também para os de mesh
+shader (cerca de 550), que antes eram compilados de novo em toda sessão. Os
+já guardados por builds anteriores continuam valendo. Um driver novo rejeita
+o arquivo inteiro e a biblioteca recomeça vazia.
+
+O arquivo passa de 150 MB e é escrito inteiro. A escrita acontece em segundo
+plano, com a menor prioridade de disco: três minutos depois do primeiro
+pipeline novo, ao fim de um carregamento e ao sair do jogo. Se o jogo travar,
+os pipelines criados nos últimos minutos são criados de novo na vez seguinte.
+
+## Campos novos de VYCE_TELEMETRY
+
+| Campo | Significado |
+| --- | --- |
+| indirect_per_frame, indirect_dropped_per_frame | Execuções indiretas descartadas por quadro. São o mesmo número: o primeiro nome é o antigo e nunca contou as que rodaram |
+| indirect_draws_per_frame, indirect_dispatches_per_frame | Execuções indiretas que rodaram, de desenho (com as de mesh) e de compute; cada uma conta uma vez, com quantos desenhos tiver |
+| t_s | Segundos desde o início do processo, como em VYCE_LOADING |
+| console, out_w, out_h, planes | Console informado ao jogo, tamanho da imagem apresentada e de quantas camadas ela é feita |
+| scene_w, scene_h | Tamanho da cena na resolução temporal do jogo; 0 enquanto ela não roda |

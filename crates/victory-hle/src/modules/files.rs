@@ -16,6 +16,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
+use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError};
 use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
 use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
 
@@ -528,17 +529,34 @@ pub extern "system" fn ReadFile(
     overlapped: *mut c_void,
 ) -> i32 {
     victory_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
+    let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
-    )
+    );
+    // For the loading progress. Nothing here changes the thread's last
+    // error, which the title reads next.
+    if done != 0 {
+        // SAFETY: the host has just written the count (null only with an
+        // overlapped read).
+        let n = if read.is_null() { len } else { unsafe { read.read_unaligned() } };
+        victory_gpu::loading::read_plainly(n.into());
+    } else if !overlapped.is_null() {
+        // SAFETY: a plain query.
+        let pending = unsafe { GetLastError() } == ERROR_IO_PENDING;
+        if pending {
+            victory_gpu::loading::read_plainly(len.into());
+        }
+    }
+    done
 }
 
 /// The host CRT reads large requests straight into the caller's buffer.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
     victory_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
-    host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
+    let n = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
         buffer, size, count, stream,
-    )
+    );
+    victory_gpu::loading::read_buffered(n.saturating_mul(size) as u64);
+    n
 }
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {

@@ -1827,9 +1827,17 @@ extern "system" fn execute_indirect(
     }
 }
 
-/// Indirect executions dropped since the last call.
+/// Indirect executions dropped so far (those that ran: `draw::take_indirect_ran`).
+pub(crate) fn indirect_so_far() -> u64 {
+    INDIRECT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Those dropped since the last call.
 pub(crate) fn take_indirect() -> u64 {
-    INDIRECT.swap(0, std::sync::atomic::Ordering::Relaxed)
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = indirect_so_far();
+    now.saturating_sub(LAST.swap(now, Relaxed))
 }
 static INDIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn count_dispatch() {

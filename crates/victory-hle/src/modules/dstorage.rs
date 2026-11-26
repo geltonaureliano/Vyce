@@ -142,9 +142,10 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         return from_win32(&error);
     }
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
+    let reads = victory_gpu::loading::opened(&name);
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file, reads });
     put(out, file)
 }
 
@@ -258,6 +259,8 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     file: std::fs::File,
+    /// What is read of it, for the loading progress.
+    reads: &'static victory_gpu::loading::FileReads,
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -451,6 +454,7 @@ fn work(scheduler: &'static Scheduler) {
         drop(lanes);
         let started = std::time::Instant::now();
         let result = execute(&job.request);
+        victory_gpu::loading::done(u64::from(job.request.destination_size));
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -646,6 +650,8 @@ fn close_lane(id: u64) {
         return;
     };
     lane.closed = true;
+    let reads = lane.unsubmitted.iter().filter(|c| matches!(c, Command::Read(_)));
+    victory_gpu::loading::given_up((reads.count() + lane.reads.len()) as u64);
     lane.unsubmitted.clear();
     lane.reads.clear();
     lane.statuses.clear(); // releases their arrays
@@ -766,6 +772,9 @@ fn queue(this: QueueRef, command: Command) {
     let Some(lane) = lanes.lanes.get_mut(&id) else {
         return;
     };
+    if matches!(command, Command::Read(_)) {
+        victory_gpu::loading::requested();
+    }
     lane.unsubmitted.push(command);
     if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
         lanes.submit(id);
@@ -929,9 +938,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }
-        .state
-        .file;
+    let File { file, reads } = &unsafe { &*request.source.cast::<Instance<File>>() }.state;
     let started = std::time::Instant::now();
     let mut done = 0;
     let result = loop {
@@ -944,7 +951,9 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
             Err(error) => break Err(from_win32(&error)),
         }
     };
-    READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let took = started.elapsed();
+    READING.fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+    reads.read(done as u64, took);
     result
 }
 
@@ -1188,6 +1197,29 @@ mod tests {
         assert_eq!(wait(array, 0), S_OK);
         assert_eq!(raw, plain[5000..6000]);
         assert_eq!(inflated, plain);
+        void(queue, 0x40);
+    }
+
+    /// Reads of files, whatever comes of them, and not reads of memory.
+    #[test]
+    fn reads_are_counted_for_the_loading_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("counted.bin");
+        std::fs::write(&path, pattern(4096)).unwrap();
+        let file = open(&path);
+        let (queue, array) = (new_queue(0), status_array(1));
+        let (mut out, mut short, mut copy) = ([0u8; 1000], [0u8; 100], [0u8; 16]);
+        let at = |b: &mut [u8]| b.as_mut_ptr().cast();
+        enqueue(queue, &request(0, at(&mut out), 1000, file, 0, 1000));
+        // Ends early.
+        enqueue(queue, &request(0, at(&mut short), 100, file, 4046, 100));
+        let memory = pattern(16);
+        enqueue(queue, &request(MEMORY_SOURCE, at(&mut copy), 16, memory.as_ptr().cast(), 0, 16));
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), END_OF_FILE);
+        let reads = victory_gpu::loading::opened(&path.to_string_lossy());
+        assert_eq!(reads.so_far(), (2, 1050));
         void(queue, 0x40);
     }
 

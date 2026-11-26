@@ -3762,37 +3762,26 @@ impl Presenter {
         }
     }
 
-    /// Writes the frame rate and frame time in the top left corner of
-    /// `back`, which is a render target on `list`.
+    /// Writes the frame rate and frame time, and under them how far a load
+    /// has come, in the top left corner of `back`, which is a render target
+    /// on `list`.
     ///
     /// # Safety
     /// `back` is this swap chain's buffer, in the render target state.
     unsafe fn readout(&self, device: &ID3D12Device, list: &ID3D12GraphicsCommandList, back: &ID3D12Resource) {
-        let Some((fps, ms)) = self.meter.shown else { return };
-        if !crate::readout::on() {
+        let rate = self.meter.shown.filter(|_| crate::readout::on());
+        let rate = rate.map(|(fps, ms)| format!("{fps:.1} FPS  {ms:.0} MS"));
+        let load = crate::loading::shown();
+        if rate.is_none() && load.is_none() {
             return;
         }
-        let text = format!("{fps:.1} FPS  {ms:.0} MS");
-        // Dots that keep their share of the picture at any size.
-        let dot = (self.height as i32 / 216).max(2);
-        let at = (dot * 3, dot * 3);
-        let (w, h) = crate::readout::size(&text);
-        let behind = RECT {
-            left: at.0,
-            top: at.1,
-            right: at.0 + w * dot,
-            bottom: at.1 + h * dot,
-        };
-        let marks = crate::readout::rects(&text, at, dot);
-        // SAFETY: our heap of one view, and rectangles inside the picture
-        // (a text of a few characters at this size).
+        let load = load.iter().map(|l| (l.text.as_str(), l.share));
+        let lines = rate.iter().map(|r| (r.as_str(), None)).chain(load);
+        // SAFETY: our heap of one view; the buffer is of this size.
         unsafe {
             let view = self.rtv.GetCPUDescriptorHandleForHeapStart();
             device.CreateRenderTargetView(back, None, view);
-            if behind.right <= self.width as i32 && behind.bottom <= self.height as i32 {
-                list.ClearRenderTargetView(view, &[0.0, 0.0, 0.0, 1.0], Some(&[behind]));
-                crate::readout::clear(list, view, &[1.0, 0.9, 0.1, 1.0], &marks);
-            }
+            crate::readout::draw(list, view, (self.width, self.height), lines);
         }
     }
 }
@@ -3866,7 +3855,14 @@ impl Meter {
         let pipeline_waits = ordinary.calls + screen.calls;
         let pipeline_timeouts = ordinary.timeouts + screen.timeouts;
         let dropped = crate::draw::take_dropped() as f64 / frames;
+        // What `indirect_per_frame` has always counted is indirect executions
+        // dropped; those that ran have fields of their own.
         let indirect = crate::list::take_indirect() as f64 / frames;
+        let [indirect_draws, indirect_dispatches] =
+            crate::draw::take_indirect_ran().map(|n| n as f64 / frames);
+        let t_s = crate::loading::clock();
+        let [out_w, out_h, planes, scene_w, scene_h] = crate::telemetry::picture();
+        let console = crate::console::current().name();
         let count = |what| crate::telemetry::take(what) as f64 / frames;
         let time = |what| crate::telemetry::take(what) as f64 / 1e3 / frames;
         let prewarm_ms = PREWARM_US.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
@@ -3883,7 +3879,11 @@ impl Meter {
                  \"cpu_copy_ms\":{copy_ms:.2},\"cpu_copy_mb\":{copy_mb:.2},\"guest_write_mb\":{back_mb:.2},\
                  \"texture_refresh_ms\":{texture_ms:.2},\"texture_refresh_mb\":{texture_mb:.2},\
                  \"bindless_plan_ms\":{plans_ms:.2},\"bindless_record_ms\":{records_ms:.2},\
-                 \"indirect_per_frame\":{indirect:.2},\
+                 \"indirect_per_frame\":{indirect:.2},\"indirect_dropped_per_frame\":{indirect:.2},\
+                 \"indirect_draws_per_frame\":{indirect_draws:.2},\
+                 \"indirect_dispatches_per_frame\":{indirect_dispatches:.2},\"t_s\":{t_s:.1},\
+                 \"console\":\"{console}\",\"out_w\":{out_w},\"out_h\":{out_h},\"planes\":{planes},\
+                 \"scene_w\":{scene_w},\"scene_h\":{scene_h},\
                  \"pipeline_wait_ms\":{pipeline_wait_ms:.2},\"pipeline_waits\":{pipeline_waits},\
                  \"pipeline_world_wait_ms\":{world_wait_ms:.2},\"pipeline_screen_wait_ms\":{screen_wait_ms:.2},\
                  \"pipeline_wait_timeouts\":{pipeline_timeouts},\
@@ -3961,7 +3961,11 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let mut text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        if let Some(load) = crate::loading::shown() {
+            text += " | ";
+            text += &load.text;
+        }
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -4002,6 +4006,7 @@ impl Host {
             return None;
         };
         let (width, height) = (desc.Width as u32, desc.Height);
+        crate::telemetry::note_picture(width, height, 1);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
@@ -4093,6 +4098,7 @@ impl Host {
             Some(a) if a.Height >= 1080 => (a.Width as u32, a.Height),
             _ => (1920, 1080),
         };
+        crate::telemetry::note_picture(width, height, 1 + u64::from(scene.is_some()));
         let format = DXGI_FORMAT_R8G8B8A8_UNORM;
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {

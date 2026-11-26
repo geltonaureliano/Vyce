@@ -148,11 +148,28 @@ pub(crate) fn take_frame() -> Vec<String> {
 }
 
 /// Draws, mesh dispatches and dispatches recorded but not run on the host
-/// (no host pipeline) since the last call.
-pub(crate) fn take_dropped() -> u64 {
-    DROPPED.swap(0, Ordering::Relaxed)
+/// (no host pipeline) so far.
+pub(crate) fn dropped_so_far() -> u64 {
+    DROPPED.load(Ordering::Relaxed)
 }
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Those since the last call.
+pub(crate) fn take_dropped() -> u64 {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = dropped_so_far();
+    now.saturating_sub(LAST.swap(now, Ordering::Relaxed))
+}
+
+/// Indirect executions run on the host, as draws (mesh dispatches with
+/// them) and as dispatches; each counts once, however many its arguments
+/// hold. Those dropped are in [`crate::list::indirect_so_far`].
+static INDIRECT_RAN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Indirect draws and dispatches run on the host since the last call.
+pub(crate) fn take_indirect_ran() -> [u64; 2] {
+    [0, 1].map(|i| INDIRECT_RAN[i].swap(0, Ordering::Relaxed))
+}
 
 /// Groups the host runs per dimension of a dispatch (and of a mesh
 /// dispatch). A count past it is undefined behaviour on the host; drivers
@@ -1108,6 +1125,9 @@ impl State {
         }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x.min(MAX_GROUPS), y, z) };
+        if p.stages.first().is_some_and(|s| s.shader.resolves_scene) {
+            crate::telemetry::note_scene(x.saturating_mul(8), y.saturating_mul(8));
+        }
         if let Some((param, index)) = start {
             let mut at = MAX_GROUPS;
             while at < x {
@@ -1982,6 +2002,7 @@ impl State {
             list.count_write();
             list.count_work();
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            INDIRECT_RAN[1].fetch_add(1, Ordering::Relaxed);
             let lit = self.ambient(list, p);
             if crate::twin::resolve(list) | lit {
                 self.continue_in(list);
@@ -1989,6 +2010,7 @@ impl State {
         } else {
             list.count_work();
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            INDIRECT_RAN[0].fetch_add(1, Ordering::Relaxed);
         }
         true
     }
