@@ -141,6 +141,43 @@ of its own: wave sums and prefix sums, as fxceless/victory-mix found) run as
 local waves (`emit::local_waves`), tried where the per-lane form is
 refused.
 
+A group of one console wave that uses LDS runs as local waves too when its
+wave operations are only the allocation idiom (`VICTORY_LDS_LOCAL=0` turns
+it off): the console compiler left out the barriers between the wave's LDS
+accesses, so the two host waves meet (a group barrier) before each LDS
+access in a block every lane runs, and before and after each lane-branch
+region with LDS accesses (`lower::lds_meetings`, after VIctory-7900XTX). A
+region with both an LDS read and an LDS write cannot be ordered so and keeps
+the console flow. The culls (CS_Tree_BatchCull) reach it only without their
+early-out, which keeps the body out of the blocks every lane runs. On the
+RTX 2070 SUPER the shared-LDS and idiom patterns give the console flow's
+results (`split_tests::local_waves_of_one_wave_groups_keep_their_lds_order`),
+the idiom's slots in another order.
+
+### Forms without early-outs or skips
+
+A wave64 compute program that the 32-lane forms refuse is tried again
+without its early-outs (`s_cbranch_execz` to a block that only ends the
+program) and then without the skips the code after them cannot see
+(`ir::without_early_outs`, `ir::without_skips`, from VIctory-7900XTX;
+`VICTORY_WAVE_FORMS=0` turns this off). The lanes outside EXEC walk the body
+masked, as the console's wave does when no lane is left, and each form is
+lowered by the same rules (`lockstep::fits`, `Local`), so only exact forms
+are taken. The fork's further forms (wave-wide branches, local waves of
+other programs) are approximate and are not taken.
+
+CS_ShadowUnifiedClearRaster and CS_SortRayTiles stay refused, measured on
+the transformed programs: the four console waves of a ShadowUnifiedClearRaster
+group branch apart for real (each wave asks whether any of its lanes passed,
+`s_bcnt1` of VCC, before a whole-wave minimum and maximum, and tests VCC made
+of EXEC and a uniform value), and SortRayTiles loops while any lane of the
+wave has work left (`s_andn2_b64` of EXEC into an exit mask, `s_cbranch_scc1`)
+between LDS atomics and barriers. The fork's 'without skips' output of the
+first puts group barriers where its waves have branched apart. An exact form
+needs the two halves of one console wave to meet without the rest of the
+group, or a rule for loops whose finished waves may go round again with no
+lane left.
+
 ### Lanes of 2-D groups on NVIDIA
 
 Measured on an RTX 2070 SUPER (Turing, driver 621.40, `lanes.rs` in the
@@ -204,7 +241,7 @@ takes `WaveSize(64)`, the NVIDIA reports 32-32).
 6. ~~Multi-wave groups: in step where their waves branch alike; local
    waves where lanes only meet within 32.~~ Left: CS_DefragHeap,
    CS_ShadowUnifiedClearRaster (branches on lanes that differ per wave) and
-   CS_SortRayTiles.
+   CS_SortRayTiles (see "Forms without early-outs or skips").
 
 ## Credit
 

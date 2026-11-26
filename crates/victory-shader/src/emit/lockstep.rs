@@ -19,18 +19,23 @@ use crate::ir::{EXEC, Exit, Program, Reg, VCC, Value};
 /// Whether the waves of a group may run `p` in step.
 pub(crate) fn fits(p: &Program, io: &Io) -> bool {
     let differs = differing(p, io);
+    let why = std::env::var_os("VICTORY_WHY").is_some();
     p.blocks.iter().all(|block| {
         let Exit::Branch { .. } = block.exit else {
             return !matches!(block.exit, Exit::Indirect);
         };
         let Some(inst) = block.insts.last() else { return false };
-        match inst.name() {
+        let alike = match inst.name() {
             "s_cbranch_execz" | "s_cbranch_execnz" => true,
             "s_cbranch_scc0" | "s_cbranch_scc1" => {
                 inst.read(Reg::Scc).is_some_and(|v| !differs.contains(&v))
             }
             _ => false,
+        };
+        if !alike && why {
+            eprintln!("not in step: {} at {:#x}", inst.name(), inst.machine.offset);
         }
+        alike
     })
 }
 

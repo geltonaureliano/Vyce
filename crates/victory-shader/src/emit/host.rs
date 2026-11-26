@@ -1058,6 +1058,9 @@ pub enum View<'a> {
     UintTextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
+    /// A typed buffer UAV of this format, this many elements of this many
+    /// bytes, zeroed (read back as dwords).
+    FormatUav(DXGI_FORMAT, u32, u32),
     /// A constant buffer of these dwords.
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
@@ -1347,11 +1350,21 @@ impl Host {
                         dev.CreateShaderResourceView(&tex, None, at);
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::StructuredUav(_, _) | View::HalfUav(_) => {
+                    View::RawUav(_)
+                    | View::StructuredUav(_, _)
+                    | View::HalfUav(_)
+                    | View::FormatUav(..) => {
                         let (n, format, elements, stride, flags) = match *v {
                             View::HalfUav(e) => (
                                 2 * e,
                                 DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                e,
+                                0,
+                                D3D12_BUFFER_UAV_FLAG_NONE,
+                            ),
+                            View::FormatUav(f, e, bytes) => (
+                                (e * bytes).div_ceil(4),
+                                f,
                                 e,
                                 0,
                                 D3D12_BUFFER_UAV_FLAG_NONE,

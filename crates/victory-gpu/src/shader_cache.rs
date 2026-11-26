@@ -49,11 +49,26 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
+        // The translation rules turned back for A/B (`emit::Switch`): each
+        // set translates every shader again, under keys of its own.
+        let switches = victory_shader::emit::switches();
+        if switches != victory_shader::emit::default_switches() {
+            let changed: Vec<String> = victory_shader::emit::Switch::ALL
+                .iter()
+                .filter(|s| s.on() != s.default_on())
+                .map(|s| format!("{}={}", s.var(), u8::from(s.on())))
+                .collect();
+            tracing::warn!(
+                switches = %changed.join(" "),
+                "translator switches set: shaders translate again"
+            );
+        }
         let mut h = blake3::Hasher::new();
         h.update(victory_shader::SOURCES.as_bytes());
         h.update(&limit.to_le_bytes());
         h.update(&[victory_shader::emit::rays().into()]);
         h.update(&victory_shader::emit::host_views().to_le_bytes());
+        h.update(&switches.to_le_bytes());
         *h.finalize().as_bytes()
     })
 }

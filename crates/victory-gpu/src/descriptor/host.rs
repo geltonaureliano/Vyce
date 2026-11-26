@@ -1007,7 +1007,7 @@ impl HostHeap {
         }
         self.keep_with_view(index, kept.flatten(), view);
         if ok {
-            self.set_stride_count(index, view_stride(view), view_count(view));
+            self.set_stride_count(index, view_stride(view) | view_kind(view), view_count(view));
         } else {
             self.set_stride(index, 0);
         }
@@ -1232,7 +1232,8 @@ impl HostHeap {
                 self.keep_with_view(index, kept.flatten(), &view);
                 // The stride is the title view's, however and whenever the
                 // host view is made.
-                self.set_stride_count(index, view_stride(&view), view_count(&view));
+                let word = view_stride(&view) | view_kind(&view);
+                self.set_stride_count(index, word, view_count(&view));
             }
         }
         if !self.sampler {
@@ -2347,6 +2348,60 @@ fn view_stride(view: &View) -> u32 {
     u32::try_from(bytes).unwrap_or(0)
 }
 
+/// What the stride table holds of a typed buffer view of an integer format
+/// besides its stride: [`victory_shader::emit::VIEW_INTEGER`], with
+/// [`victory_shader::emit::VIEW_SIGNED`] for a signed one (shaders pass the
+/// bits of its 16-bit typed accesses, not halves); 0 for any other view.
+/// (From VIctory-7900XTX 9a6c829, after VIctory 4243a96a.)
+fn view_kind(view: &View) -> u32 {
+    use victory_shader::emit::{Switch, VIEW_INTEGER, VIEW_SIGNED};
+    // Shaders read the marks, and take them off the stride, only with
+    // `VICTORY_D16_INTEGER` on (the default).
+    if !Switch::D16Integer.on() {
+        return 0;
+    }
+    // The format of a typed buffer view (neither raw nor structured).
+    let srv = |w: &[u32; 10]| {
+        let desc = srv_desc(w);
+        if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+            return None;
+        }
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { desc.Anonymous.Buffer };
+        let typed = b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 == 0;
+        typed.then_some(desc.Format.0)
+    };
+    let uav = |w: &[u32; 10]| {
+        let desc = uav_desc(w);
+        if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+            return None;
+        }
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { desc.Anonymous.Buffer };
+        let typed = b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 == 0;
+        typed.then_some(desc.Format.0)
+    };
+    let format = match view {
+        View::Shader(_, Some(desc)) => srv(desc),
+        View::Placed(false, resource, desc) if resource[0] == 1 => {
+            desc[..10].try_into().ok().and_then(srv)
+        }
+        View::Unordered(_, _, Some(desc)) => uav(desc),
+        View::Placed(true, resource, desc) if resource[0] == 1 => {
+            desc[..10].try_into().ok().and_then(uav)
+        }
+        _ => None,
+    };
+    match format {
+        // R32G32B32A32, R32G32B32, R16G16B16A16, R32G32, R10G10B10A2,
+        // R8G8B8A8, R16G16, R32, R8G8, R16 and R8 _UINT.
+        Some(3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62) => VIEW_INTEGER,
+        // The same _SINT (R10G10B10A2 has none).
+        Some(4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64) => VIEW_INTEGER | VIEW_SIGNED,
+        _ => 0,
+    }
+}
+
 /// The elements of the title's buffer view `view` (0 for other views), bytes
 /// for a raw one: as the console's descriptors count them.
 fn view_count(view: &View) -> u32 {
@@ -3380,6 +3435,29 @@ void main() {
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Typed buffer views of integer formats are marked in the table of
+    /// strides; float, normalized, raw and structured ones are not, nor are
+    /// textures (after VIctory-7900XTX 9a6c829).
+    #[test]
+    fn integer_typed_buffer_views_are_marked_in_the_table_of_strides() {
+        use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS};
+        // Format, dimension (buffer), first element, count, stride, counter, flags.
+        let uav = |format, stride, flags| View::Unordered(0, 0, Some([format, 1, 0, 0, 64, stride, 0, 0, flags, 0]));
+        assert_eq!(view_kind(&uav(12, 0, 0)), VIEW_INTEGER, "R16G16B16A16_UINT");
+        assert_eq!(view_kind(&uav(59, 0, 0)), VIEW_INTEGER | VIEW_SIGNED, "R16_SINT");
+        assert_eq!(view_kind(&uav(10, 0, 0)), 0, "R16G16B16A16_FLOAT");
+        assert_eq!(view_kind(&uav(58, 0, 0)), 0, "R16_SNORM");
+        assert_eq!(view_kind(&uav(39, 0, 1)), 0, "raw");
+        assert_eq!(view_kind(&uav(0, 16, 0)), 0, "structured");
+        assert_eq!(view_kind(&View::Unordered(0, 0, Some([57, 4, 0, 0, 0, 0, 0, 0, 0, 0]))), 0, "a 2D texture");
+        // SRV words: format, dimension, mapping, (pad), first element, count, stride, flags.
+        let srv = View::Shader(0, Some([57, 1, 0x1688, 0, 0, 0, 64, 0, 0, 0]));
+        assert_eq!(view_kind(&srv), VIEW_INTEGER, "R16_UINT shader view");
+        // The stride keeps its bits.
+        let word = view_stride(&uav(12, 0, 0)) | view_kind(&uav(12, 0, 0));
+        assert_eq!(word & VIEW_STRIDE_BITS, 8);
     }
 
     #[test]

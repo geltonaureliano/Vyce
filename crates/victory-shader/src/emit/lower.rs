@@ -498,6 +498,12 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
+    /// Stride table dwords read, by DXIL block, descriptor load, first
+    /// dword and table offset ([`Self::slot_word`]).
+    slot_words: HashMap<(usize, Site, u8, u32), V>,
+    /// The block a guarded block and its join follow ([`Self::begin_guarded`]),
+    /// which dominates both: what is read there serves them too.
+    guard_heads: HashMap<usize, usize>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -526,6 +532,10 @@ struct Lower<'a> {
     console_cf: bool,
     /// Order group-shared accesses across both halves of one console wave.
     sync_split_lds: bool,
+    /// Local waves of a one-wave group with LDS: the blocks every lane runs,
+    /// and where the two host waves meet ([`lds_meetings`]); `Some(None)` if
+    /// barriers cannot keep the console's order.
+    lds_meet: Option<Option<(Vec<bool>, Vec<(bool, bool)>)>>,
     /// Split without [`Self::console_cf`] cannot run it, the console flow can.
     wants_console_flow: bool,
     /// The console thread's flat id in the group (relabelled; see
@@ -665,6 +675,206 @@ fn mask_set_op(name: &str) -> bool {
         op,
         "and" | "or" | "xor" | "andn2" | "orn2" | "nand" | "nor" | "xnor" | "not" | "mov"
     )
+}
+
+/// Whether `inst` reads or writes the group's LDS (not the lane exchanges
+/// `ds_swizzle` and `ds_(b)permute`, which use no memory).
+fn lds_access(inst: &Inst) -> bool {
+    let name = inst.name();
+    matches!(inst.fields, Fields::Ds { gds: false, .. })
+        && !(name.starts_with("ds_swizzle") || name.contains("permute") || name == "ds_nop")
+}
+
+/// Per IR block: every lane of the wave that started the program runs it,
+/// no per-lane branch separates it from the entry (it lies in no lane
+/// branch's region: the blocks reachable from the branch that do not
+/// post-dominate it). `None` with an indirect exit (not followed).
+/// From VIctory-7900XTX `all_lane_blocks` (GPL-3.0-or-later).
+fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
+    let n = st.exits.len();
+    let mut all = vec![true; n];
+    for (_, region) in lane_regions(st)? {
+        for b in (0..n).filter(|&b| region[b]) {
+            all[b] = false;
+        }
+    }
+    Some(all)
+}
+
+/// Every per-lane branch (by its block) with its region: the blocks
+/// reachable from it that do not post-dominate it, which only some lanes
+/// run. Not branches on uniform conditions, which all lanes take alike.
+/// `None` with an indirect exit. From VIctory-7900XTX `lane_regions`.
+fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
+    let n = st.exits.len();
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (b, e) in st.exits.iter().enumerate() {
+        match *e {
+            LaneExit::Jump(t) => succ[b].push(t),
+            LaneExit::Branch { taken, not_taken, .. } => {
+                succ[b].push(taken);
+                succ[b].push(not_taken);
+            }
+            LaneExit::End => {}
+            LaneExit::Indirect => return None,
+        }
+    }
+    // Post-dominators as bit sets (every End leads to one exit after it).
+    let words = n.div_ceil(64);
+    let full = vec![u64::MAX; words];
+    let mut pdom: Vec<Vec<u64>> = (0..n)
+        .map(|b| {
+            if succ[b].is_empty() {
+                let mut v = vec![0; words];
+                v[b / 64] |= 1 << (b % 64);
+                v
+            } else {
+                full.clone()
+            }
+        })
+        .collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in (0..n).rev() {
+            if succ[b].is_empty() {
+                continue;
+            }
+            let mut v = full.clone();
+            for &t in &succ[b] {
+                for (w, x) in v.iter_mut().enumerate() {
+                    *x &= pdom[t][w];
+                }
+            }
+            v[b / 64] |= 1 << (b % 64);
+            if v != pdom[b] {
+                pdom[b] = v;
+                changed = true;
+            }
+        }
+    }
+    let mut regions = Vec::new();
+    for (d, e) in st.exits.iter().enumerate() {
+        let LaneExit::Branch { when, .. } = *e else { continue };
+        if st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))) {
+            continue; // all lanes go the same way
+        }
+        let mut seen = vec![false; n];
+        let mut stack: Vec<usize> = succ[d].clone();
+        while let Some(b) = stack.pop() {
+            if seen[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 {
+                continue;
+            }
+            seen[b] = true;
+            stack.extend(succ[b].iter().copied());
+        }
+        regions.push((d, seen));
+    }
+    Some(regions)
+}
+
+/// LDS accesses of a console wave run as two host waves, where some sit in
+/// blocks that only some lanes run (`all` is [`all_lane_blocks`]): per IR
+/// block, whether the host waves meet (a group barrier) at its start and
+/// before its exit. `None` if barriers cannot keep the console's order.
+///
+/// The console runs the wave's lanes in step, so an LDS write is seen by
+/// every later read. Two host waves keep that order if they meet between
+/// any two accesses of which one writes. A barrier must be run by every
+/// thread, so it cannot stand in a lane branch's region; but every way into
+/// and out of such a region passes a block all lanes run, and the waves meet
+/// there: before the exit of an all-lane block into a region with LDS
+/// accesses, and at the start of an all-lane block entered from one.
+/// Accesses in all-lane blocks get a barrier each. What that cannot order
+/// is a write and a read inside one region (blocks joined without an
+/// all-lane block between them): refused.
+/// shortcut: two writes in one region are taken not to hit the same dword
+/// from both halves (atomics among them, whose order only moves slots).
+/// From VIctory-7900XTX `lds_meetings` (GPL-3.0-or-later).
+fn lds_meetings(p: &Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
+    let n = st.exits.len();
+    let succ = |b: usize| -> Vec<usize> {
+        match st.exits[b] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
+            LaneExit::End | LaneExit::Indirect => Vec::new(),
+        }
+    };
+    // Regions: blocks not every lane runs, joined by the edges between them.
+    let mut region: Vec<usize> = (0..n).collect();
+    fn find(region: &mut [usize], mut b: usize) -> usize {
+        while region[b] != b {
+            region[b] = region[region[b]];
+            b = region[b];
+        }
+        b
+    }
+    for b in 0..n {
+        for t in succ(b) {
+            if !all[b] && !all[t] {
+                let (x, y) = (find(&mut region, b), find(&mut region, t));
+                region[x] = y;
+            }
+        }
+    }
+    // Per region: LDS reads, LDS writes (atomics write).
+    let mut reads = vec![false; n];
+    let mut writes = vec![false; n];
+    for (b, block) in p.blocks.iter().enumerate().take(n) {
+        if all[b] {
+            continue;
+        }
+        let r = find(&mut region, b);
+        for i in block.insts.iter().filter(|i| lds_access(i)) {
+            if i.name().starts_with("ds_read") {
+                reads[r] = true;
+            } else {
+                writes[r] = true;
+            }
+        }
+    }
+    if (0..n).any(|r| reads[r] && writes[r]) {
+        return None;
+    }
+    let mut meet = vec![(false, false); n];
+    for b in 0..n {
+        for t in succ(b) {
+            if all[b] && !all[t] {
+                let r = find(&mut region, t);
+                meet[b].1 |= reads[r] || writes[r];
+            } else if !all[b] && all[t] {
+                let r = find(&mut region, b);
+                meet[t].0 |= reads[r] || writes[r];
+            }
+        }
+    }
+    Some(meet)
+}
+
+/// For a one-wave group run as two local 32-lane waves: the blocks every
+/// lane runs and where the waves meet ([`lds_meetings`] on the per-lane
+/// structure `st`), if group barriers can keep its LDS order. The title's
+/// own barriers must stand where every lane runs: on the console the wave
+/// reaches one if any lane does, here a host wave without such a lane
+/// would leave the other waiting.
+fn local_lds(p: &Program, st: &Structured) -> Option<(Vec<bool>, Vec<(bool, bool)>)> {
+    let all = all_lane_blocks(st)?;
+    let barriers = p
+        .blocks
+        .iter()
+        .enumerate()
+        .all(|(b, block)| all[b] || block.insts.iter().all(|i| i.name() != "s_barrier"));
+    if !barriers {
+        return None;
+    }
+    let meet = lds_meetings(p, st, &all)?;
+    Some((all, meet))
+}
+
+/// Whether the LDS accesses of a one-wave group run as two local 32-lane
+/// waves can keep the console's order ([`local_lds`]).
+pub(super) fn lds_meetable(p: &Program, st: &Structured) -> bool {
+    local_lds(p, st).is_some()
 }
 
 /// Samples whose level comes from derivatives across each quad of lanes.
@@ -1135,6 +1345,7 @@ impl<'a> Lower<'a> {
         let mut console_lanes = false;
         let mut split = false;
         let mut sync_split_lds = false;
+        let mut lds_meet = None;
         let mut wants_console_flow = false;
         let mut lockstep = false;
         if let StageIo::Cs(cs) = x.native.io {
@@ -1263,6 +1474,15 @@ impl<'a> Lower<'a> {
                     .any(|e| matches!(*e, LaneExit::Branch { when, .. } if !uniform(when)))
                 && !insts().any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32")
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+            let why = std::env::var_os("VICTORY_WHY").is_some();
+            if x.native.wave64 && !x.console_cf && !x.local && why {
+                eprintln!(
+                    "wave64 lowering: one_wave {one_wave} console_lanes {console_lanes} \
+                     reads_whole {reads_whole} masks_held {masks_held} split {split} \
+                     lockstep {lockstep} console_flow {wants_console_flow} lds {}",
+                    s.lds_dwords
+                );
+            }
             if x.console_cf {
                 console_lanes = true;
                 // In halves only where the host cannot run the console wave.
@@ -1274,6 +1494,12 @@ impl<'a> Lower<'a> {
                 console_lanes = true;
                 split = false;
                 wants_console_flow = false;
+                // The console compiler leaves barriers out between LDS
+                // accesses of one wave: the two host waves meet around
+                // them (VIctory-7900XTX's local waves of one-wave groups).
+                if one_wave && s.lds_dwords > 0 {
+                    lds_meet = Some(local_lds(p, x.st));
+                }
             }
             if split || x.local {
                 s.wave_size = Some(32);
@@ -1356,6 +1582,8 @@ impl<'a> Lower<'a> {
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
+            slot_words: HashMap::new(),
+            guard_heads: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -1369,6 +1597,7 @@ impl<'a> Lower<'a> {
             lockstep,
             console_cf: x.console_cf,
             sync_split_lds,
+            lds_meet,
             wants_console_flow,
             console_flat: None,
             xchg: None,
@@ -2102,6 +2331,12 @@ impl<'a> Lower<'a> {
         if self.wants_console_flow && !self.x.console_cf && !self.x.per_lane_only {
             return Err(unsupported(0, CONSOLE_FLOW));
         }
+        if matches!(self.lds_meet, Some(None)) {
+            return Err(unsupported(
+                0,
+                "an LDS read and write (or a barrier) in a lane-branch region of local waves",
+            ));
+        }
         if let Some(n) = self.s.wave_size
             && !self.x.target.runs(n)
         {
@@ -2207,15 +2442,35 @@ impl<'a> Lower<'a> {
                     self.join_scalars(b);
                 }
             }
+            let meet = match &self.lds_meet {
+                Some(Some((_, meet))) => meet[b],
+                _ => (false, false),
+            };
+            if meet.0 {
+                self.lds_meeting();
+            }
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
                 self.inst(b, i)?;
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
+                    // (no meeting inside a whole-wave section)
+                    let insts = &p.blocks[b].insts;
+                    if matches!(self.lds_meet, Some(Some(_)))
+                        && insts[i..end.min(insts.len())].iter().any(lds_access)
+                    {
+                        return Err(unsupported(
+                            p.blocks[b].insts[i].machine.offset,
+                            "an LDS access in a whole-wave section of local waves",
+                        ));
+                    }
                     self.section(b, i, end)?;
                     i = end;
                     continue;
                 }
                 i += 1;
+            }
+            if meet.1 {
+                self.lds_meeting();
             }
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
@@ -3596,6 +3851,59 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, away, stepped, h)
     }
 
+    /// `f` as an f16 in the low bits, rounded to nearest, ties to even, as the
+    /// console's 16-bit float operations round, whatever the host's own
+    /// conversion does: D3D lets `f32tof16` round toward zero, and Turing's
+    /// does (measured on an RTX 2070 SUPER: 0x3c03 + 0x4000 gives 0x4201,
+    /// not the console's 0x4202). The conversion toward zero, or the next
+    /// half away from zero where that one is nearer, or as near and the
+    /// first one odd. Past the largest half the next one counts as 2^16, the
+    /// bound IEEE rounds by, so 65520 and up become infinity. (`f` is an f32
+    /// result of two halves here; rounding it again to 16 bits gives the
+    /// rounding of the exact result, 24 bits being more than twice 11 and
+    /// two.) From VIctory-7900XTX (`f16_nearest`, after fxceless).
+    fn f16_nearest(&mut self, f: V) -> V {
+        let c = self.cur;
+        let f32t = self.s.t.f32;
+        let lo = self.f16_toward_zero(f);
+        let (one, zero) = (self.s.m.i32(1), self.s.m.i32(0));
+        let hi = self.s.m.bin(c, Bin::Add, lo, one);
+        let size = |l: &mut Self, h: V| {
+            let w = l.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+            l.unary(6, w)
+        };
+        let (below, above) = (size(self, lo), size(self, hi));
+        let (magnitude, infinity) = (self.s.m.i32(0x7FFF), self.s.m.i32(0x7C00));
+        let m = self.s.m.bin(c, Bin::And, hi, magnitude);
+        let top = self.s.m.cmp(c, pred::EQ, m, infinity);
+        let bound = self.s.m.f32(65536.0f32.to_bits());
+        let above = self.s.m.select(c, top, bound, above);
+        let fa = self.unary(6, f);
+        // (both differences are exact: the three values lie within one half's step)
+        let under = self.s.m.bin(c, Bin::Sub, fa, below);
+        let over = self.s.m.bin(c, Bin::Sub, above, fa);
+        // Ordered: never for NaN, which stays what the conversion made of it.
+        let nearer = self.s.m.cmp(c, pred::OLT, over, under);
+        let tie = self.s.m.cmp(c, pred::OEQ, over, under);
+        let odd = self.s.m.bin(c, Bin::And, lo, one);
+        let odd = self.s.m.cmp(c, pred::NE, odd, zero);
+        let tie = self.s.m.bin(c, Bin::And, tie, odd);
+        let up = self.s.m.bin(c, Bin::Or, nearer, tie);
+        self.s.m.select(c, up, hi, lo)
+    }
+
+    /// The f16 of an f32 ALU result, in the low bits: the host's conversion,
+    /// or rounded to nearest as the console does with `VICTORY_F16_NEAREST=1`
+    /// ([`Self::f16_nearest`], a dozen instructions more).
+    fn alu_half(&mut self, f: V) -> V {
+        if super::Switch::F16Nearest.on() {
+            return self.f16_nearest(f);
+        }
+        let i32t = self.s.t.i32;
+        self.s
+            .op(self.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+    }
+
     /// `(a >> off[4:0]) & ((1 << width) - 1)`, sign-extended from the field's
     /// top bit when `signed`; widths from 32 on take every bit. A signed
     /// field that runs past bit 31 extends from bit 31, as the hardware
@@ -4094,6 +4402,8 @@ impl<'a> Lower<'a> {
         let (then, join) = (self.s.m.new_block(), self.s.m.new_block());
         self.s.m.terminate(self.cur, Term::CondBr(g, then, join));
         let head = self.cur;
+        self.guard_heads.insert(then, head);
+        self.guard_heads.insert(join, head);
         self.cur = then;
         Some((head, join))
     }
@@ -5136,6 +5446,14 @@ impl<'a> Lower<'a> {
             .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
+    /// The group's threads meet, with group-shared memory done
+    /// ([`Self::lds_meet`]).
+    fn lds_meeting(&mut self) {
+        let (mode, void) = (self.s.m.i32(1 | 8), self.s.t.void);
+        self.s
+            .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
     // ---- instructions ----
 
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
@@ -5176,6 +5494,15 @@ impl<'a> Lower<'a> {
             && self.ordered();
         if fence {
             self.uav_fence();
+        }
+        if let Some(Some((all, _))) = &self.lds_meet
+            && all[b]
+            && lds_access(inst)
+        {
+            // The two host waves meet before each LDS access every lane
+            // runs: what the other one wrote is visible, and what it still
+            // reads is not overwritten.
+            self.lds_meeting();
         }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
@@ -6181,8 +6508,7 @@ impl<'a> Lower<'a> {
             let h = self.handle(site, src, false, (11 | u, 0))?;
             return Ok(self.view_dwords(h, Some(0), addr, None, count));
         }
-        let slot = self.heap_slot(src, false)?;
-        let stride = self.slot_dword(slot, 0);
+        let stride = self.slot_word(src, 0)?;
         let zero = self.s.m.i32(0);
         let buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
         let at = self.begin_guarded(Some(buffer));
@@ -6581,12 +6907,12 @@ impl<'a> Lower<'a> {
         });
         let unknown = wanted && self.x.target.exact_views && self.used_kind(&src).is_none();
         if image.is_none() && records.is_none() && (unknown || matches!(props.0 & 0xfff, 10 | 12)) {
-            let slot = if load == site {
-                self.heap_slot(&src, false)?
+            let n = if load == site {
+                self.slot_word(&src, super::OWN_SLOTS)?
             } else {
-                self.heap_index_at(site, skew.wrapping_neg(), false)?
+                let slot = self.heap_index_at(site, skew.wrapping_neg(), false)?;
+                self.slot_dword(slot, super::OWN_SLOTS)
             };
-            let n = self.slot_dword(slot, super::OWN_SLOTS);
             for k in 0..count {
                 if (k as i32).wrapping_add(skew) == 2 {
                     self.write(inst, Reg::S(code + k as u8), n, None);
@@ -6828,10 +7154,10 @@ impl<'a> Lower<'a> {
     /// typed loads do (channels past the format's read 0, 0, 0, 1).
     // shortcut: the descriptor's channel swizzle is taken as the identity
     // (it is for raw views and the descriptors code builds), elements of 4
-    // bytes or more as dword-aligned. Norm formats divide, which the AMD
-    // driver does 1 ULP off the hardware's correctly rounded conversion for
-    // some values; correct it with an integer check if a title compares
-    // converted values exactly.
+    // bytes or more as dword-aligned. Normalized codes take the float
+    // nearest their quotient in integers ([`Self::norm_quotient`]), as the
+    // console's buffer unit gives it; with `VICTORY_EXACT_NORM=0` the host
+    // divides, one ulp off for some codes (see [`super::Switch::ExactNorm`]).
     fn format_load(&mut self, h: V, off: V, format: u8, channels: u32) -> Result<Vec<V>, Why> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
@@ -6889,7 +7215,18 @@ impl<'a> Lower<'a> {
                 l.s.m.bin(c, Bin::AShr, t, k)
             };
             let f32t = self.s.t.f32;
+            let exact = super::Switch::ExactNorm.on();
             let x = match numeric {
+                Numeric::Unorm if exact && w <= 16 => {
+                    let q = self.norm_quotient(field, w);
+                    let q = self.as_float(q);
+                    // The largest code is exactly 1.0 (it is no quotient
+                    // below 1 that the integer path takes).
+                    let (top, one) = (self.s.m.i32((1 << w) - 1), self.s.m.f32(1.0f32.to_bits()));
+                    let full = self.s.m.cmp(c, pred::EQ, field, top);
+                    let q = self.s.m.select(c, full, one, q);
+                    float(self, q)
+                }
                 Numeric::Unorm => {
                     let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
                     let max = self.s.m.f32((((1u64 << w) - 1) as f32).to_bits());
@@ -6901,6 +7238,30 @@ impl<'a> Lower<'a> {
                     let full = self.s.m.cmp(c, pred::EQ, field, top);
                     let one = self.s.m.f32(1.0f32.to_bits());
                     let q = self.s.m.select(c, full, one, q);
+                    float(self, q)
+                }
+                Numeric::Snorm if exact && w <= 17 => {
+                    let s = signed(self);
+                    // The magnitude's quotient with the code's sign; the
+                    // codes at and past the ends are exactly 1.0 and -1.0
+                    // (the lowest code is -1.0 too, as is the one above it).
+                    // After VIctory-7900XTX c5a2f8d (upstream 645391b).
+                    let top = (1u32 << (w - 1)) - 1;
+                    let (zero, sign) = (self.s.m.i32(0), self.s.m.i32(0x8000_0000));
+                    let neg = self.s.m.cmp(c, pred::SLT, s, zero);
+                    let minus = self.s.m.bin(c, Bin::Sub, zero, s);
+                    let m = self.s.m.select(c, neg, minus, s);
+                    let q = self.norm_quotient(m, w - 1);
+                    let sign = self.s.m.select(c, neg, sign, zero);
+                    let q = self.s.m.bin(c, Bin::Or, q, sign);
+                    let q = self.as_float(q);
+                    let (high, one) = (self.s.m.i32(top), self.s.m.f32(1.0f32.to_bits()));
+                    let at_top = self.s.m.cmp(c, pred::SGE, s, high);
+                    let q = self.s.m.select(c, at_top, one, q);
+                    let low = self.s.m.i32(top.wrapping_neg());
+                    let minus_one = self.s.m.f32((-1.0f32).to_bits());
+                    let at_bottom = self.s.m.cmp(c, pred::SLE, s, low);
+                    let q = self.s.m.select(c, at_bottom, minus_one, q);
                     float(self, q)
                 }
                 Numeric::Snorm => {
@@ -6949,6 +7310,151 @@ impl<'a> Lower<'a> {
         }
         out.truncate(channels as usize);
         Ok(out)
+    }
+
+    /// The bits of the float nearest to `a / d`, `d = 2^w - 1`, for codes
+    /// `0 <= a < d` and `w <= 16`: what the console's buffer unit gives for
+    /// a normalized code. The host's division is not exact (an RTX 2070
+    /// SUPER returns 126 of the 256 8-bit codes one ulp off, and 16-bit
+    /// code 257 one ulp low), and titles truncate `x * d` back to the code
+    /// (a material index in a vertex colour's alpha), which a quotient one
+    /// ulp low turns into the code below.
+    ///
+    /// `Q = floor(a * 2^32 / d) = a * K + floor(a * r / d)` with `K =
+    /// floor(2^32 / d)` and `r = 2^32 mod d` (no division when `r` is 1:
+    /// widths dividing 32). `a / d` is never exact for `0 < a < d` (`d`
+    /// odd, `r` coprime to it), so `Q` rounds to 24 bits up exactly when
+    /// its highest dropped bit is set, and the result is that integer (at
+    /// most 2^24, so its conversion is exact on any host) scaled by a power
+    /// of two; `Q` itself when it fits, the quotient's further bits then
+    /// lying below half an ulp. That holds for every code of every width but
+    /// 11 and 12 (`norm_quotient_matches_the_nearest_float` checks all codes
+    /// of widths 1 to 16), which take [`Self::exact_norm`]. The host's
+    /// conversion of a larger integer is not relied on: WARP rounds those
+    /// above 2^31 otherwise.
+    /// From VIctory-7900XTX 9a6c829 (after VIctory da82e444).
+    fn norm_quotient(&mut self, a: V, w: u32) -> V {
+        if w <= 1 {
+            // (only code 0 lies below 1)
+            return self.s.m.i32(0);
+        }
+        if matches!(w, 11 | 12) {
+            return self.exact_norm(a, w);
+        }
+        let c = self.cur;
+        let d = (1u64 << w) - 1;
+        let (kk, r) = ((1u64 << 32) / d, (1u64 << 32) % d);
+        let k = |l: &mut Self, v: u64| l.s.m.i32(v as u32);
+        let (one, kv) = (k(self, 1), k(self, kk));
+        let mut q = self.s.m.bin(c, Bin::Mul, a, kv);
+        if r != 1 {
+            let (rv, dv) = (k(self, r), k(self, d));
+            let t = self.s.m.bin(c, Bin::Mul, a, rv);
+            let more = self.s.m.bin(c, Bin::UDiv, t, dv);
+            q = self.s.m.bin(c, Bin::Add, q, more);
+        }
+        // The bits to drop (1 to 8) from the exponent of `q >> 8`, which
+        // converts exactly (fewer than 25 bits); none when `q` fits.
+        let k8 = k(self, 8);
+        let top = self.s.m.bin(c, Bin::LShr, q, k8);
+        let top = self.s.m.cast(c, Cast::UiToFp, top, self.s.t.f32);
+        let top = self.as_int(top);
+        let k23 = k(self, 23);
+        let e = self.s.m.bin(c, Bin::LShr, top, k23);
+        let bias = k(self, 127 + 15);
+        let shift = self.s.m.bin(c, Bin::Sub, e, bias);
+        let (zero, b24) = (k(self, 0), k(self, 1 << 24));
+        let fits = self.s.m.cmp(c, pred::IULT, q, b24);
+        let shift = self.s.m.select(c, fits, zero, shift);
+        // Rounded up when the highest dropped bit is set: `a / d` is never
+        // exact, so a dropped half is more than half, never a tie.
+        let up = self.s.m.bin(c, Bin::Shl, q, one);
+        let up = self.s.m.bin(c, Bin::LShr, up, shift);
+        let up = self.s.m.bin(c, Bin::And, up, one);
+        let m = self.s.m.bin(c, Bin::LShr, q, shift);
+        let m = self.s.m.bin(c, Bin::Add, m, up);
+        // At most 2^24: exact as a float, and so its scale by 2^(shift - 32).
+        let f = self.s.m.cast(c, Cast::UiToFp, m, self.s.t.f32);
+        let b95 = k(self, 127 - 32);
+        let scale = self.s.m.bin(c, Bin::Add, shift, b95);
+        let scale = self.s.m.bin(c, Bin::Shl, scale, k23);
+        let scale = self.as_float(scale);
+        let f = self.s.m.bin(c, Bin::Mul, f, scale);
+        self.as_int(f)
+    }
+
+    /// [`Self::norm_quotient`] in integers only, for any width up to 16: `Q`
+    /// as there, 8 more bits when that leaves fewer than 25 (codes of wide
+    /// formats near 0), then rounded to 24 bits to nearest even with the
+    /// remainder as sticky bit, and assembled as float bits.
+    /// From VIctory-7900XTX 9a6c829 (after VIctory da82e444).
+    fn exact_norm(&mut self, a: V, w: u32) -> V {
+        let c = self.cur;
+        let d = (1u64 << w) - 1;
+        let (kk, r) = ((1u64 << 32) / d, (1u64 << 32) % d);
+        let k = |l: &mut Self, v: u64| l.s.m.i32(v as u32);
+        let (one, zero, dv, k8) = (k(self, 1), k(self, 0), k(self, d), k(self, 8));
+        let kv = k(self, kk);
+        let mut q = self.s.m.bin(c, Bin::Mul, a, kv);
+        let mut rem = a;
+        if r != 1 {
+            let rv = k(self, r);
+            let t = self.s.m.bin(c, Bin::Mul, a, rv);
+            let more = self.s.m.bin(c, Bin::UDiv, t, dv);
+            q = self.s.m.bin(c, Bin::Add, q, more);
+            rem = self.s.m.bin(c, Bin::URem, t, dv);
+        }
+        // The exponent's bias less the 32 (or 40) fraction bits of `q`; the
+        // shift below is added.
+        let mut bias = k(self, 127 + 23 - 32);
+        if kk < 1 << 24 {
+            // Fewer than 25 bits for the smallest codes: 8 more.
+            let t = self.s.m.bin(c, Bin::Shl, rem, k8);
+            let more = self.s.m.bin(c, Bin::UDiv, t, dv);
+            let rest = self.s.m.bin(c, Bin::URem, t, dv);
+            let wide = self.s.m.bin(c, Bin::Shl, q, k8);
+            let wide = self.s.m.bin(c, Bin::Or, wide, more);
+            let limit = k(self, 1 << 24);
+            let small = self.s.m.cmp(c, pred::IULT, q, limit);
+            q = self.s.m.select(c, small, wide, q);
+            rem = self.s.m.select(c, small, rest, rem);
+            let b40 = k(self, 127 + 23 - 40);
+            bias = self.s.m.select(c, small, b40, bias);
+        }
+        // Bits to drop: the bit length less 24, 1 to 8.
+        let mut shift = one;
+        for bit in 25..32 {
+            let at = k(self, 1 << bit);
+            let ge = self.s.m.cmp(c, pred::IUGE, q, at);
+            let add = self.s.m.select(c, ge, one, zero);
+            shift = self.s.m.bin(c, Bin::Add, shift, add);
+        }
+        let mant = self.s.m.bin(c, Bin::LShr, q, shift);
+        let below = self.s.m.bin(c, Bin::Sub, shift, one);
+        let half = self.s.m.bin(c, Bin::LShr, q, below);
+        let half = self.s.m.bin(c, Bin::And, half, one);
+        let low = self.s.m.bin(c, Bin::Shl, one, below);
+        let low = self.s.m.bin(c, Bin::Sub, low, one);
+        let low = self.s.m.bin(c, Bin::And, q, low);
+        let rest = self.s.m.bin(c, Bin::Or, low, rem);
+        let sticky = self.s.m.cmp(c, pred::NE, rest, zero);
+        let odd = self.s.m.bin(c, Bin::And, mant, one);
+        let tie = self.s.m.select(c, sticky, one, odd);
+        let up = self.s.m.bin(c, Bin::And, half, tie);
+        let mant = self.s.m.bin(c, Bin::Add, mant, up);
+        // Rounding up to 2^24 moves to the next exponent.
+        let k24 = k(self, 24);
+        let carry = self.s.m.bin(c, Bin::LShr, mant, k24);
+        let mant = self.s.m.bin(c, Bin::LShr, mant, carry);
+        let e = self.s.m.bin(c, Bin::Add, bias, shift);
+        let e = self.s.m.bin(c, Bin::Add, e, carry);
+        let k23 = k(self, 23);
+        let e = self.s.m.bin(c, Bin::Shl, e, k23);
+        let fraction = k(self, 0x7F_FFFF);
+        let m = self.s.m.bin(c, Bin::And, mant, fraction);
+        let bits = self.s.m.bin(c, Bin::Or, e, m);
+        let is_zero = self.s.m.cmp(c, pred::EQ, a, zero);
+        self.s.m.select(c, is_zero, zero, bits)
     }
 
     /// Channels of buffer format `format`, as [`Self::format_load`] gives
@@ -7477,13 +7983,74 @@ impl<'a> Lower<'a> {
     /// stride was not recovered statically, reading `stride` from the host's
     /// runtime stride table (`t0`, [`super::STRIDE_SPACE`]).
     fn runtime_stride_offset(&mut self, src: &Source, index: V, off: V) -> Result<V, Why> {
-        let slot = self
-            .heap_slot(src, false)
+        let word = self
+            .slot_word(src, 0)
             .map_err(|_| "a structured buffer of unknown stride")?;
         let c = self.cur;
-        let stride = self.slot_dword(slot, 0);
+        // (the host marks integer views above the stride while the switch
+        // that reads the marks is on)
+        let stride = if super::Switch::D16Integer.on() {
+            let bits = self.s.m.i32(super::VIEW_STRIDE_BITS);
+            self.s.m.bin(c, Bin::And, word, bits)
+        } else {
+            word
+        };
         let elem_off = self.s.m.bin(c, Bin::Mul, index, stride);
         Ok(self.s.m.bin(c, Bin::Add, elem_off, off))
+    }
+
+    /// The host's table dword `from` dwords past the slot of the view `src`
+    /// names ([`Self::slot_dword`]). Of a descriptor load it is read once
+    /// per block and the blocks it dominates through guards
+    /// (`VICTORY_STRIDE_ONCE=0`: at every use): with exact views most scalar
+    /// loads of views picked from the heap read the table, which lives in
+    /// system memory. (After VIctory-7900XTX's strides map, lower.rs
+    /// `slot_word`, and victory-mix's.)
+    fn slot_word(&mut self, src: &Source, from: u32) -> Result<V, Why> {
+        let key = match *src {
+            Source::Loaded { load, first } if super::Switch::StrideOnce.on() => {
+                Some((load, first, from))
+            }
+            _ => None,
+        };
+        if let Some((load, first, from)) = key {
+            let mut at = self.cur;
+            loop {
+                if let Some(&v) = self.slot_words.get(&(at, load, first, from)) {
+                    return Ok(v);
+                }
+                match self.guard_heads.get(&at) {
+                    Some(&up) => at = up,
+                    None => break,
+                }
+            }
+        }
+        let slot = self.heap_slot(src, false)?;
+        let v = self.slot_dword(slot, from);
+        if let Some((load, first, from)) = key {
+            self.slot_words.insert((self.cur, load, first, from), v);
+        }
+        Ok(v)
+    }
+
+    /// Whether the typed buffer view `src` names is one of an integer
+    /// format, and whether of a signed one, as the host's table says
+    /// ([`super::VIEW_INTEGER`], [`super::VIEW_SIGNED`]): `None` where the
+    /// table has no slot for it (views built in code, root views) and with
+    /// `VICTORY_D16_INTEGER=0`.
+    fn integer_view(&mut self, src: &Source) -> Option<(V, V)> {
+        if !super::Switch::D16Integer.on() {
+            return None;
+        }
+        let word = self.slot_word(src, 0).ok()?;
+        let c = self.cur;
+        let zero = self.s.m.i32(0);
+        let [int, signed] = [super::VIEW_INTEGER, super::VIEW_SIGNED].map(|bit| {
+            let bit = self.s.m.i32(bit);
+            let x = self.s.m.bin(c, Bin::And, word, bit);
+            self.s.m.cmp(c, pred::NE, x, zero)
+        });
+        Some((int, signed))
     }
 
     /// What the host's table by heap slot (`t0`, [`super::STRIDE_SPACE`])
@@ -8366,9 +8933,7 @@ impl<'a> Lower<'a> {
                     Some(Ok(o)) => o,
                     _ => self.s.m.i32(0),
                 };
-                let h = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
+                let h = self.alu_half(r);
                 let (keep, h) = if name == "v_fma_mixhi_f16" {
                     let k16 = self.s.m.i32(16);
                     (0xFFFF, self.s.m.bin(c, Bin::Shl, h, k16))
@@ -8422,11 +8987,10 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_cvt_f16_f32" if v.opsel == 0 => {
-                // Rounded to nearest even (the MODE default) into the low half.
+                // Rounded to nearest even (the MODE default) into the low
+                // half (as the host converts unless `VICTORY_F16_NEAREST=1`).
                 let a = f(self, 0)?;
-                let r = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[a]);
+                let r = self.alu_half(a);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a 16-bit result outside a VGPR");
                 };
@@ -9126,8 +9690,7 @@ impl<'a> Lower<'a> {
             if v.clamp {
                 f = l.unary(7, f);
             }
-            let h =
-                l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+            let h = l.alu_half(f);
             l.write_half(inst, h, guard)
         };
         if name == "v_cvt_f16_f32" {
@@ -9431,7 +9994,7 @@ impl<'a> Lower<'a> {
             return Err("a packed half FMA of constants");
         }
         let c = self.cur;
-        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let f32t = self.s.t.f32;
         let old = inst.read(Reg::V(reg)).ok_or("an unread destination")?;
         let words = [self.operand(inst, &v.src[0])?, self.operand(inst, &v.src[1])?, self.i32_of(old)?];
         let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
@@ -9446,7 +10009,7 @@ impl<'a> Lower<'a> {
                 })
                 .collect();
             let f = self.fmad(xs[0], xs[1], xs[2]);
-            halves.push(self.s.op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]));
+            halves.push(self.alu_half(f));
         }
         let hi = self.s.m.bin(c, Bin::Shl, halves[1], k16);
         let lo = self.s.m.bin(c, Bin::And, halves[0], low);
@@ -9470,7 +10033,7 @@ impl<'a> Lower<'a> {
             return Err("modifiers on a packed integer operation");
         }
         let c = self.cur;
-        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let f32t = self.s.t.f32;
         let mut halves = Vec::new();
         for high in [false, true] {
             let mut xs = Vec::new();
@@ -9502,8 +10065,7 @@ impl<'a> Lower<'a> {
                 if v.clamp {
                     f = self.unary(7, f);
                 }
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                self.alu_half(f)
             } else {
                 let k16 = self.s.m.i32(16);
                 let sext = |l: &mut Self, x: V| {
@@ -10573,10 +11135,7 @@ impl<'a> Lower<'a> {
                         None => Ok(None),
                     }
                 };
-                let to_f16 = |l: &mut Self, f: V| {
-                    let i32t = l.s.t.i32;
-                    l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
-                };
+                let to_f16 = |l: &mut Self, f: V| l.alu_half(f);
                 let h = 2 * attribute.channel + u8::from(attribute.high);
                 let c = self.cur;
                 if name == "v_interp_p1ll_f16" {
@@ -10584,7 +11143,28 @@ impl<'a> Lower<'a> {
                     let f = half(self, h)?.ok_or("a packed input half no element holds")?;
                     self.as_int(f)
                 } else if f16 {
-                    let f = half(self, h)?.ok_or("a packed input half no element holds")?;
+                    let mut f = half(self, h)?.ok_or("a packed input half no element holds")?;
+                    if let Fields::Valu(v) = &inst.fields
+                        && super::Switch::InterpF16Mods.on()
+                    {
+                        // omod, then clamp, before the one rounding to 16
+                        // bits; op_sel[3] picks the destination half (the
+                        // low half was always written, so a high one never
+                        // arrived). From VIctory-7900XTX b9c18b0, after
+                        // VIctory e29391f.
+                        if v.omod != 0 {
+                            let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(v.omod)];
+                            let k = self.s.m.f32(factor.to_bits());
+                            f = self.s.m.bin(c, Bin::Mul, f, k);
+                        }
+                        if v.clamp {
+                            f = self.unary(7, f);
+                        }
+                        let lo = to_f16(self, f);
+                        // A pixel interpolates in every lane; guards only
+                        // hide inactive ones.
+                        return self.write_half(inst, lo, None);
+                    }
                     let lo = to_f16(self, f);
                     self.low_half(inst, reg, lo)
                 } else if matches!(eval, Eval::Mode(1)) {
@@ -12132,8 +12712,16 @@ impl<'a> Lower<'a> {
             let mut vals =
                 self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, regs as u8)?;
             if d16 {
-                // shortcut: d16 data is taken as f16 (integer formats would
-                // keep 16 bits), widened for the 32-bit float store.
+                // d16 data is taken as f16, widened for the 32-bit float
+                // store; through a view of an integer format it is a 16-bit
+                // integer, zero- or sign-extended, as the host's table says
+                // (VIctory-7900XTX 9a6c829, after VIctory 4243a96a: a face
+                // network keeps its halves in UINT views; its output was
+                // noise). shortcut: the handle stays a float one, whose bits
+                // the drivers pass; a view the table has no slot for (built
+                // in code) is taken as a float one.
+                let integer = if typed { self.integer_view(src) } else { None };
+                let c = self.cur;
                 let mut wide = Vec::new();
                 for k in 0..count {
                     let mut x = vals[(k / 2) as usize];
@@ -12145,7 +12733,16 @@ impl<'a> Lower<'a> {
                     let f = self
                         .s
                         .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
-                    wide.push(self.as_int(f));
+                    let mut w = self.as_int(f);
+                    if let Some((int, signed)) = integer {
+                        let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+                        let zero_ext = self.s.m.bin(c, Bin::And, x, low);
+                        let up = self.s.m.bin(c, Bin::Shl, x, k16);
+                        let sign_ext = self.s.m.bin(c, Bin::AShr, up, k16);
+                        let n = self.s.m.select(c, signed, sign_ext, zero_ext);
+                        w = self.s.m.select(c, int, n, w);
+                    }
+                    wide.push(w);
                 }
                 vals = wide;
             }
@@ -12276,16 +12873,25 @@ impl<'a> Lower<'a> {
             return Err("a buffer result");
         };
         if d16 {
-            // Two f16 channels per VGPR (an odd last high half 0).
+            // Two f16 channels per VGPR (an odd last high half 0); the low
+            // 16 bits of an integer view's (see the stores above).
+            let integer = if typed { self.integer_view(src) } else { None };
+            let c = self.cur;
             let k16 = self.s.m.i32(16);
             let i32t = self.s.t.i32;
             for k in 0..count.div_ceil(2) {
                 let mut x = None;
                 for ch in (2 * k..(2 * k + 2).min(count)).rev() {
                     let f = self.s.m.extract(c, r, ch);
-                    let h = self
+                    let mut h = self
                         .s
                         .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+                    if let Some((int, _)) = integer {
+                        let bits = self.as_int(f);
+                        let low = self.s.m.i32(0xFFFF);
+                        let low = self.s.m.bin(c, Bin::And, bits, low);
+                        h = self.s.m.select(c, int, low, h);
+                    }
                     x = Some(match x {
                         Some(hi) => {
                             let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
@@ -14601,6 +15207,78 @@ mod tests {
         // Invalid, past the table.
         assert_eq!(buffer_format(0), None);
         assert_eq!(buffer_format(78), None);
+    }
+
+    /// `Lower::norm_quotient`'s arithmetic on the CPU, step for step (u32
+    /// wrapping as DXIL's i32, exact conversions of values below 2^24).
+    fn norm_quotient_cpu(a: u32, w: u32) -> u32 {
+        if w <= 1 {
+            return 0;
+        }
+        if matches!(w, 11 | 12) {
+            return exact_norm_cpu(a, w);
+        }
+        let d = (1u64 << w) - 1;
+        let (kk, r) = ((1u64 << 32) / d, (1u64 << 32) % d);
+        let mut q = a.wrapping_mul(kk as u32);
+        if r != 1 {
+            q = q.wrapping_add(a.wrapping_mul(r as u32) / d as u32);
+        }
+        let e = ((q >> 8) as f32).to_bits() >> 23;
+        let shift = if q < 1 << 24 { 0 } else { e.wrapping_sub(127 + 15) };
+        let up = (q << 1) >> shift & 1;
+        let m = (q >> shift) + up;
+        let scale = f32::from_bits((shift + 127 - 32) << 23);
+        (m as f32 * scale).to_bits()
+    }
+
+    /// `Lower::exact_norm`'s arithmetic on the CPU, step for step.
+    fn exact_norm_cpu(a: u32, w: u32) -> u32 {
+        let d = (1u64 << w) - 1;
+        let dd = d as u32;
+        let (kk, r) = ((1u64 << 32) / d, (1u64 << 32) % d);
+        let mut q = a.wrapping_mul(kk as u32);
+        let mut rem = a;
+        if r != 1 {
+            let t = a.wrapping_mul(r as u32);
+            q = q.wrapping_add(t / dd);
+            rem = t % dd;
+        }
+        let mut bias = 127 + 23 - 32;
+        if kk < 1 << 24 && q < 1 << 24 {
+            let t = rem << 8;
+            q = q << 8 | t / dd;
+            rem = t % dd;
+            bias = 127 + 23 - 40;
+        }
+        let shift = 1 + (25..32).filter(|&bit| q >= 1 << bit).count() as u32;
+        let mant = q >> shift;
+        let half = q >> (shift - 1) & 1;
+        let sticky = (q & ((1 << (shift - 1)) - 1)) | rem != 0;
+        let up = half & if sticky { 1 } else { mant & 1 };
+        let mant = mant + up;
+        let carry = mant >> 24;
+        let mant = mant >> carry;
+        let bits = (bias + shift + carry) << 23 | mant & 0x7F_FFFF;
+        if a == 0 { 0 } else { bits }
+    }
+
+    /// Every code `0 <= a < 2^w - 1` of every width up to 16 takes the float
+    /// nearest `a / (2^w - 1)` (as the CPU divides, correctly rounded), by
+    /// both integer paths of the normalized loads (`exact_norm` for every
+    /// width it is asked for).
+    #[test]
+    fn norm_quotient_matches_the_nearest_float() {
+        for w in 1..=16u32 {
+            let d = (1u32 << w) - 1;
+            for a in 0..d {
+                let want = (a as f32 / d as f32).to_bits();
+                assert_eq!(norm_quotient_cpu(a, w), want, "{w}-bit code {a}");
+                if w >= 2 {
+                    assert_eq!(exact_norm_cpu(a, w), want, "{w}-bit code {a}, integers only");
+                }
+            }
+        }
     }
 
     /// Lowers a pixel program that loads a sampler and an image from two

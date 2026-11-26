@@ -692,3 +692,269 @@ fn loops_with_an_exit_mask_grown_from_zero() {
     ];
     console_flow_case("exit-mask loop reading lane 40", &body, 64, |_| 40 + 64);
 }
+
+/// [`run`] with a raw UAV of `dwords` dwords (at least the lanes' results).
+fn run_dwords(host: &Host, cs: &super::HostShader, threads: u32, groups: u32, dwords: u32) -> Result<Vec<u32>, String> {
+    let (root, pso) = host.compute_pipeline(cs)?;
+    let data = vec![0; (cs.user_data_dwords() as usize).max(1)];
+    let views = [View::RawUav(dwords.max(threads * groups))];
+    let out = host.dispatch(
+        &root,
+        &pso,
+        &Dispatch {
+            roots: vec![(0, Root::Constants(data))],
+            views: &views,
+            samplers: &[],
+            groups: [groups, 1, 1],
+        },
+    )?;
+    Ok(out.into_iter().next().unwrap_or_default())
+}
+
+/// A one-wave group's LDS shared between its lanes without barriers, as the
+/// console compiler leaves it: every lane writes LDS[0] and LDS[1], adds
+/// t + 1 to LDS[0], the lanes below 40 (both halves of the wave) take the
+/// greatest t into LDS[1] inside a branch, and every lane reads both after
+/// it: 2080 + 39.
+const LDS_SHARED: &[u32] = &[
+    0x7E02_0280, // v_mov_b32 v1, 0
+    0x7E08_0280, // v_mov_b32 v4, 0
+    0xD834_0000,
+    0x0000_0401, // ds_write_b32 v1, v4
+    0xD834_0004,
+    0x0000_0401, // ds_write_b32 v1, v4 offset:4
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x4A06_0081, // v_add_nc_u32 v3, 1, v0
+    0xD800_0000,
+    0x0000_0301, // ds_add_u32 v1, v3
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+    0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+    0xBF88_0003, // s_cbranch_execz +3
+    0xD820_0004,
+    0x0000_0001, // ds_max_u32 v1, v0 offset:4
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    0xD8D8_0000,
+    0x0200_0001, // ds_read_b32 v2, v1
+    0xD8D8_0004,
+    0x0500_0001, // ds_read_b32 v5, v1 offset:4
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x4A04_0B02, // v_add_nc_u32 v2, v2, v5
+];
+
+/// The allocation idiom of the title's culls and tile classifications in a
+/// one-wave group with LDS: the odd lanes count themselves (`s_bcnt1`), the
+/// first of them (`s_ff1` against its own number) reserves that many slots
+/// with an atomic add on a counter at dword 4096, every odd lane writes its
+/// t at the reserved base plus its rank among them (`v_mbcnt` of EXEC) into
+/// the list from dword 4097 and adds 1 to LDS[0], and every lane reads
+/// LDS[0] after the branch: 32.
+const LDS_IDIOM: &[u32] = &[
+    0x7E02_0280, // v_mov_b32 v1, 0
+    0x7E08_0280, // v_mov_b32 v4, 0
+    0xD834_0000,
+    0x0000_0401, // ds_write_b32 v1, v4
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x360A_0081, // v_and_b32 v5, 1, v0
+    0x7D8A_0A80, // v_cmp_ne_u32 vcc, 0, v5
+    0xBE8E_246A, // s_and_saveexec_b64 s[14:15], vcc
+    0xBF88_001E, // s_cbranch_execz +30
+    0xBE8C_107E, // s_bcnt1_i32_b64 s12, exec
+    0xD765_0006,
+    0x0001_00C1, // v_mbcnt_lo_u32_b32 v6, -1, 0
+    0xD766_0006,
+    0x0002_0CC1, // v_mbcnt_hi_u32_b32 v6, -1, v6
+    0xD765_0007,
+    0x0001_007E, // v_mbcnt_lo_u32_b32 v7, exec_lo, 0
+    0xD766_0007,
+    0x0002_0E7F, // v_mbcnt_hi_u32_b32 v7, exec_hi, v7
+    0xBE8D_147E, // s_ff1_i32_b64 s13, exec
+    0x7E12_02FF,
+    0x0000_4000, // v_mov_b32 v9, 0x4000
+    0x7E10_020C, // v_mov_b32 v8, s12
+    0xBE90_047E, // s_mov_b64 s[16:17], exec
+    0x7DA4_0C0D, // v_cmpx_eq_u32 exec, s13, v6
+    0xE0C8_5000,
+    0x8001_0809, // buffer_atomic_add v8, v9, s[4:7], 0 offen glc
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xBEFE_0410, // s_mov_b64 exec, s[16:17]
+    0x7E24_0508, // v_readfirstlane_b32 s18, v8
+    0x4A14_0E12, // v_add_nc_u32 v10, s18, v7
+    0x3416_1482, // v_lshlrev_b32 v11, 2, v10
+    0x4A16_16FF,
+    0x0000_4004, // v_add_nc_u32 v11, 0x4004, v11
+    0xE070_1000,
+    0x8001_000B, // buffer_store_dword v0, v11, s[4:7], 0 offen
+    0x7E18_0281, // v_mov_b32 v12, 1
+    0xD800_0000,
+    0x0000_0C01, // ds_add_u32 v1, v12
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x88FE_0E7E, // s_or_b64 exec, exec, s[14:15]
+    0xD8D8_0000,
+    0x0200_0001, // ds_read_b32 v2, v1
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+];
+
+/// The idiom through whole-wave sections, as the title's tile
+/// classifications have it: every lane adds t to LDS[0], an exclusive prefix
+/// sum of t + 1 (v9) and the sum of t + 1 (s12) over the wave, the first
+/// lane reserves the sum at the counter (dword 4096), every lane writes t + 1
+/// at the base plus its prefix in the list from dword 4097, and reads
+/// LDS[0]: 2016.
+fn lds_sections() -> Vec<u32> {
+    let mut words = vec![
+        0x7E18_0280, // v_mov_b32 v12, 0
+        0xD834_0000,
+        0x0000_0C0C, // ds_write_b32 v12, v12
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD800_0000,
+        0x0000_000C, // ds_add_u32 v12, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E1A_0300, // v_mov_b32 v13, v0
+        0x4A00_0081, // v_add_nc_u32 v0, 1, v0
+        // WavePrefixSum(t + 1) into v9, as `wave_prefix_sums_continue_into_the_upper_half`.
+        0xBE8A_25C1, // s_or_saveexec_b64 s[10:11], -1
+        0xD501_0001,
+        0x002A_0080, // v_cndmask_b32_e64 v1, 0, v0, s[10:11]
+        0x4A02_02FA,
+        0xFF01_1101, // v_add_nc_u32_dpp v1, v1, v1 row_shr:1
+        0x4A02_02FA,
+        0xFF01_1201, // v_add_nc_u32_dpp v1, v1, v1 row_shr:2
+        0x4A02_02FA,
+        0xFF01_1401, // v_add_nc_u32_dpp v1, v1, v1 row_shr:4
+        0x4A02_02FA,
+        0xFF01_1801, // v_add_nc_u32_dpp v1, v1, v1 row_shr:8
+        0xD778_0006,
+        0x0305_8301, // v_permlanex16_b32 v6, v1, -1, -1
+        0x7E0E_0280, // v_mov_b32_e32 v7, 0
+        0x7E0E_02FA,
+        0xAF00_E406, // v_mov_b32_dpp v7, v6 quad_perm:[0,1,2,3] row_mask:0xa
+        0x4A02_0F01, // v_add_nc_u32_e32 v1, v1, v7
+        0xD760_000C,
+        0x0001_3F01, // v_readlane_b32 s12, v1, 31
+        0x7E10_020C, // v_mov_b32_e32 v8, s12
+        0x7E0E_0280, // v_mov_b32_e32 v7, 0
+        0x7E0E_02FA,
+        0xCF00_E408, // v_mov_b32_dpp v7, v8 quad_perm:[0,1,2,3] row_mask:0xc
+        0x4A02_0F01, // v_add_nc_u32_e32 v1, v1, v7
+        0x7E12_0280, // v_mov_b32_e32 v9, 0
+        0x7E12_02FA,
+        0xFF01_1101, // v_mov_b32_dpp v9, v1 row_shr:1
+        0xD760_000D,
+        0x0001_1F01, // v_readlane_b32 s13, v1, 15
+        0xD761_0009,
+        0x0001_200D, // v_writelane_b32 v9, s13, 16
+        0xD760_000D,
+        0x0001_3F01, // v_readlane_b32 s13, v1, 31
+        0xD761_0009,
+        0x0001_400D, // v_writelane_b32 v9, s13, 32
+        0xD760_000D,
+        0x0001_5F01, // v_readlane_b32 s13, v1, 47
+        0xD761_0009,
+        0x0001_600D, // v_writelane_b32 v9, s13, 48
+        0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+    ];
+    words.extend_from_slice(WAVE_SUM); // WaveActiveSum(t + 1) into s12
+    words.extend_from_slice(&[
+        0xD765_000E,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v14, -1, 0
+        0xD766_000E,
+        0x0002_1CC1, // v_mbcnt_hi_u32_b32 v14, -1, v14
+        0xBE8F_147E, // s_ff1_i32_b64 s15, exec
+        0x7E10_020C, // v_mov_b32 v8, s12
+        0x7E1E_02FF,
+        0x0000_4000, // v_mov_b32 v15, 0x4000
+        0xBE90_047E, // s_mov_b64 s[16:17], exec
+        0x7DA4_1C0F, // v_cmpx_eq_u32 exec, s15, v14
+        0xE0C8_5000,
+        0x8001_080F, // buffer_atomic_add v8, v15, s[4:7], 0 offen glc
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xBEFE_0410, // s_mov_b64 exec, s[16:17]
+        0x7E24_0508, // v_readfirstlane_b32 s18, v8
+        0x4A14_1212, // v_add_nc_u32 v10, s18, v9
+        0x3416_1482, // v_lshlrev_b32 v11, 2, v10
+        0x4A16_16FF,
+        0x0000_4004, // v_add_nc_u32 v11, 0x4004, v11
+        0xE070_1000,
+        0x8001_000B, // buffer_store_dword v0, v11, s[4:7], 0 offen
+        0x7E00_030D, // v_mov_b32 v0, v13
+        0xD8D8_0000,
+        0x0200_000C, // ds_read_b32 v2, v12
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    ]);
+    words
+}
+
+/// [`program`] of 64 threads with 512 bytes of LDS.
+fn with_lds(body: &[u32]) -> crate::NativeProgram {
+    let mut p = program(body, 64);
+    p.vgprs = 16;
+    let StageIo::Cs(io) = &mut p.io else {
+        unreachable!()
+    };
+    io.rsrc2 |= 1 << 15; // 512 bytes of group-shared memory.
+    p
+}
+
+/// One-wave groups with LDS as two local 32-lane waves that meet around
+/// their LDS accesses (`VICTORY_LDS_LOCAL`, VIctory-7900XTX's local waves of
+/// such groups): every lane's result as in the console flow, the idiom's
+/// slots the same ones in another order; and the forms differ.
+#[test]
+fn local_waves_of_one_wave_groups_keep_their_lds_order() {
+    let nvidia = super::Target { lanes_min: 32, lanes_max: 32, exact_views: false };
+    let local = |p: &crate::NativeProgram| emit_for(p, nvidia).expect("local waves");
+    let console = |p: &crate::NativeProgram| {
+        super::with_switch(super::Switch::LdsLocal, false, || emit_for(p, nvidia)).expect("console flow")
+    };
+    let (shared, idiom, sections) = (with_lds(LDS_SHARED), with_lds(LDS_IDIOM), with_lds(&lds_sections()));
+    for p in [&shared, &idiom, &sections] {
+        let (l, c) = (local(p), console(p));
+        assert_eq!(wave_size(&l.dxil), Some(32));
+        assert_ne!(l.dxil, c.dxil, "local waves are not the console flow");
+        if let Ok(mut v) =
+            super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut l.dxil.clone()).expect("local waves validate");
+        }
+    }
+    for name in adapters().unwrap_or_default() {
+        let Ok(host) = Host::on(&name) else {
+            continue;
+        };
+        if host.target().runs(64) {
+            continue; // the forms are for hosts of 32-lane waves
+        }
+        let groups = 8;
+        for form in ["local", "console"] {
+            let make = |p: &crate::NativeProgram| if form == "local" { local(p) } else { console(p) };
+            // Shared LDS: the same total in every lane of every group.
+            let out = run_dwords(&host, &make(&shared), 64, groups, 0).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(out.iter().all(|&x| x == 2080 + 39), "{name}: {form}: shared LDS: {:?}", &out[..64]);
+            // The idiom: 32 a group counted in LDS, the counter at 32 per group,
+            // the list the odd t of every group.
+            let out = run_dwords(&host, &make(&idiom), 64, groups, 4097 + 32 * groups)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(out[..(64 * groups) as usize].iter().all(|&x| x == 32), "{name}: {form}: LDS count");
+            assert_eq!(out[4096], 32 * groups, "{name}: {form}: reserved slots");
+            let mut list = out[4097..(4097 + 32 * groups) as usize].to_vec();
+            list.sort_unstable();
+            let mut want: Vec<u32> = (0..groups).flat_map(|_| (1..64).step_by(2)).collect();
+            want.sort_unstable();
+            assert_eq!(list, want, "{name}: {form}: the slots");
+            // The idiom through sections: every lane's t + 1 at a slot of its own.
+            let total = 2080 * groups;
+            let out = run_dwords(&host, &make(&sections), 64, groups, 4097 + total)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(out[..(64 * groups) as usize].iter().all(|&x| x == 2016), "{name}: {form}: LDS sum");
+            assert_eq!(out[4096], total, "{name}: {form}: reserved slots");
+            let mut list: Vec<u32> = out[4097..(4097 + total) as usize].iter().copied().filter(|&x| x != 0).collect();
+            list.sort_unstable();
+            let mut want: Vec<u32> = (0..groups).flat_map(|_| 1..65).collect();
+            want.sort_unstable();
+            assert_eq!(list, want, "{name}: {form}: the slots of the sections' idiom");
+            eprintln!("{name}: one-wave LDS groups exact ({form})");
+        }
+    }
+}
