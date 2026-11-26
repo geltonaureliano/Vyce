@@ -189,6 +189,16 @@ fn three_dimensional_groups_keep_the_consoles_lanes() {
             [16, 2, 4],
             [8, 8, 4],
             [4, 8, 8],
+            // Shapes the title uses most, and rows longer than NVIDIA's
+            // waves are wide.
+            [8, 8, 1],
+            [16, 16, 1],
+            [8, 16, 1],
+            [16, 8, 1],
+            [4, 16, 1],
+            [32, 2, 1],
+            [32, 32, 1],
+            [64, 4, 2],
         ] {
             let p = program_3d(threads);
             let n: u32 = threads.iter().product();
@@ -235,6 +245,22 @@ fn flow_case(label: &str, body: &[u32], threads: u32, want: impl Fn(u32) -> u32,
         );
         eprintln!("{name}: {label}, {threads} threads exact (split {split})");
     }
+}
+
+/// Lane permutations inside halves of 32 (`v_permlane16`, `v_permlanex16`)
+/// need nothing from the other host wave.
+#[test]
+fn lane_permutations_stay_in_their_half() {
+    let select = |lo: u32, hi: u32| [0xBE94_03FF, lo, 0xBE95_03FF, hi];
+    // v_permlanex16_b32 v2, v0, s20, s21 with each lane's own nibble: the
+    // other row's lane.
+    let mut body = select(0x7654_3210, 0xFEDC_BA98).to_vec();
+    body.extend([0xD778_0002, 0x0054_2900]);
+    flow_case("permlanex16", &body, 64, |t| t ^ 16, true);
+    // v_permlane16_b32 v2, v0, s20, s21 reversing each row.
+    let mut body = select(0x89AB_CDEF, 0x0123_4567).to_vec();
+    body.extend([0xD777_0002, 0x0054_2900]);
+    flow_case("permlane16", &body, 64, |t| (t & !15) | (15 - (t & 15)), true);
 }
 
 /// A mask counted whole: 40 lanes of the console wave, 32 in one half and
@@ -405,6 +431,7 @@ fn backward_permute_wraps_in_each_half() {
     let nvidia = super::Target {
         lanes_min: 32,
         lanes_max: 32,
+        exact_views: false,
     };
     for threads in [32, 48, 64, 128] {
         let cs = emit_for(&program(GATHER_NEXT, threads), nvidia).expect("half-wave gather");
@@ -459,6 +486,7 @@ fn lds_reads_cross_halves_inside_a_masked_branch() {
     let nvidia = super::Target {
         lanes_min: 32,
         lanes_max: 32,
+        exact_views: false,
     };
     let cs = emit_for(&p, nvidia).expect("one group split into two 32-lane waves");
     assert_eq!(wave_size(&cs.dxil), Some(32));
@@ -482,18 +510,90 @@ fn lds_reads_cross_halves_inside_a_masked_branch() {
     }
 }
 
-/// Groups of several console waves need the halves to meet without a
-/// group barrier: not yet.
+/// Groups of several console waves: each wave's halves exchange through
+/// dwords of their own.
 #[test]
-fn console_flow_is_for_one_console_wave_per_group() {
-    let body = [
+fn waves_of_a_group_exchange_apart() {
+    let read = [
         0xD760_0009,
         0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    for threads in [128, 192, 256, 1024] {
+        console_flow_case("v_readlane 40 of each wave", &read, threads, |t| (t & !63) + 40);
+    }
+    let mut sum = WAVE_SUM.to_vec();
+    sum.push(0x7E04_020C); // v_mov_b32 v2, s12
+    let total = |t: u32, threads: u32| {
+        let from = t & !63;
+        (from..(from + 64).min(threads)).sum::<u32>()
+    };
+    for threads in [128, 160, 256, 320, 1024] {
+        console_flow_case("WaveActiveSum(t) of each wave", &sum, threads, |t| total(t, threads));
+    }
+}
+
+/// A branch only the lanes below 80 take: the second of four waves in part,
+/// the last two not at all, and all of them meet at the exchanges inside.
+#[test]
+fn waves_of_a_group_run_branches_in_step() {
+    let mut body = vec![
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x7D88_00FF,
+        0x0000_0050, // v_cmp_gt_u32 vcc, 80, v0
+        0xBE8E_246A, // s_and_saveexec_b64 s[14:15], vcc
+        0xBF88_0015, // s_cbranch_execz +21
+    ];
+    body.extend_from_slice(WAVE_SUM);
+    body.push(0x7E04_020C); // v_mov_b32 v2, s12
+    body.push(0x88FE_0E7E); // s_or_b64 exec, exec, s[14:15]
+    console_flow_case("if (t < 80) WaveActiveSum(t)", &body, 256, |t| match t {
+        0..64 => 2016,
+        64..80 => (64..80).sum(),
+        _ => 1,
+    });
+}
+
+/// A loop a lane runs (t / 16) times: waves leave it at different turns.
+#[test]
+fn waves_of_a_group_loop_in_step() {
+    let body = [
+        0x2C02_0084, // v_lshrrev_b32 v1, 4, v0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7D8A_0280, // v_cmp_ne_u32 vcc, 0, v1
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0006, // s_cbranch_execz end
+        // loop:
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+        0x7D82_0302, // v_cmp_lt_u32 vcc, v2, v1
+        0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+        0xBF89_FFFA, // s_cbranch_execnz loop
+        // end:
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    ];
+    console_flow_case("loop t / 16 times", &body, 256, |t| t / 16);
+}
+
+/// A scalar branch on what differs between waves keeps a program of several
+/// waves per group out of the lockstep form.
+#[test]
+fn waves_that_branch_apart_do_not_run_in_step() {
+    let body = [
+        0xD760_0009,
+        0x0001_0100, // v_readlane_b32 s9, v0, 0
+        0xBF06_8009, // s_cmp_eq_u32 s9, 0
+        0xBF85_0003, // s_cbranch_scc1 +3
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0xBF80_0000, // s_nop 0
         0x7E04_0209, // v_mov_b32 v2, s9
     ];
     let nvidia = super::Target {
         lanes_min: 32,
         lanes_max: 32,
+        exact_views: false,
     };
     assert!(emit_for(&program(&body, 64), nvidia).is_ok());
     assert!(emit_for(&program(&body, 128), nvidia).is_err());

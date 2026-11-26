@@ -10,13 +10,17 @@
 //!
 //! When a count buffer is given, threads at or past `min(max, count)` return
 //! immediately without charging the list's budget or reading uninitialized
-//! tail slots. Each list has a budget (2^27 vertex instances or threads,
-//! groups counted as 64 threads, mesh groups as 128): active records past it
-//! run empty, saturating without 32-bit wraparound so a list of thousands of
-//! garbage records cannot run for seconds either.
+//! tail slots. Records that are garbage on the face of it (slots of all ones)
+//! run empty and charge nothing. Each list has a budget (2^29 vertex
+//! instances or threads, groups counted as 64 threads, mesh groups as 128):
+//! active records past it run empty, so a list of thousands of records of
+//! garbage cannot run for seconds either. Each record adds to the budget
+//! once: which ones are past it depends on their order only, and clamps that
+//! run side by side give the same result each time unless a list really
+//! spends it all.
 //!
-//! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
-//! groups per dimension and 2^20 per dispatch, one-dimensional mesh
+//! shortcut: the bounds (2^24 vertices or instances, 2^26 vertex instances,
+//! 65,535 groups per dimension and 2^20 per dispatch, one-dimensional mesh
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
@@ -40,10 +44,10 @@ cbuffer Record : register(b0) {
 ByteAddressBuffer src_args : register(t0);
 ByteAddressBuffer count_buf : register(t1);
 RWByteAddressBuffer dst_args : register(u0);
-// The list's work so far (vertex instances, threads): past the budget,
-// records run empty.
+// The list's work so far (vertex instances, threads), in 64s: past the
+// budget, records run empty.
 RWByteAddressBuffer budget : register(u1);
-static const uint BUDGET = 1u << 27;
+static const uint BUDGET = 1u << 23;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
 [RootSignature(RS)]
@@ -56,63 +60,48 @@ void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= eff_count) return;
     uint src_at = args_offset + id.x * stride;
     uint dst_at = id.x * stride;
+    // The whole record at once (a load of title memory takes its time), and
+    // nothing past its last argument: that is all execution reads.
+    uint4 a = uint4(0, 0, 0, 0);
+    uint last = 0;
+    if (kind >= 2) {
+        a.xyz = src_args.Load3(src_at);
+    } else {
+        a = src_args.Load4(src_at);
+        if (kind == 1) last = src_args.Load(src_at + 16);
+    }
+    // What it costs, in 64s.
     uint cost;
-    uint2 draw_counts = uint2(0, 0);
-    uint3 groups = uint3(0, 0, 0);
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
-        uint count = min(src_args.Load(src_at), 1u << 24);
-        uint instances = min(src_args.Load(src_at + 4), (1u << 26) / max(count, 1u));
-        cost = count * instances;
-        draw_counts = uint2(count, instances);
+        if (a.x > (1u << 24) || a.y > (1u << 24)) a.xy = uint2(0, 0);
+        a.y = min(a.y, (1u << 26) / max(a.x, 1u));
+        cost = (a.x * a.y + 63u) >> 6;
     } else if (kind == 2) {
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+        a.xyz = min(a.xyz, uint3(65535u, 65535u, 65535u));
         // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
-            g = uint3(0, 0, 0);
-        }
-        cost = g.x * g.y * g.z * 64u;
-        groups = g;
+        if (a.z != 0 && a.x * a.y > GROUPS / a.z) a.xyz = uint3(0, 0, 0);
+        cost = a.x * a.y * a.z;
     } else {
         // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = src_args.Load3(src_at);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
-        cost = g.x * g.y * g.z * 128u;
-        groups = g;
+        if (a.x > GROUPS) a.x = 0;
+        a.xyz = min(a.xyz, uint3(65535u, 1u, 1u));
+        cost = a.x * a.y * a.z * 2u;
     }
-    bool over = false;
     if (cost > 0) {
+        // One add, and none once the budget is spent: it cannot wrap.
         uint before;
         budget.InterlockedOr(0, 0, before);
-        // Bounded retries: an unbounded loop of atomics is a GPU hang if
-        // contention never settles; a record that gives up runs empty.
-        bool settled = false;
-        [allow_uav_condition]
-        for (uint tries = 0; tries < 256 && before < BUDGET; tries++) {
-            uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
-            uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
-            if (prev == before) { settled = true; break; }
-            before = prev;
+        if (before < BUDGET) budget.InterlockedAdd(0, cost, before);
+        if (before >= BUDGET || cost > BUDGET - before) {
+            if (kind <= 1) a.xy = uint2(0, 0); else a.xyz = uint3(0, 0, 0);
         }
-        over = !settled || before >= BUDGET || BUDGET - before < cost;
     }
-    if (kind <= 1) {
-        if (over) {
-            draw_counts = uint2(0, 0);
-        }
-        dst_args.Store2(dst_at, draw_counts);
-        for (uint off = 8; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
-        }
+    if (kind >= 2) {
+        dst_args.Store3(dst_at, a.xyz);
     } else {
-        if (over) {
-            groups = uint3(0, 0, 0);
-        }
-        dst_args.Store3(dst_at, groups);
-        for (uint off = 12; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
-        }
+        dst_args.Store4(dst_at, a);
+        if (kind == 1) dst_args.Store(dst_at + 16, last);
     }
 }
 "#;
@@ -356,10 +345,12 @@ fn record_clamp(
 /// To find faults: 3 as 1 for mesh dispatches only, 4 as 1 for draws only,
 /// 5 as 1 with a new list for the clamps always, 6 the lists cut as for 1
 /// with each clamp before its draw all the same.
-/// 7 as 1 with the clamps run one after another (a barrier between them):
-/// the default. Without it whole mesh objects flickered (leaves, chairs,
-/// clothes: seen by the user, 2026-11-25), as records past the list's budget
-/// were not the same ones from frame to frame.
+/// 7 as 1 with the clamps run one after another (a barrier between them).
+/// Without it whole mesh objects flickered (leaves, chairs, clothes: seen by
+/// the user, 2026-11-25) while each record fought for its place in the
+/// budget and gave up after a while. Now each adds to it once, whatever runs
+/// beside it, and 1 (the clamps of a list side by side) is the default again:
+/// one after another they take microseconds each.
 /// `VICTORY_HOIST_CLAMPS=<n>` sets it; diagnostics builds read it again
 /// every half second from the file `VICTORY_HOIST_FILE` names, if any.
 pub(crate) fn hoist_mode() -> u8 {
@@ -367,7 +358,7 @@ pub(crate) fn hoist_mode() -> u8 {
     static MODE: AtomicU8 = AtomicU8::new(u8::MAX);
     let mode = MODE.load(Ordering::Relaxed);
     if mode == u8::MAX {
-        let set = std::env::var("VICTORY_HOIST_CLAMPS").ok().and_then(|v| v.parse().ok()).unwrap_or(7);
+        let set = std::env::var("VICTORY_HOIST_CLAMPS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
         MODE.store(set, Ordering::Relaxed);
         if cfg!(feature = "diagnostics")
             && let Some(file) = std::env::var_os("VICTORY_HOIST_FILE")
@@ -764,7 +755,7 @@ void main() {
         let Some(mut gpu) = harness else { return };
         let (zero, zero_data, _) = gpu.shared_buffer(4);
         let (src, src_data, _) = gpu.shared_buffer(16);
-        let (readback, results, _) = gpu.shared_buffer(48);
+        let (readback, results, _) = gpu.shared_buffer(9 * 16);
         let budget = gpu.default_uav(256);
         let dst = gpu.default_uav(16);
         // SAFETY: these buffers are mapped and have room for the supplied data.
@@ -773,7 +764,7 @@ void main() {
             src_data.cast::<[u32; 4]>().write([1 << 24, 4, 17, 13]);
         }
         reset_budget(&gpu.list, &budget, &zero);
-        for at in [0, 16, 32] {
+        for at in (0..9).map(|i| i * 16) {
             assert!(record_clamp(
                 &gpu.clamp, &gpu.list, &dst, &budget, (&src, 0), None, (0, 16, 1),
             ));
@@ -793,11 +784,12 @@ void main() {
         unsafe { gpu.list.Close().unwrap() };
         for _ in 0..2 {
             // SAFETY: there is no outstanding GPU execution, and the result buffer is mapped.
-            unsafe { std::ptr::write_bytes(results, 0xCC, 48) };
+            unsafe { std::ptr::write_bytes(results, 0xCC, 9 * 16) };
             gpu.execute_closed_and_wait();
-            // SAFETY: the GPU fence completed all three copies before this read.
-            let actual = unsafe { results.cast::<[[u32; 4]; 3]>().read() };
-            assert_eq!(actual, [[1 << 24, 4, 17, 13], [1 << 24, 4, 17, 13], [0, 0, 17, 13]]);
+            // SAFETY: the GPU fence completed all the copies before this read.
+            let actual = unsafe { results.cast::<[[u32; 4]; 9]>().read() };
+            assert_eq!(actual[..8], [[1 << 24, 4, 17, 13]; 8]);
+            assert_eq!(actual[8], [0, 0, 17, 13]);
         }
     }
 
@@ -873,8 +865,8 @@ void main() {
     ///     (`max = 4096`) does NOT blow `BUDGET` or zero valid dispatches in
     ///     this or subsequent `ExecuteIndirect` calls in the same list,
     /// (b) `src_args` (and `count_buf`) are NOT mutated in-place, and
-    /// (c) full `stride` bytes (`stride = 24` > `12`) are copied for active
-    ///     records into `dst_args` at offset `0`.
+    /// (c) the arguments of active records are in `dst_args` at their stride
+    ///     (`stride = 24` > `12`) from offset `0`.
     #[test]
     fn warp_count_buffer_ignores_garbage_tail_and_preserves_source() {
         let Some(mut warp) = WarpHarness::new() else {
@@ -1045,8 +1037,7 @@ void main() {
             "valid indirect dispatches must all execute"
         );
         assert_eq!(
-            spent,
-            expected_groups * 64,
+            spent, expected_groups,
             "budget must reflect only active records below countBuffer"
         );
         assert_eq!(
@@ -1058,37 +1049,28 @@ void main() {
             "count_buf must never be mutated"
         );
 
-        // Check `dst_args` records 0..3: clamped group counts + preserved extra stride words.
-        assert_eq!(
-            &clamped_words[0..6],
-            &[3, 2, 1, 0x1111_2222, 0x3333_4444, 0x5555_6666]
-        );
-        assert_eq!(
-            &clamped_words[6..12],
-            &[5, 1, 1, 0x7777_8888, 0x9999_AAAA, 0xBBBB_CCCC]
-        );
-        assert_eq!(
-            &clamped_words[12..18],
-            &[65_535, 1, 1, 0xDDDD_EEEE, 0xFFFF_0001, 0x0123_4567]
-        );
+        // Check `dst_args` records 0..3: clamped group counts.
+        assert_eq!(&clamped_words[0..3], &[3, 2, 1]);
+        assert_eq!(&clamped_words[6..9], &[5, 1, 1]);
+        assert_eq!(&clamped_words[12..15], &[65_535, 1, 1]);
         // Inactive slot 3 was never copied from `src_args`.
-        assert_ne!(clamped_words[21], 0xDEAD_BEEF);
+        assert_ne!(clamped_words[18], 65_535);
     }
 
-    /// WARP D3D12 test proving `BUDGET` saturates without 32-bit unsigned
-    /// wraparound across >64 huge indexed-draw records (`count = None`), while
-    /// preserving `StartIndexLocation`, `BaseVertexLocation`,
-    /// `StartInstanceLocation`, and custom stride padding, and leaving
-    /// `src_args` untouched.
+    /// WARP D3D12 test proving records past `BUDGET` run empty, the same
+    /// number whatever runs beside them, across >64 huge indexed-draw records
+    /// (`count = None`), while `StartIndexLocation`, `BaseVertexLocation` and
+    /// `StartInstanceLocation` stay, garbage charges nothing, and `src_args`
+    /// is left untouched.
     #[test]
-    fn warp_budget_saturates_without_wraparound_and_preserves_draw_fields() {
+    fn warp_budget_stops_records_past_it_and_preserves_draw_fields() {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
         const KIND_INDEXED: u32 = 1;
         const STRIDE: u32 = 24; // 5 indexed-draw words + 1 trailing custom word
         const RECORDS: u32 = 128; // 2 waves of 64: old InterlockedAdd wrapped 2^32 at 64!
-        const BUDGET_CAP: u32 = 1 << 27;
+        const BUDGET_CAP: u32 = 1 << 23;
 
         let total_bytes = (STRIDE * RECORDS) as usize;
         let (src_buf, src_ptr, _) = warp.shared_buffer(total_bytes as u64);
@@ -1098,9 +1080,11 @@ void main() {
 
         let mut initial_src = vec![0u8; total_bytes];
         for i in 0..RECORDS as usize {
+            // Every other record: garbage, which is refused.
+            let huge = if i % 2 == 0 { 1 << 24 } else { u32::MAX };
             let words: [u32; 6] = [
-                u32::MAX,                    // IndexCount -> clamps to 1 << 24
-                u32::MAX,                    // InstanceCount -> clamps to 4 (cost = 1 << 26)
+                huge,                        // IndexCount
+                huge,                        // InstanceCount -> clamps to 4 (cost = 1 << 26)
                 1000 + i as u32,             // StartIndexLocation
                 (-200i32 + i as i32) as u32, // BaseVertexLocation
                 5000 + i as u32,             // StartInstanceLocation
@@ -1159,9 +1143,9 @@ void main() {
             (spent, after_src, out_words)
         };
 
-        assert_eq!(
-            spent, BUDGET_CAP,
-            "budget must saturate at BUDGET without wrapping"
+        assert!(
+            (BUDGET_CAP..=BUDGET_CAP + (RECORDS << 20)).contains(&spent),
+            "budget must be spent without wrapping: {spent}"
         );
         assert_eq!(after_src, initial_src, "src_args must remain untouched");
 
@@ -1178,9 +1162,9 @@ void main() {
             assert_eq!(rec[2], 1000 + i as u32);
             assert_eq!(rec[3], (-200i32 + i as i32) as u32);
             assert_eq!(rec[4], 5000 + i as u32);
-            assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
         }
-        assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
+        // 2^26 vertex instances each of 2^29.
+        assert_eq!((kept, zeroed), (8, (RECORDS as usize) - 8));
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, `done`, `Host::execute`,

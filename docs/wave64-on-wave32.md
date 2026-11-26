@@ -128,9 +128,29 @@ that can let individual threads return early are ineligible for this LDS
 path. `emit::split_tests` checks a read across halves inside a masked
 branch against known output values.
 
-Groups of several console waves still need another meeting point: a group
-barrier would wait for console waves elsewhere. The plan stays per-console-
-wave arrival counters with double-buffered slots and a bounded wait.
+Groups of several console waves run the console flow in step
+(`emit::lockstep`) when every wave of the group takes the same way at each
+branch: branches on EXEC (`s_cbranch_execz`/`execnz`) and on SCC from
+scalars the whole group shares. Each console wave then has its own pair of
+exchange dwords, and all waves of the group meet at the same barriers.
+Programs whose waves may branch apart keep another form or are refused
+(`waves_that_branch_apart_do_not_run_in_step`).
+
+Programs whose lanes only meet within their own 32 (each host wave a wave
+of its own: wave sums and prefix sums, as fxceless/victory-mix found) run as
+local waves (`emit::local_waves`), tried where the per-lane form is
+refused.
+
+### Lanes of 2-D groups on NVIDIA
+
+Measured on an RTX 2070 SUPER (Turing, driver 621.40, `lanes.rs` in the
+lab): a group up to 16 threads wide fills each 32-lane wave with a run of
+32 flat ids from a multiple of 32 (lanes in quad order, which the
+relabelling does not mind), with texture reads, LDS, stores or quad
+operations alike. A group wider than 16 with more than one row does not:
+a wave holds 16 x 2 blocks (32x32: threads 0-15 and 32-47). For those
+shapes each wave takes the next console lanes from a group-shared counter
+(`Lower::waves_scatter`), as victory-mix does for all groups.
 
 ### The console flow on every host
 
@@ -181,7 +201,10 @@ takes `WaveSize(64)`, the NVIDIA reports 32-32).
    whose waves already meet at barriers.
 5. ~~The console flow and the one-wave exchange (ballots, readlane,
    readfirstlane, writelane, mbcnt, divergent branches and loops).~~
-6. Multi-wave groups (counters). One-wave LDS sharing is implemented.
+6. ~~Multi-wave groups: in step where their waves branch alike; local
+   waves where lanes only meet within 32.~~ Left: CS_DefragHeap,
+   CS_ShadowUnifiedClearRaster (branches on lanes that differ per wave) and
+   CS_SortRayTiles.
 
 ## Credit
 

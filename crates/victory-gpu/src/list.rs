@@ -1460,9 +1460,40 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
 /// bottom of the pipe `(flags, control, address, size)`. Host lists order
-/// their own work and every submission is waited for, so there is nothing
-/// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+/// their draws and dispatches, but not the shader writes of one against
+/// the reads of the next: the title asks for that here (a pass that culls
+/// into a buffer, then one that reads it), and gets a barrier for every
+/// shader write before it. `VYCE_SYNC_BARRIER=0` leaves them out, as before.
+extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    SYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(windows)]
+    if sync_barrier()
+        && let Some(list) = host_list(this)
+    {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+        // SAFETY: the same layout; no resource named.
+        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+        // SAFETY: an open list.
+        unsafe { list.list.ResourceBarrier(&[barrier]) };
+    }
+    #[cfg(not(windows))]
+    let _ = this;
+}
+
+/// Whether the title's syncs become barriers (see [`sync`]).
+#[cfg(windows)]
+fn sync_barrier() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("VYCE_SYNC_BARRIER").is_ok_and(|v| v == "0"))
+}
+
+/// The title's syncs so far.
+static SYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Those since the last call.
+pub(crate) fn take_syncs() -> u64 {
+    SYNCS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -1705,6 +1736,9 @@ mod state {
             return;
         }
         let mut ran = false;
+        if super::left_out(this) {
+            return;
+        }
         if super::indirect_on() {
             super::hoist(this);
             with_state(this, |list, s| {
@@ -1775,6 +1809,21 @@ extern "system" fn draw(_: This) {
     count_draw();
 }
 
+/// Whether the list's pipeline is left out of the picture
+/// ([`crate::pipeline::left_out`]), for indirect draws and dispatches: before
+/// anything is recorded for them.
+#[cfg(windows)]
+fn left_out(this: This) -> bool {
+    let mut out = false;
+    with_state(this, |list, s| {
+        out = s.left_out();
+        if out {
+            list.missed_draw();
+        }
+    });
+    out
+}
+
 /// Whether the title's indirect draws and dispatches run on the host:
 /// always now that their arguments are clamped and budgeted
 /// (`crate::indirect`) and pipelines are made off the render thread.
@@ -1819,6 +1868,9 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        if left_out(this) {
+            return;
+        }
         if kind != DISPATCH {
             hoist(this);
         }

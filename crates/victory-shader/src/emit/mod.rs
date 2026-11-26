@@ -93,6 +93,7 @@ mod lds_tests;
 #[cfg(all(test, windows))]
 mod lane_read_loop_tests;
 mod local_waves;
+mod lockstep;
 mod lower;
 mod rectangle;
 #[cfg(test)]
@@ -110,6 +111,8 @@ mod threading;
 pub mod validator;
 #[cfg(all(test, windows))]
 mod valu_tests;
+#[cfg(all(test, windows))]
+mod view_tests;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};
@@ -260,6 +263,16 @@ pub struct UserData {
 pub struct Target {
     pub lanes_min: u32,
     pub lanes_max: u32,
+    /// Whether a buffer's descriptor only reads right through an access of
+    /// its own kind, as on NVIDIA (measured on Turing): raw accesses see
+    /// other bytes of a structured view whose stride is a multiple of 8 or
+    /// 12, structured ones of such a stride other bytes of a raw view, and
+    /// nothing but a constant buffer read sees a constant buffer. (AMD's
+    /// buffer descriptors are all one kind.) The host then views all
+    /// structured and raw buffers as plain dwords and shaders read them
+    /// raw; of a descriptor picked from the heap, the host's table by slot
+    /// tells whether it is a constant buffer.
+    pub exact_views: bool,
 }
 
 impl Target {
@@ -268,6 +281,7 @@ impl Target {
     pub const ANY: Target = Target {
         lanes_min: 4,
         lanes_max: 128,
+        exact_views: false,
     };
 
     /// Whether the host runs waves of `lanes`.
@@ -275,11 +289,12 @@ impl Target {
         (self.lanes_min..=self.lanes_max).contains(&lanes)
     }
 
-    /// The range as bytes, for cache keys.
-    pub fn key(self) -> [u8; 8] {
-        let mut k = [0; 8];
+    /// All of it as bytes, for cache keys.
+    pub fn key(self) -> [u8; 9] {
+        let mut k = [0; 9];
         k[..4].copy_from_slice(&self.lanes_min.to_le_bytes());
-        k[4..].copy_from_slice(&self.lanes_max.to_le_bytes());
+        k[4..8].copy_from_slice(&self.lanes_max.to_le_bytes());
+        k[8] = self.exact_views.into();
         k
     }
 }
@@ -1168,10 +1183,12 @@ mod tests {
     const NVIDIA: Target = Target {
         lanes_min: 32,
         lanes_max: 32,
+        exact_views: false,
     };
     const RDNA: Target = Target {
         lanes_min: 32,
         lanes_max: 64,
+        exact_views: false,
     };
 
     #[test]
@@ -1187,16 +1204,11 @@ mod tests {
         assert!(emit_for(&wave64, Target::ANY).is_ok());
         assert!(emit_for(&wave64, RDNA).is_ok());
         assert!(emit_for(&wave64, NVIDIA).is_ok());
-        // Two per group: the halves cannot meet at a group barrier yet.
+        // Two per group: in step, as the program does not branch on lanes.
         let two = compute_of(&words, true, 128);
         assert!(emit_for(&two, RDNA).is_ok());
-        assert_eq!(
-            emit_for(&two, NVIDIA),
-            Err(crate::ShaderError::Unsupported {
-                offset: 0,
-                what: "console wave64 lanes on a host without 64-lane waves",
-            })
-        );
+        assert!(emit_for(&two, NVIDIA).is_ok());
+        // (Waves that branch apart: `split_tests`.)
         // The same code in waves of 32 runs on either.
         let wave32 = compute(&words, false);
         assert!(emit_for(&wave32, NVIDIA).is_ok());
@@ -1232,10 +1244,9 @@ mod tests {
     }
 
     /// On every hardware adapter: a wave64 program that reads other lanes
-    /// translates in groups of one console wave (natively or in the console
-    /// flow) and the adapter takes it; in groups of two it translates
-    /// exactly when the adapter runs 64-lane waves. On a machine with an AMD
-    /// and an NVIDIA GPU this checks both answers.
+    /// translates in groups of one console wave and of two (natively, in the
+    /// console flow or in step) and the adapter takes it. On a machine with
+    /// an AMD and an NVIDIA GPU this checks both forms.
     #[test]
     #[cfg(windows)]
     fn each_adapter_gets_what_it_runs() {
@@ -1255,14 +1266,10 @@ mod tests {
                 emit_for(&compute(&words, true), target).unwrap_or_else(|e| panic!("{name}: {e}"));
             host.compute_pipeline(&one)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
-            match emit_for(&compute_of(&words, true, 128), target) {
-                Ok(cs) => {
-                    assert!(target.runs(64), "{name}");
-                    host.compute_pipeline(&cs)
-                        .unwrap_or_else(|e| panic!("{name}: {e}"));
-                }
-                Err(_) => assert!(!target.runs(64), "{name}"),
-            }
+            let two = emit_for(&compute_of(&words, true, 128), target)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            host.compute_pipeline(&two)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
         }
     }
 
@@ -1432,6 +1439,7 @@ mod tests {
             psv: None,
             console_cf: false,
             per_lane_only: false,
+            local: false,
         })
         .unwrap();
         let mut dxil = l.dxil;
@@ -1590,6 +1598,7 @@ mod tests {
             psv: None,
             console_cf: false,
             per_lane_only: false,
+            local: false,
         })
         .unwrap();
         let mut dxil = l.dxil;
@@ -1756,6 +1765,7 @@ mod tests {
             psv: None,
             console_cf: false,
             per_lane_only: false,
+            local: false,
         })
         .unwrap();
         assert!(l.stride_table);
@@ -1915,6 +1925,7 @@ mod tests {
             psv: None,
             console_cf: false,
             per_lane_only: false,
+            local: false,
         })
         .unwrap();
         let mut dxil = l.dxil;

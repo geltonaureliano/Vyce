@@ -6,6 +6,10 @@
 //! queue back; else the submission returns, and the work runs on the thread
 //! that meets the wait. One title thread submits to all queues, waits before
 //! what they wait for, so a submission never blocks.
+//!
+//! A signal goes behind what the host GPU still runs, and a wait that such
+//! work will meet is met, as all queues run on one host queue
+//! (`crate::flight`).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -38,12 +42,18 @@ pub(crate) enum Op {
     Wait(Held, u64),
     Signal(Held, u64),
     Lists(Box<dyn Lists>),
+    /// Work that needs everything the host GPU runs to be finished.
     Work(Box<dyn FnOnce() + Send>),
+    /// Work that goes behind it by itself.
+    Behind(Box<dyn FnOnce() + Send>),
 }
 
 #[derive(Default)]
 pub(crate) struct Timeline {
     state: Mutex<State>,
+    /// The flights of another host than the process's (tests).
+    #[cfg(all(test, windows))]
+    line: std::sync::OnceLock<Arc<crate::flight::Line>>,
 }
 
 #[derive(Default)]
@@ -65,18 +75,13 @@ static HELD: AtomicU64 = AtomicU64::new(0);
 /// dropped, is never met: past this its list runs all the same.
 const LIMIT: Duration = Duration::from_secs(2);
 
-/// Whether an unwaited host submission is still to be finished.
-fn finishing() -> bool {
+/// Whether signals and waits go by the host queue's order
+/// ([`crate::flight::late_signal`]).
+fn late() -> bool {
     #[cfg(windows)]
-    return crate::host::has_in_flight();
+    return crate::flight::late_signal();
     #[cfg(not(windows))]
     false
-}
-
-/// Waits for the unwaited host submissions and finishes them.
-fn finish() {
-    #[cfg(windows)]
-    crate::host::wait_in_flight_if_ready();
 }
 
 /// Whether any queue is held back.
@@ -96,8 +101,97 @@ impl Timeline {
         timeline
     }
 
+    /// A queue of another host than the process's.
+    #[cfg(all(test, windows))]
+    pub(crate) fn on(line: &Arc<crate::flight::Line>) -> Arc<Timeline> {
+        let timeline = Timeline::new();
+        assert!(timeline.line.set(line.clone()).is_ok());
+        timeline
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// What is in flight, if there is a host GPU.
+    #[cfg(windows)]
+    fn line(&self) -> Option<Arc<crate::flight::Line>> {
+        #[cfg(test)]
+        if let Some(line) = self.line.get() {
+            return Some(line.clone());
+        }
+        crate::host::line().cloned()
+    }
+
+    /// Whether a wait for `fence` to reach `value` is met: it has, or it will
+    /// when what is in flight, ahead of what follows the wait, has landed.
+    fn met(&self, fence: &Held, value: u64) -> bool {
+        if fence.reached(value) {
+            return true;
+        }
+        #[cfg(windows)]
+        if late() && self.line().is_some_and(|line| line.signals(fence, value)) {
+            crate::telemetry::count(crate::telemetry::Count::LateWaits, 1);
+            return true;
+        }
+        false
+    }
+
+    /// Whether a queue at a wait that is not met first has what is in flight
+    /// finished, which may meet it. (Not with [`late`]: it is looked at again
+    /// when that has landed.)
+    fn finishing(&self) -> bool {
+        #[cfg(windows)]
+        return !late() && self.line().is_some_and(|line| line.busy());
+        #[cfg(not(windows))]
+        false
+    }
+
+    /// Waits for what is in flight, for a queue at such a wait.
+    fn finish(&self) -> Box<dyn FnOnce()> {
+        #[cfg(windows)]
+        let line = self.line();
+        Box::new(move || {
+            #[cfg(windows)]
+            if let Some(line) = line {
+                line.drain(crate::telemetry::Count::WaitHeld);
+            }
+        })
+    }
+
+    /// A signal of the queue: behind what is in flight, or once that is
+    /// finished.
+    fn signal(&self, fence: Held, value: u64) -> Box<dyn FnOnce()> {
+        #[cfg(windows)]
+        let line = self.line();
+        Box::new(move || {
+            #[cfg(windows)]
+            if let Some(line) = line {
+                use crate::flight::After;
+                if late() {
+                    match line.after(After::Signal(fence, value)) {
+                        Ok(()) => crate::telemetry::count(crate::telemetry::Count::LateSignals, 1),
+                        Err(now) => now.run(),
+                    }
+                    return;
+                }
+                line.drain(crate::telemetry::Count::WaitSignal);
+            }
+            fence.signal(value);
+        })
+    }
+
+    /// Work of the queue that needs everything before it finished.
+    fn work(&self, work: Box<dyn FnOnce() + Send>) -> Box<dyn FnOnce()> {
+        #[cfg(windows)]
+        let line = self.line();
+        Box::new(move || {
+            #[cfg(windows)]
+            if let Some(line) = line {
+                line.drain(crate::telemetry::Count::WaitWork);
+            }
+            work();
+        })
     }
 
     /// Adds work to the queue and runs what can run, on every queue.
@@ -127,17 +221,17 @@ impl Timeline {
                     return moved;
                 }
                 Some(Op::Wait(fence, value)) => {
-                    if !fence.reached(*value) && !force {
+                    if !force && !self.met(fence, *value) {
                         // What it waits for may be what an unwaited
                         // submission still owes (its bottom-of-pipe writes):
                         // that one is finished first, then this is looked
                         // at again. Without this the queue stood until the
                         // wait was forced, two seconds a frame.
-                        if !finishing() {
+                        if !self.finishing() {
                             s.hold(true);
                             return moved;
                         }
-                        Box::new(finish)
+                        self.finish()
                     } else {
                         let op = s.ops.pop_front();
                         Box::new(move || drop(op))
@@ -153,11 +247,11 @@ impl Timeline {
                             continue;
                         }
                         // As for a fence above.
-                        if !finishing() {
+                        if !self.finishing() {
                             s.hold(true);
                             return moved;
                         }
-                        Box::new(finish)
+                        self.finish()
                     } else {
                         let work = lists.take(n);
                         if n == len {
@@ -166,17 +260,10 @@ impl Timeline {
                         work
                     }
                 }
-                Some(Op::Signal(..) | Op::Work(_)) => match s.ops.pop_front() {
-                    Some(Op::Signal(fence, value)) => Box::new(move || {
-                        #[cfg(windows)]
-                        crate::host::wait_in_flight_if_ready();
-                        fence.signal(value);
-                    }),
-                    Some(Op::Work(work)) => Box::new(move || {
-                        #[cfg(windows)]
-                        crate::host::wait_in_flight_if_ready();
-                        work();
-                    }),
+                Some(Op::Signal(..) | Op::Work(_) | Op::Behind(_)) => match s.ops.pop_front() {
+                    Some(Op::Signal(fence, value)) => self.signal(fence, value),
+                    Some(Op::Work(work)) => self.work(work),
+                    Some(Op::Behind(work)) => work,
                     _ => return moved,
                 },
             };
@@ -273,6 +360,11 @@ fn watch() {
 
 /// Runs the op held back longest, if nothing moved for `LIMIT`.
 fn force() {
+    // What the host GPU runs may meet the wait when it lands.
+    #[cfg(windows)]
+    if late() && crate::host::line().is_some_and(|line| line.busy()) {
+        return progress();
+    }
     let quiet = MOVED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -303,7 +395,7 @@ fn force() {
                     Op::Lists(lists) => lists.waits(),
                     Op::Wait(_, v) => format!("fence wait {v}"),
                     Op::Signal(_, v) => format!("signal {v}"),
-                    Op::Work(_) => "work".into(),
+                    Op::Work(_) | Op::Behind(_) => "work".into(),
                 };
                 tracing::info!("queue {i} op {k}: {text}");
             }

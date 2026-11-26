@@ -58,6 +58,7 @@ fn host_shader(stage: &'static str, hw_stage: victory_shader::HwStage, bytes: &[
     shader.translated.get_or_init(|| Some(Translated {
         resource_heap: false,
         writes_memory: true,
+        writes_buffers: true,
         host: victory_shader::emit::HostShader {
             stage: hw_stage,
             dxil: bytes.to_vec(),
