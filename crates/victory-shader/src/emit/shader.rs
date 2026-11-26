@@ -19,6 +19,8 @@ pub const STRIDE_SPACE: u32 = 2;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const DOUBLES: u64 = 1 << 2;
+    /// The host tests depth and stencil before the pixel shader runs.
+    pub const EARLY_DEPTH: u64 = 1 << 3;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLE_EXT: u64 = 1 << 6;
     pub const STENCIL_REF: u64 = 1 << 11;
@@ -673,6 +675,11 @@ impl Shader {
         } else {
             None
         };
+        // What the shader gives for depth, stencil or coverage is tested after
+        // it ran.
+        if self.outputs.iter().any(|o| o.kind == 14 || (17..=20).contains(&o.kind)) {
+            self.flags &= !flags::EARLY_DEPTH;
+        }
         // A pixel shader with an SV_StencilRef output (as DXC collects it).
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;

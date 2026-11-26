@@ -14,9 +14,11 @@
 //! `R16_UNORM` (the console's 16-bit depth), stencil as `R8_UINT`. The
 //! title's unordered-access views are made on the twins, and right after a
 //! dispatch that wrote one, a small draw copies it into the depth texture
-//! (depth through `SV_Depth`, stencil through `SV_StencilRef`).
-//! Everything else (draws, shader reads, clears) keeps using the depth
-//! texture itself.
+//! (depth through `SV_Depth`, stencil through `SV_StencilRef`). Hosts that
+//! take no stencil from pixel shaders (NVIDIA) get the stencil plane through
+//! a buffer instead, as victory-mix does: a plane can be copied, only not
+//! from another texture. Everything else (draws, shader reads, clears) keeps
+//! using the depth texture itself.
 //!
 //! shortcut: the copy goes one way. Depth or stencil written by draws or
 //! clears is not copied back to the twins, so a dispatch writing only part
@@ -48,11 +50,21 @@ macro_rules! once {
 pub(crate) struct Twin {
     pub(crate) depth: ID3D12Resource,
     pub(crate) stencil: Option<ID3D12Resource>,
+    /// What the stencil plane is copied through, where draws cannot write it.
+    through: Option<Through>,
     depth_format: DXGI_FORMAT,
     /// The depth texture's typed depth format.
     dsv_format: DXGI_FORMAT,
     width: u32,
     height: u32,
+}
+
+/// A buffer as big as a stencil plane, laid out as the host copies it.
+struct Through {
+    buffer: ID3D12Resource,
+    layout: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    /// The plane's subresource of the depth texture.
+    subresource: u32,
 }
 
 /// The planes of a depth texture.
@@ -128,7 +140,13 @@ pub(crate) fn make(texture: &ID3D12Resource) -> Option<Twin> {
         made
     };
     let depth_format = DXGI_FORMAT_R16_UNORM;
+    let through = if has_stencil && copier(host).is_some_and(|c| !c.stencil_ref) {
+        through(host, &d)
+    } else {
+        None
+    };
     let twin = Twin {
+        through,
         depth: plane(depth_format)?,
         stencil: if has_stencil {
             plane(DXGI_FORMAT_R8_UINT)
@@ -148,6 +166,93 @@ pub(crate) fn make(texture: &ID3D12Resource) -> Option<Twin> {
         "depth texture written as an image: twins made"
     );
     Some(twin)
+}
+
+/// The buffer the stencil plane (mip 0, slice 0) of a depth texture of
+/// description `d` is copied through.
+fn through(host: &Host, d: &D3D12_RESOURCE_DESC) -> Option<Through> {
+    let subresource = u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize);
+    let mut layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+    let mut size = 0;
+    // SAFETY: a plain query writing one footprint and the size.
+    unsafe {
+        host.device.GetCopyableFootprints(
+            d,
+            subresource,
+            1,
+            0,
+            Some(&mut layout),
+            None,
+            None,
+            Some(&mut size),
+        );
+    }
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: size,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+    let mut made: Option<ID3D12Resource> = None;
+    // SAFETY: valid descriptions; the out pointer is ours.
+    let result = unsafe {
+        host.device.CreateCommittedResource(
+            &heap,
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut made,
+        )
+    };
+    if let Err(e) = result {
+        tracing::warn!(error = %e, size, "no buffer to copy a stencil plane through: it stays as it is");
+    }
+    Some(Through { buffer: made?, layout, subresource })
+}
+
+/// Copies the stencil twin `from` (in the unordered access state, left there)
+/// into its plane of `depth`, which is in the copy destination state.
+fn copy_stencil(
+    list: &ID3D12GraphicsCommandList,
+    from: &ID3D12Resource,
+    depth: &ID3D12Resource,
+    through: &Through,
+) {
+    let subresource = |texture: &ID3D12Resource, index: u32| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the location never releases.
+        pResource: unsafe { std::mem::transmute_copy(texture) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: index },
+    };
+    let placed = D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: as above.
+        pResource: unsafe { std::mem::transmute_copy(&through.buffer) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: through.layout },
+    };
+    let (common, source, dest, unordered) = (
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    );
+    let to = crate::host::transition;
+    // SAFETY: an open list and live resources; the buffer was made as big as
+    // the footprint and rests in the common state between copies; whole
+    // subresources both times, as depth and stencil planes are to be copied.
+    unsafe {
+        list.ResourceBarrier(&[to(from, unordered, source), to(&through.buffer, common, dest)]);
+        list.CopyTextureRegion(&placed, 0, 0, 0, &subresource(from, 0), None);
+        list.ResourceBarrier(&[to(from, source, unordered), to(&through.buffer, dest, source)]);
+        list.CopyTextureRegion(&subresource(depth, through.subresource), 0, 0, 0, &placed, None);
+        list.ResourceBarrier(&[to(&through.buffer, source, common)]);
+    }
 }
 
 /// The plane a title unordered-access view `words` (host layout, title
@@ -361,7 +466,7 @@ fn make_copier(host: &Host) -> windows::core::Result<Copier> {
     .is_ok()
         && options.PSSpecifiedStencilRefSupported.as_bool();
     if !stencil_ref {
-        tracing::warn!("the host takes no stencil from pixel shaders: depth twins copy depth only");
+        tracing::info!("the host takes no stencil from pixel shaders: stencil twins are copied through a buffer");
     }
     // SAFETY: a root signature the compiler embedded.
     let root: ID3D12RootSignature = unsafe { device.CreateRootSignature(0, bytes(&vs))? };
@@ -486,11 +591,26 @@ fn copy(list: &HostList, resource: This, depth: bool, stencil: bool) -> bool {
     let Some(c) = copier(host) else {
         return false;
     };
-    let stencil = stencil && c.stencil_ref && twin.stencil.is_some();
-    let Some(pso) = c.pipeline(host, twin.dsv_format, depth, stencil) else {
-        return false;
-    };
     let l = &list.list;
+    let mut recorded = false;
+    if stencil
+        && !c.stencil_ref
+        && let (Some(from), Some(through)) = (&twin.stencil, &twin.through)
+    {
+        const COPY_DEST: u32 = 0x400;
+        crate::list::ensure_state(list, resource, COPY_DEST);
+        copy_stencil(l, from, texture, through);
+        list.keep(from);
+        list.keep(&through.buffer);
+        recorded = true;
+    }
+    let stencil = stencil && c.stencil_ref && twin.stencil.is_some();
+    if !depth && !stencil {
+        return recorded;
+    }
+    let Some(pso) = c.pipeline(host, twin.dsv_format, depth, stencil) else {
+        return recorded;
+    };
     const DEPTH_WRITE: u32 = 0x10;
     crate::list::ensure_state(list, resource, DEPTH_WRITE);
     let planes: Vec<&ID3D12Resource> = std::iter::once(&twin.depth).chain(twin.stencil.as_ref()).collect();
@@ -578,4 +698,123 @@ fn copy(list: &HostList, resource: This, depth: bool, stencil: bool) -> bool {
         list.keep(s);
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pattern in a stencil twin reaches the stencil plane of its depth
+    /// texture, for each size and with mips below.
+    #[test]
+    fn stencil_twins_reach_their_plane_through_a_buffer() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        for (width, height, mips) in [(64u32, 32u32, 1u16), (300, 70, 1), (256, 256, 3)] {
+            let texture = |format, mips, flags, state| {
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: width.into(),
+                    Height: height,
+                    DepthOrArraySize: 1,
+                    MipLevels: mips,
+                    Format: format,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Flags: flags,
+                    ..Default::default()
+                };
+                let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+                let mut made: Option<ID3D12Resource> = None;
+                // SAFETY: valid descriptions; the out pointer is ours.
+                unsafe {
+                    host.device
+                        .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut made)
+                        .unwrap();
+                }
+                made.unwrap()
+            };
+            let depth = texture(
+                DXGI_FORMAT_R24G8_TYPELESS,
+                mips,
+                D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            );
+            let stencil = texture(
+                DXGI_FORMAT_R8_UINT,
+                1,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            );
+            // SAFETY: a live texture.
+            let made = through(host, &unsafe { depth.GetDesc() }).unwrap();
+            assert_eq!(made.subresource, u32::from(mips));
+            let pitch = made.layout.Footprint.RowPitch;
+            let size = u64::from(pitch) * u64::from(height);
+            let (up, bytes) = host.shared_buffer(size).unwrap();
+            let (back, seen) = host.shared_buffer(size).unwrap();
+            let value = |x: u32, y: u32| (x * 7 + y * 13 + 1) as u8;
+            for y in 0..height {
+                for x in 0..width {
+                    // SAFETY: inside the mapped upload buffer.
+                    unsafe { bytes.cast::<u8>().add((y * pitch + x) as usize).write(value(x, y)) };
+                }
+            }
+            let mut placed = made.layout;
+            placed.Footprint.Format = DXGI_FORMAT_R8_UINT;
+            let at = |b: &ID3D12Resource, layout| D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: a borrowed pointer the location never releases.
+                pResource: unsafe { std::mem::transmute_copy(b) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: layout },
+            };
+            let sub = |t: &ID3D12Resource, index| D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: as above.
+                pResource: unsafe { std::mem::transmute_copy(t) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: index },
+            };
+            let list = host.new_list().unwrap();
+            let to = crate::host::transition;
+            // SAFETY: an open list and live resources in the states given.
+            unsafe {
+                list.list.CopyTextureRegion(&sub(&stencil, 0), 0, 0, 0, &at(&up, placed), None);
+                list.list.ResourceBarrier(&[to(
+                    &stencil,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+            // Twice: the buffer and the twin are left as they were found.
+            copy_stencil(&list.list, &stencil, &depth, &made);
+            copy_stencil(&list.list, &stencil, &depth, &made);
+            // SAFETY: as above.
+            unsafe {
+                list.list.ResourceBarrier(&[to(
+                    &depth,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                list.list.CopyTextureRegion(
+                    &at(&back, made.layout),
+                    0,
+                    0,
+                    0,
+                    &sub(&depth, made.subresource),
+                    None,
+                );
+            }
+            list.close();
+            host.execute(&[&list]);
+            for y in 0..height {
+                for x in 0..width {
+                    // SAFETY: inside the mapped buffer, after the GPU finished.
+                    let got = unsafe { seen.cast::<u8>().add((y * pitch + x) as usize).read() };
+                    assert_eq!(got, value(x, y), "{width}x{height} at {x}, {y}");
+                }
+            }
+            // SAFETY: a plain query.
+            assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        }
+    }
 }
