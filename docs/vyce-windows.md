@@ -70,10 +70,29 @@ por quadro e os novos campos ms e prepare_ms do aviso de submissão lenta.
 
 ## Painel de diagnóstico
 
-A ação Run abre o jogo e o painel do Vyce. O painel mostra FPS, tempo e
-desenhos por quadro, quadros apresentados, preparação da CPU, espera pelas
-submissões da GPU, descartes e logs. A atividade de carregamento reflete
-os eventos observados nos logs e no renderizador.
+A ação Run abre o jogo e, na borda direita da tela, o painel do Vyce, sem
+tirar o foco do jogo. A parte de cima mostra o momento:
+
+- o FPS, o tempo de cada quadro, há quanto tempo veio a última medida e um
+  gráfico dos últimos 2 minutos. Sem quadro novo por 4 s, o número fica
+  cinza e o painel diz há quanto tempo o jogo não apresenta nada;
+- a faixa de carregamento: etapa, porcentagem, tempo que falta e o que o
+  carregamento espera (o disco ou pipelines), das linhas VYCE_LOADING. Sem
+  essas linhas, a etapa é deduzida dos quadros, sem porcentagem;
+- para onde vai o tempo do quadro: GPU, preparo na CPU, cópia de volta e o
+  resto, numa barra, com uma frase sobre quem segura o quadro. O mouse
+  sobre cada parte mostra os detalhes;
+- VRAM usada e o limite, RAM, processador, limite de textura, desenhos e
+  descartados por quadro, pipelines na fila e buffers na VRAM.
+
+Embaixo, Resumo lista os eventos em português, com as repetições juntas e
+contadas: etapas, avisos e erros. Um clique em um evento mostra o que ele
+quer dizer e as linhas do log de onde veio. Técnico mostra o log limpo, com
+filtro; Mostrar tudo inclui as linhas repetitivas e as de telemetria.
+Copiar resumo põe na área de transferência um texto curto para colar numa
+conversa: placa, versão, medianas do último minuto, avisos por tipo e os
+últimos erros. Quando o jogo termina, o painel diz como (janela fechada,
+placa de vídeo parou, travamento, código de saída) e continua aberto.
 
 O painel atualiza CPU e RAM do sistema e do jogo a cada segundo. A RAM do
 sistema mostra uso, total e memória disponível. A RAM do jogo corresponde
@@ -82,12 +101,15 @@ total da máquina. O painel também mostra o número de processadores
 lógicos e de threads do jogo.
 
 Use -NoDebugWindow para abrir só o jogo. Fechar o painel mantém a sessão
-do jogo aberta.
+do jogo aberta. VYCE_PANEL_BOUNDS=x,y,largura,altura abre o painel nesse
+lugar. A parte do painel escrita em C# é compilada na primeira vez e
+guardada na pasta temporária; depois o painel abre em cerca de um segundo.
+Se ela não compilar, abre um painel simples com os números e os avisos.
 
 Os dois registros continuam em Vyce-data\logs. Nas builds com telemetria,
 o arquivo de erros também recebe uma linha VYCE_TELEMETRY por amostra para
-permitir comparações posteriores. O painel omite essas linhas brutas da
-visualização de logs.
+permitir comparações posteriores. O painel lê os registros desde o começo,
+então pode ser aberto a qualquer momento.
 
 A telemetria separa o trabalho da GPU da espera por ela. Estes campos de
 VYCE_TELEMETRY são por quadro, exceto os de memória:
