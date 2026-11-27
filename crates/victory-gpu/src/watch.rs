@@ -983,6 +983,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     if len == 0 {
         return;
     }
+    // First, before any lock of ours: a texture copy landing there ends
+    // before the runtime goes on, and none lands there after.
+    crate::texback::remapped(at, len);
     let end = at.saturating_add(len);
     {
         let mut g = guards();

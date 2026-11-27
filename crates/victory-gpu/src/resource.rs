@@ -1376,6 +1376,37 @@ pub(crate) fn is_texture(this: This) -> bool {
         && resource(this).host.is_some()
 }
 
+/// Width, height and format of title texture `this` if it is a 2D texture
+/// of one sample (`None` for anything else), for `crate::texback`'s kinds.
+#[cfg(windows)]
+pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
+    if this.is_null() {
+        return None;
+    }
+    let d = &resource(this).desc;
+    const TEXTURE_2D: u32 = 3;
+    (d.dimension == TEXTURE_2D && d.sample_count <= 1).then_some((d.width, d.height, d.format))
+}
+
+/// Title texture `this`'s console layout and the title memory it starts at,
+/// for `crate::texback`; `None` for a buffer and for a texture with more
+/// than one plane.
+#[cfg(windows)]
+pub(crate) fn title_texture(this: This) -> Option<(texture::Layout, usize)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let t = texture_layout(&r.desc)?;
+    let [plane] = &t.planes[..] else {
+        return None;
+    };
+    (plane.offset == 0).then(|| (plane.layout.clone(), r.data() as usize))
+}
+
 /// A buffer's host memory and size; `None` for textures.
 pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     if this.is_null() {
@@ -1469,6 +1500,11 @@ fn hand_out_resource(
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
+        // First, while its memory is still there: a landing under way ends
+        // before, and none writes into it after (`crate::texback`).
+        if self.desc.dimension != BUFFER {
+            crate::texback::released(std::ptr::from_ref::<Resource>(self) as usize);
+        }
         if self.desc.flags & 5 != 0 && self.host.is_some() {
             let at = std::ptr::from_ref::<Resource>(self) as usize;
             let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
@@ -2209,6 +2245,45 @@ pub(crate) fn test_buffer(width: u64) -> This {
         sample_quality: 0,
         layout: 1,
         flags: 0,
+    };
+    let mut out = std::ptr::null();
+    let hr = create_committed(
+        std::ptr::null(),
+        &heap,
+        0,
+        &desc,
+        0,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+    assert_eq!(hr, S_OK);
+    out
+}
+
+/// A committed 2D title texture of one mip, `width` x `height` of DXGI
+/// format `format`, with the console's resource flags `flags`.
+#[cfg(test)]
+pub(crate) fn test_texture(width: u64, height: u32, format: u32, flags: u32) -> This {
+    let heap = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 0,
+        visible_nodes: 0,
+    };
+    let desc = ResourceDesc {
+        dimension: 3,
+        alignment: 0,
+        width,
+        height,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 0,
+        flags,
     };
     let mut out = std::ptr::null();
     let hr = create_committed(

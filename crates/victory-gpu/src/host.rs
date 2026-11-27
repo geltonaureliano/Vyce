@@ -1645,6 +1645,9 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Title textures the list's shaders may write that go back into title
+    /// memory once it has run ([`crate::texback`]), with their copies.
+    texture_backs: Vec<std::sync::Arc<crate::texback::Back>>,
     /// Waits for memory values, with how many `writes` precede them.
     waits: Vec<(usize, crate::memwait::Wait)>,
     /// The work before each of `writes`.
@@ -1904,6 +1907,9 @@ impl Host {
         if process {
             early.take(&mut batch, runs, false);
         }
+        // Textures the runs' shaders write that go back into title memory,
+        // in the runs' order ([`crate::texback`]).
+        let mut textures: Vec<Arc<crate::texback::Back>> = Vec::new();
         for list in runs {
             let uploads = list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -1922,6 +1928,8 @@ impl Host {
             }
             if !skip {
                 lists.push(list.list.cast().ok());
+                // Its copies run only with its commands.
+                textures.extend(list.texture_backs());
             }
         }
         batch.prepare_bindless();
@@ -1976,6 +1984,10 @@ impl Host {
         let works = !no_work();
         #[cfg(not(feature = "diagnostics"))]
         let works = true;
+        // Lists that do not run copy nothing.
+        if !works {
+            textures.clear();
+        }
         // Not around runs that are waited for one by one.
         let timed = (works && !each)
             .then(|| self.telemetry_clock())
@@ -2076,6 +2088,7 @@ impl Host {
             let mut flight = Flight::new(this_submission, keep.map(<[_]>::to_vec).unwrap_or_default());
             flight.fence = *submitted;
             flight.back = cpu_back;
+            flight.textures = textures;
             flight.writes = take_writes(runs);
             flight.timed = timed.map(|(_, pair)| pair);
             flight.sent = sent;
@@ -2141,7 +2154,7 @@ impl Host {
             }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
-        finish(&self.queue, runs, &cpu_back, &take_writes(runs));
+        finish(&self.queue, runs, &cpu_back, &textures, &take_writes(runs));
         // Waited for, under the submission's lock: nothing sent since.
         for list in runs {
             list.landed(u64::MAX);
@@ -2410,8 +2423,16 @@ fn take_writes(runs: &[&HostList]) -> Vec<Write> {
 
 /// After a submission of `runs` ran on `queue`: what its shaders wrote
 /// (`back`) goes back into title memory, then its read-backs, then the
-/// bottom-of-pipe writes that tell the title the GPU is done.
-pub(crate) fn finish(queue: &ID3D12CommandQueue, runs: &[&HostList], back: &[Range], writes: &[Write]) {
+/// textures its shaders wrote that the title reads on the CPU (`textures`,
+/// [`crate::texback`]), then the bottom-of-pipe writes that tell the title
+/// the GPU is done.
+pub(crate) fn finish(
+    queue: &ID3D12CommandQueue,
+    runs: &[&HostList],
+    back: &[Range],
+    textures: &[Arc<crate::texback::Back>],
+    writes: &[Write],
+) {
     let copying = std::time::Instant::now();
     if crate::shadow::pass::on() {
         let written = crate::shadow::pass::copy_back(back);
@@ -2445,6 +2466,8 @@ pub(crate) fn finish(queue: &ID3D12CommandQueue, runs: &[&HostList], back: &[Ran
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
     }
+    let written = crate::texback::land(textures);
+    COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
     COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
     // Host timestamps the lists resolved, on the title's GPU clock.
     let mut clock = None;
@@ -2619,6 +2642,9 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        // After all the list's work: what its shaders left in the textures
+        // that go back into title memory.
+        self.textures_back();
         // The host closes no list with queries running; their title ends,
         // in a later list, are dropped (`end_query`).
         for (heap, kind, index, _) in self.queries.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
@@ -2918,6 +2944,72 @@ impl HostList {
                 (before != wanted).then_some(before)
             }
         }
+    }
+
+    /// Moves host copy `copy` to `wanted` (a host state) in this list: a
+    /// barrier, unless this is the list's first use of it, which its prelude
+    /// brings there at submission.
+    pub(crate) fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
+        if let Some(before) = self.transition_copy(copy, wanted) {
+            let state = legal_state(&copy.texture, wanted);
+            let barrier = transition(
+                &copy.texture,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATES(state as i32),
+            );
+            // SAFETY: an open list and a live texture.
+            unsafe { self.list.ResourceBarrier(&[barrier]) };
+        }
+    }
+
+    /// A draw or dispatch being recorded may write title texture `resource`
+    /// through unordered access: if it is of a kind copied back
+    /// ([`crate::texback`], `VICTORY_TEXTURE_BACK`), the list copies it now,
+    /// before the first such write, and again when it closes.
+    pub(crate) fn texture_written(&self, resource: crate::object::This) {
+        if !crate::texback::wanted(resource) {
+            return;
+        }
+        let owner = resource as usize;
+        if self.deferred().texture_backs.iter().any(|b| b.owner() == owner) {
+            return;
+        }
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: a plain query of the list's own device.
+        if unsafe { self.list.GetDevice(&mut device) }.is_err() {
+            return;
+        }
+        if let Some(back) = device.and_then(|d| crate::texback::Back::new(&d, resource)) {
+            self.texture_back(std::sync::Arc::new(back));
+        }
+    }
+
+    /// Records `back`'s first copy, of what its texture holds before the
+    /// list's shaders write it, and keeps it for the second when the list
+    /// closes.
+    pub(crate) fn texture_back(&self, back: std::sync::Arc<crate::texback::Back>) {
+        const COPY_SOURCE: u32 = D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32;
+        self.settle(&back.copy, COPY_SOURCE);
+        back.record(&self.list, false);
+        self.deferred().texture_backs.push(back);
+    }
+
+    /// When the list closes: the second copy of each texture copied back.
+    /// The title may have released one since, so its host copy is the one
+    /// the copies hold.
+    fn textures_back(&self) {
+        const COPY_SOURCE: u32 = D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32;
+        let backs = self.deferred().texture_backs.clone();
+        for back in &backs {
+            self.settle(&back.copy, COPY_SOURCE);
+            back.record(&self.list, true);
+        }
+    }
+
+    /// The textures copied back once a submission of this recording has run
+    /// its commands.
+    pub(crate) fn texture_backs(&self) -> Vec<std::sync::Arc<crate::texback::Back>> {
+        self.deferred().texture_backs.clone()
     }
 
     /// Records that this list starts and ends with `copy` in `wanted` state
@@ -4798,6 +4890,12 @@ impl Meter {
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
+        // Of that, textures shaders wrote that went back into title memory
+        // (`crate::texback`): how many, the KB they wrote, the KB read back.
+        let [textures_back, textures_back_kb, textures_read_kb] = {
+            let [landed, written, read, _] = crate::texback::take_counts();
+            [landed as f64, written as f64 / 1e3, read as f64 / 1e3].map(|v| v / frames)
+        };
         let [plans_ms, records_ms] =
             [0, 1].map(|i| BINDLESS_US[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
         let [ordinary, screen] = crate::pipeline::take_wait_stats();
@@ -4822,6 +4920,8 @@ impl Meter {
                  \"frame_ms\":{ms:.2},\"frames_total\":{},\"draws_per_frame\":{draws:.2},\
                  \"gpu_wait_ms\":{gpu:.2},\"cpu_prepare_ms\":{cpu:.2},\"copy_back_ms\":{back_ms:.2},\
                  \"cpu_copy_ms\":{copy_ms:.2},\"cpu_copy_mb\":{copy_mb:.2},\"guest_write_mb\":{back_mb:.2},\
+                 \"textures_back\":{textures_back:.2},\"textures_back_kb\":{textures_back_kb:.1},\
+                 \"textures_back_read_kb\":{textures_read_kb:.1},\
                  \"texture_refresh_ms\":{texture_ms:.2},\"texture_refresh_mb\":{texture_mb:.2},\
                  \"bindless_plan_ms\":{plans_ms:.2},\"bindless_record_ms\":{records_ms:.2},\
                  \"indirect_per_frame\":{indirect:.2},\
@@ -4866,7 +4966,8 @@ impl Meter {
             tracing::info!(
                 "[{} {}] {fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB, bindless plans \
-                 {plans_ms:.1} ms; {gpu:.1} on the GPU; {back_ms:.1} copying back {back_mb:.1} MB; \
+                 {plans_ms:.1} ms; {gpu:.1} on the GPU; {back_ms:.1} copying back {back_mb:.1} MB, \
+                 of it {textures_back:.1} textures {textures_back_kb:.0} KB; \
                  bindless records {records_ms:.1} ms; pipeline waits {world_wait_ms:.1} ms ordinary \
                  {screen_wait_ms:.1} ms screen, {pipeline_timeouts}/{pipeline_waits} timed out in sample), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \

@@ -586,3 +586,91 @@ compilação offline foi conferida com um cargo.exe de mentira num par
 Vyce/Vyce-data de teste (8 casos: offline por padrão, -Online, o ambiente
 de quem chama, o aviso quando falha), e a release compila. Ainda não foi
 medida em jogo.
+
+## Fase 2: texturas de volta (texback)
+
+Algumas texturas que os shaders do jogo escrevem são lidas depois pelo
+código do próprio jogo, na CPU. No console a CPU e a GPU usam a mesma
+memória: o que um passe de compute grava numa textura fica na memória do
+jogo. No Vyce a textura é uma cópia no host, e o que os shaders gravavam
+ficava só nela. Os mapas de altura e de deslocamento da água são assim: o
+jogo os lê na CPU para os barcos boiarem, e lia memória que ninguém tinha
+escrito.
+
+Agora, para as texturas dos tipos de VICTORY_TEXTURE_BACK (por padrão os
+quatro da água: 256x256 R32_FLOAT, 256x256 R32G32_FLOAT, 64x64
+R32G32_FLOAT e 128x128 R16G16_UINT), uma lista cujos shaders escrevem uma
+delas por uma tabela de descritores copia a textura para um buffer de
+leitura nosso duas vezes: logo antes do primeiro draw ou dispatch que pode
+escrevê-la e quando a lista fecha. Quando a submissão termina, no pouso
+(depois da cópia de volta dos buffers e das leituras de textura do jogo,
+antes das escritas do fim do pipeline e das cercas que o jogo espera), os
+elementos que mudaram entre as duas cópias vão para a memória do jogo, no
+layout do console, e só onde a memória do jogo é diferente. Um elemento que
+a CPU do jogo escreveu e os shaders da lista não mexeram fica com o valor
+do jogo, e páginas onde nada mudou não são escritas. A cópia de upload da
+textura (quando existe) não toma essa escrita como do jogo, então não manda
+um quadro antigo por cima do que a GPU escreveu depois; as outras cópias da
+mesma memória a veem escrita, como veriam a escrita da GPU do console.
+
+Vem do github.com/avatarmanz/VIctory-7900XTX (23925a4, que traz o
+fxceless/victory-fork f5c03f3b, PR 999 de Geckomacabre e
+cxy0072019-sketch) e do codeberg.org/p1nkman/p1nkman-VI (9aaa9ec), os dois
+GPL-3.0: os tipos, a variável e os tíquetes. As duas cópias, a comparação e
+o pouso foram escritos para o modelo do Vyce.
+
+Fica ligado por padrão. Os forks que já fazem isso rodam ligado: no
+VIctory-7900XTX está ligado no código e o barco fica em cima a sessão
+inteira (sem isso ele afundava em todas); o p1nkman-VI (RTX) e o
+victory-3060TI deixam desligado no código, mas os launchers de NVIDIA de
+8 GB deles ligam (VICTORY_TEXTURE_BACK=1), e eles contam o barco
+boiando e a missão do barco jogável. O custo é pequeno: com as quatro
+texturas escritas uma vez por quadro, cerca de 1,7 MB lidos da placa por
+quadro e alguns décimos de ms de CPU no pouso. Quando nenhuma textura
+desses tipos é escrita não custa nada (uma comparação por vista de escrita
+de textura gravada).
+
+Os blocos flutuando: a investigação da fase 2 (lab\fase2-desenho.json,
+floating-blocks) mostrou que são props e pessoas inteiros, de pé,
+levantados perto da água, e uma das famílias suspeitas é esta: o próprio
+jogo os põe ali a partir do que lê de texturas que a GPU escreveu. Não está
+provado que são estas texturas. Para conferir, no mesmo save e no mesmo
+ponto da praia, uma sessão com VICTORY_TEXTURE_BACK=0 e outra sem a
+variável: com a cópia de volta o barco deve boiar; se os objetos descem para
+o chão, eram estas texturas.
+
+| O que mudou | Para voltar ao de antes |
+| --- | --- |
+| Texturas dos quatro tipos da água que os shaders escrevem voltam para a memória do jogo quando a submissão termina, antes das cercas | VICTORY_TEXTURE_BACK=0 |
+| Outros tipos podem ser pedidos: largura x altura e formato DXGI, separados por vírgula (1 volta aos quatro da água) | VICTORY_TEXTURE_BACK=256x256f41,64x64f16 |
+
+Campos novos de VYCE_TELEMETRY: textures_back (texturas copiadas de volta
+por quadro), textures_back_kb (KB escritos na memória do jogo por quadro) e
+textures_back_read_kb (KB lidos da placa por quadro). copy_back_ms e
+guest_write_mb já incluem essas texturas. O log de 5 em 5 s diz "of it N
+textures X KB" depois de "copying back", e no painel a dica de "Cópia de
+volta" mostra "Texturas copiadas de volta por quadro".
+
+O que fica de fora: escritas por slots indexados direto no heap
+(ResourceDescriptorHeap[]), por render target, cópias e resolves para a
+textura, o que veio antes do primeiro draw ou dispatch da lista que pode
+escrevê-la, e um elemento que os shaders reescrevem com o valor que ele já
+tinha (a memória do jogo fica com o que tinha ali). Também ficam de fora
+texturas sem os mips maiores no host, em layouts com XOR ou acima de 16 MiB.
+Uma leitura do jogo entre a submissão e a cerca vê o que havia antes, como
+no console antes da GPU rodar.
+
+Para a etapa B dos voos: Flight.textures traz, para cada textura,
+Back::range(), a faixa da memória do jogo que o pouso pode escrever; ela
+entra nas faixas que o pouso escreve (lw).
+
+Testada pelo heavy.sh: victory-gpu na placa com 204 passando e 9 ignorados
+(os 196 de antes e 8 novos: a textura que um shader escreve está na memória
+do jogo, no layout do console e byte a byte, antes de alguém ver a cerca,
+no WARP e na placa, e um elemento que o jogo escreveu e o shader não mexeu
+fica com o valor do jogo; só os tipos da lista ganham cópias; uma lista que
+não roda e uma textura liberada não escrevem nada; a cópia de upload não
+toma a nossa escrita como do jogo; a leitura da variável, os tíquetes e a
+comparação), também com VICTORY_TEXTURE_BACK=0; victory-hle com 99
+passando e os 5 testes de xmem que já falhavam; a build release passa.
+Ainda não foi medida em jogo.

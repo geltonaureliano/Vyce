@@ -71,6 +71,8 @@ mod compose;
 #[cfg(windows)]
 mod twin;
 #[cfg(windows)]
+mod texback;
+#[cfg(windows)]
 mod texpool;
 #[cfg(windows)]
 mod texture;

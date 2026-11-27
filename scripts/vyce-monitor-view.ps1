@@ -1021,6 +1021,8 @@ namespace Vyce.Monitor
             Add(prepare, "Buffers na placa: ", V("card_record_ms"), Say.Ms);
             List<string> back = new List<string>();
             Add(back, "Escritos na memória do jogo: ", V("guest_write_mb"), Say.Size);
+            Add(back, "Texturas copiadas de volta por quadro: ", V("textures_back"),
+                v => Say.PerFrame(v) + " (" + Say.Number(V("textures_back_kb"), "N0") + " KB)");
             List<string> rest = new List<string>();
             Add(rest, "Espera por pipelines: ", p.PipelineWait, Say.Ms);
             Func<string, List<string>, string> tip = (what, lines) => what + "\n" + string.Join("\n", lines.ToArray());
