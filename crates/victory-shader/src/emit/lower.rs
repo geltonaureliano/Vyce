@@ -924,6 +924,7 @@ fn lds_meetings(p: &Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool,
 /// shared-wave and lockstep forms know (`VICTORY_LOCAL_MEET_CHECKS=0`: the
 /// fork's regions and no such check).
 fn local_lds(
+    native: &NativeProgram,
     p: &Program,
     st: &Structured,
     res: &Resources,
@@ -934,7 +935,7 @@ fn local_lds(
     }
     let g = LaneGraph::of(st)?;
     let varying = if checks {
-        let written = super::local_waves::loads_of_written_memory(p, res);
+        let written = super::local_waves::loads_of_written_memory(native, p, res);
         super::local_waves::host_wave_varying(p, st, &g, &written)
     } else {
         Vec::new()
@@ -955,8 +956,63 @@ fn local_lds(
 
 /// Whether the LDS accesses of a one-wave group run as two local 32-lane
 /// waves can keep the console's order ([`local_lds`]).
-pub(super) fn lds_meetable(p: &Program, st: &Structured, res: &Resources) -> bool {
-    local_lds(p, st, res).is_some()
+pub(super) fn lds_meetable(
+    native: &NativeProgram,
+    p: &Program,
+    st: &Structured,
+    res: &Resources,
+) -> bool {
+    local_lds(native, p, st, res).is_some()
+}
+
+/// The used-resource entry a descriptor falls in: one loaded from a table
+/// (or fetched from memory over one), by the range holding its dword; one
+/// built around a root view, by that view ([`root_view_entry`]); of a
+/// choice, the first of its sources that falls in one. `scalar` holds the
+/// addresses of the program's loads ([`Resources::scalar`]).
+pub(super) fn used_entry<'a>(
+    native: &'a NativeProgram,
+    scalar: &HashMap<Site, Address>,
+    src: &Source,
+) -> Option<&'a UsedResource> {
+    if let Source::Phi { args, .. }
+    | Source::Select { args, .. }
+    | Source::Lanes { args, .. }
+    | Source::Paths { args, .. } = src
+    {
+        return args.iter().find_map(|a| used_entry(native, scalar, a));
+    }
+    if let Source::Built { address, .. } = src {
+        return root_view_entry(native, address.param);
+    }
+    let (Source::Loaded { load, first } | Source::Fetched { load, first }) = src else {
+        return None;
+    };
+    let a = scalar.get(load)?;
+    let rp = native.layout.get(a.param)?;
+    if rp.root != RootType::Table {
+        return None;
+    }
+    let dword = (a.offset / 4) + u32::from(*first);
+    native
+        .used
+        .iter()
+        .filter(|u| {
+            u.root == RootType::Table
+                && u.user_data == rp.user_data
+                && u.table_offset_dwords <= dword
+        })
+        .max_by_key(|u| u.table_offset_dwords)
+}
+
+/// The used-resource entry of the root view (root descriptor) at layout
+/// index `param`.
+pub(super) fn root_view_entry(native: &NativeProgram, param: usize) -> Option<&UsedResource> {
+    let rp = native.layout.get(param)?;
+    native
+        .used
+        .iter()
+        .find(|u| u.root == RootType::Descriptor && u.user_data == rp.user_data)
 }
 
 /// Samples whose level comes from derivatives across each quad of lanes.
@@ -1580,7 +1636,7 @@ impl<'a> Lower<'a> {
                 // accesses of one wave: the two host waves meet around
                 // them (VIctory-7900XTX's local waves of one-wave groups).
                 if one_wave && s.lds_dwords > 0 {
-                    lds_meet = Some(local_lds(p, x.st, x.res));
+                    lds_meet = Some(local_lds(x.native, p, x.st, x.res));
                 }
             }
             if split || x.local {
@@ -7645,41 +7701,7 @@ impl<'a> Lower<'a> {
 
     /// The used-resource entry a descriptor loaded from a table falls in.
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
-        if let Source::Phi { args, .. }
-        | Source::Select { args, .. }
-        | Source::Lanes { args, .. }
-        | Source::Paths { args, .. } = src
-        {
-            return args.iter().find_map(|a| self.used_kind(a));
-        }
-        if let Source::Built { address, .. } = src {
-            let rp = self.x.native.layout.get(address.param)?;
-            return self
-                .x
-                .native
-                .used
-                .iter()
-                .find(|u| u.root == RootType::Descriptor && u.user_data == rp.user_data);
-        }
-        let (Source::Loaded { load, first } | Source::Fetched { load, first }) = src else {
-            return None;
-        };
-        let a = self.scalar.get(load)?;
-        let rp = self.x.native.layout.get(a.param)?;
-        if rp.root != RootType::Table {
-            return None;
-        }
-        let dword = (a.offset / 4) + u32::from(*first);
-        self.x
-            .native
-            .used
-            .iter()
-            .filter(|u| {
-                u.root == RootType::Table
-                    && u.user_data == rp.user_data
-                    && u.table_offset_dwords <= dword
-            })
-            .max_by_key(|u| u.table_offset_dwords)
+        used_entry(self.x.native, &self.scalar, src)
     }
 
     /// A handle for the descriptor `src` read at `site`.

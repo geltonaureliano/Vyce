@@ -215,11 +215,20 @@ pub enum Switch {
     /// its lanes then go round with EXEC clear until the loop limit
     /// ([`crate::ir::without_early_outs`]).
     LoopEarlyOuts,
+    /// `VICTORY_HOST_WAVE_READS=0`: with the meeting checks on, what the two
+    /// host waves may hold apart is found as in 1952aaf again: a value is
+    /// taken as alike in the lanes whatever its instruction reads beside its
+    /// operands (an accumulator's old value, a swap's, `v_div_fmas_f32`'s
+    /// VCC) and whatever lanes a select's or carry's mask holds, and a
+    /// scalar load as alike in both host waves whatever writes its memory.
+    /// A lane read of such a value can then part the host waves at a
+    /// barrier: a hang (`local_waves::host_wave_varying`).
+    HostWaveReads,
 }
 
 impl Switch {
     /// Every switch, in the order of [`switches`]'s bits.
-    pub const ALL: [Switch; 9] = [
+    pub const ALL: [Switch; 10] = [
         Switch::ExactNorm,
         Switch::D16Integer,
         Switch::WaveForms,
@@ -229,6 +238,7 @@ impl Switch {
         Switch::LdsLocal,
         Switch::LocalMeetChecks,
         Switch::LoopEarlyOuts,
+        Switch::HostWaveReads,
     ];
 
     /// The environment variable that sets it.
@@ -243,6 +253,7 @@ impl Switch {
             Switch::LdsLocal => "VICTORY_LDS_LOCAL",
             Switch::LocalMeetChecks => "VICTORY_LOCAL_MEET_CHECKS",
             Switch::LoopEarlyOuts => "VICTORY_LOOP_EARLY_OUTS",
+            Switch::HostWaveReads => "VICTORY_HOST_WAVE_READS",
         }
     }
 
@@ -756,7 +767,7 @@ fn emit_program(
                 found.is_ok()
             };
             let meetable = || {
-                let met = lower::lds_meetable(p, st, res);
+                let met = lower::lds_meetable(native, p, st, res);
                 if !met && std::env::var_os("VICTORY_WHY").is_some() {
                     eprintln!("local waves: LDS the two host waves cannot meet around");
                 }
