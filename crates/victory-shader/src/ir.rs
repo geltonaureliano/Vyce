@@ -347,6 +347,21 @@ fn only_ends(p: &Program, b: usize) -> bool {
             .all(|i| matches!(i.fields, gfx10::Fields::Sopp { .. }))
 }
 
+/// Whether block `b` of `p` lies on a cycle: some way from it leads back.
+fn on_cycle(p: &Program, b: usize) -> bool {
+    let mut seen = vec![false; p.blocks.len()];
+    let mut stack = p.blocks[b].exit.successors();
+    while let Some(x) = stack.pop() {
+        if x == b {
+            return true;
+        }
+        if !std::mem::replace(&mut seen[x], true) {
+            stack.extend(p.blocks[x].exit.successors());
+        }
+    }
+    false
+}
+
 /// The program without its early-outs: an `s_cbranch_execz` to a block that
 /// only ends the program (`if (!inBounds) return;`, the outermost branch of
 /// most compute programs) is left out, so the lanes that would have left
@@ -355,17 +370,21 @@ fn only_ends(p: &Program, b: usize) -> bool {
 /// only when no lane of the wave is left; scalar code has no effects. The
 /// body is then code every lane runs, which a console wave run as two host
 /// waves needs for the barriers of its exchanges and LDS accesses.
+/// An early-out on a loop is kept unless `on_loops`: it may be the loop's
+/// only way out, and lanes walking on with EXEC clear would go round until
+/// the loop limit stops them (a host GPU reset, at a million turns).
 /// `None` if the program has no such branch.
-/// From VIctory-7900XTX (fxceless 578d459), GPL-3.0-or-later.
-pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
+/// From VIctory-7900XTX (fxceless 578d459), GPL-3.0-or-later; the loops
+/// kept are Vyce's.
+pub(crate) fn without_early_outs(p: &Program, on_loops: bool) -> Option<Program> {
     let mut blocks = p.blocks.clone();
     let mut any = false;
-    for block in &mut blocks {
+    for (b, block) in blocks.iter_mut().enumerate() {
         let Exit::Branch { taken, not_taken } = block.exit else {
             continue;
         };
         let skip = block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz");
-        if skip && only_ends(p, taken) {
+        if skip && only_ends(p, taken) && (on_loops || !on_cycle(p, b)) {
             block.insts.pop();
             block.exit = Exit::Jump(not_taken);
             any = true;
@@ -400,9 +419,10 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
 /// copies; a join nothing reads shows no one the difference (a restore of
 /// EXEC that the next one overwrites reads nothing); and the join may have
 /// other ways in (an inner branch that ends together with an outer one).
+/// `on_loops` as for [`without_early_outs`].
 /// From VIctory-7900XTX (fxceless 578d459; 389db9e, e5841a0),
 /// GPL-3.0-or-later.
-pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
+pub(crate) fn without_skips(p: &Program, deep: bool, on_loops: bool) -> Option<Program> {
     use std::collections::{HashMap, HashSet};
     let n = p.blocks.len();
     // Scalars moved from register to register (a scalar the compiler parked
@@ -543,7 +563,8 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         {
             continue;
         }
-        if only_ends(p, taken) || skipped(b, taken, not_taken).is_some() {
+        let early_out = only_ends(p, taken) && (on_loops || !on_cycle(p, b));
+        if early_out || skipped(b, taken, not_taken).is_some() {
             blocks[b].insts.pop();
             blocks[b].exit = Exit::Jump(not_taken);
             any = true;
@@ -1507,9 +1528,12 @@ mod tests {
             S_ENDPGM,    // end:
         ];
         let p = build_words(&early_out, true);
-        let q = without_early_outs(&p).expect("an early-out");
+        let q = without_early_outs(&p, false).expect("an early-out");
         assert!(q.blocks.iter().flat_map(|b| &b.insts).all(|i| i.name() != "s_cbranch_execz"));
-        assert_eq!(without_skips(&p, false).as_ref().map(|q| q.blocks.len()), Some(q.blocks.len()));
+        assert_eq!(
+            without_skips(&p, false, false).as_ref().map(|q| q.blocks.len()),
+            Some(q.blocks.len())
+        );
         // A skip: the region writes only a VGPR.
         let skip = |scalar: bool| {
             let mut w = vec![
@@ -1527,10 +1551,46 @@ mod tests {
             build_words(&w, true)
         };
         let pure = skip(false);
-        assert!(without_early_outs(&pure).is_none(), "no early-out");
-        let q = without_skips(&pure, false).expect("a pure skip");
+        assert!(without_early_outs(&pure, false).is_none(), "no early-out");
+        let q = without_skips(&pure, false, false).expect("a pure skip");
         assert!(q.blocks.iter().flat_map(|b| &b.insts).all(|i| i.name() != "s_cbranch_execz"));
-        assert!(without_skips(&skip(true), false).is_none(), "the join sees s2");
+        assert!(without_skips(&skip(true), false, false).is_none(), "the join sees s2");
+    }
+
+    /// An early-out that is a loop's only way out stays in both forms:
+    /// without it the lanes whose EXEC the loop cleared would go round
+    /// until the loop limit. The old rule (`on_loops`) left it out.
+    #[test]
+    fn early_outs_on_loops_are_kept() {
+        let looped = [
+            0x7E02_0280, // v_mov_b32 v1, 0
+            // loop:
+            0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+            0x7D88_0300, // v_cmp_gt_u32 vcc, v0, v1
+            0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+            0xBF88_0001, // s_cbranch_execz end
+            0xBF82_FFFB, // s_branch loop
+            S_ENDPGM,    // end:
+        ];
+        let p = build_words(&looped, true);
+        assert!(without_early_outs(&p, false).is_none(), "the loop's only exit");
+        assert!(without_skips(&p, false, false).is_none(), "the loop's only exit");
+        let q = without_early_outs(&p, true).expect("the old rule");
+        assert!(q.blocks.iter().flat_map(|b| &b.insts).all(|i| i.name() != "s_cbranch_execz"));
+        // The program's loop has no way out left: it closes on itself.
+        let ends = q.blocks.iter().filter(|b| b.exit == Exit::End).count();
+        let reached = reverse_postorder(&q.blocks);
+        assert!(reached.iter().all(|&b| q.blocks[b].exit != Exit::End), "{ends} ends");
+        // An early-out before the loop is still left out.
+        let mut before = vec![
+            0x7DA8_00A8, // v_cmpx_gt_u32 exec, 40, v0
+            0xBF88_0006, // s_cbranch_execz end
+        ];
+        before.extend_from_slice(&looped);
+        let p = build_words(&before, true);
+        let q = without_early_outs(&p, false).expect("the early-out before the loop");
+        let execz = q.blocks.iter().flat_map(|b| &b.insts).filter(|i| i.name() == "s_cbranch_execz");
+        assert_eq!(execz.count(), 1, "the loop's early-out stays");
     }
 
     #[test]

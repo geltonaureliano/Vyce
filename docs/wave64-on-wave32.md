@@ -154,6 +154,34 @@ RTX 2070 SUPER the shared-LDS and idiom patterns give the console flow's
 results (`split_tests::local_waves_of_one_wave_groups_keep_their_lds_order`),
 the idiom's slots in another order.
 
+A group barrier must be met as often by every thread, or the threads that
+reach it wait for good (a hang, then a reset of the card). The blocks where
+the waves meet are therefore the ones both host waves run as often, which
+the fork's rule did not quite give (`VICTORY_LOCAL_MEET_CHECKS=0` brings it
+back):
+
+- A loop that lanes leave after different numbers of turns is a region of
+  its own, its exit test included: a lane branch's region never held the
+  branch's block, so the latch of such a loop met the other host wave once
+  a turn, a different number of times in each thread. The waves now meet
+  before the loop and after it.
+- A uniform branch can still part the two host waves: each reserves slots of
+  its own with the first-lane atomic of the allocation idiom, and a lane
+  read (`v_readfirstlane_b32`, `v_readlane_b32`) of a value the lanes hold
+  apart reads a lane of its own host wave. Such scalars, what is made of
+  them, lane masks read as numbers and what a lane branch's region leaves
+  behind (`local_waves::host_wave_varying`) make a branch on them a region
+  too.
+- A program that reaches memory by address returns at its entry in the
+  threads of the last group past the dispatch, each alone: no meetings
+  (the shared-wave and lockstep forms knew it).
+
+The translation of both cases is checked on the module (no barrier between
+a loop's header and its back edge, as many barriers on every way to the
+end) before it runs on the card, against the console flow
+(`split_tests::local_waves_meet_only_where_both_host_waves_run_as_often`,
+`local_waves_of_loops_and_reserved_branches_match_the_console`).
+
 ### Forms without early-outs or skips
 
 A wave64 compute program that the 32-lane forms refuse is tried again
@@ -164,7 +192,10 @@ program) and then without the skips the code after them cannot see
 masked, as the console's wave does when no lane is left, and each form is
 lowered by the same rules (`lockstep::fits`, `Local`), so only exact forms
 are taken. The fork's further forms (wave-wide branches, local waves of
-other programs) are approximate and are not taken.
+other programs) are approximate and are not taken. An early-out on a loop
+stays (`VICTORY_LOOP_EARLY_OUTS=0` leaves it out as the fork did): it may be
+the loop's only way out, and lanes walking on with EXEC clear would go round
+until the loop limit stopped them a million turns later.
 
 CS_ShadowUnifiedClearRaster and CS_SortRayTiles stay refused, measured on
 the transformed programs: the four console waves of a ShadowUnifiedClearRaster

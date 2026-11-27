@@ -200,11 +200,25 @@ pub enum Switch {
     /// again, not as two local 32-lane waves that meet around their LDS
     /// accesses ([`local_waves`]).
     LdsLocal,
+    /// `VICTORY_LOCAL_MEET_CHECKS=0`: the two local waves of a one-wave
+    /// group meet where the fork put their group barriers again: also in
+    /// the blocks of a loop that lanes leave after different numbers of
+    /// turns, inside branches on scalars the two host waves may hold apart
+    /// (the slots each reserved, a lane read), and in programs that reach
+    /// memory by address (their last group's threads past the dispatch
+    /// return at once). Each can leave a host thread waiting at a barrier
+    /// the others never reach: a hang (`lower::local_lds`).
+    LocalMeetChecks,
+    /// `VICTORY_LOOP_EARLY_OUTS=0`: the forms without early-outs leave out
+    /// an early-out on a loop too, where it may be the loop's only way out:
+    /// its lanes then go round with EXEC clear until the loop limit
+    /// ([`crate::ir::without_early_outs`]).
+    LoopEarlyOuts,
 }
 
 impl Switch {
     /// Every switch, in the order of [`switches`]'s bits.
-    pub const ALL: [Switch; 7] = [
+    pub const ALL: [Switch; 9] = [
         Switch::ExactNorm,
         Switch::D16Integer,
         Switch::WaveForms,
@@ -212,6 +226,8 @@ impl Switch {
         Switch::F16Nearest,
         Switch::StrideOnce,
         Switch::LdsLocal,
+        Switch::LocalMeetChecks,
+        Switch::LoopEarlyOuts,
     ];
 
     /// The environment variable that sets it.
@@ -224,6 +240,8 @@ impl Switch {
             Switch::F16Nearest => "VICTORY_F16_NEAREST",
             Switch::StrideOnce => "VICTORY_STRIDE_ONCE",
             Switch::LdsLocal => "VICTORY_LDS_LOCAL",
+            Switch::LocalMeetChecks => "VICTORY_LOCAL_MEET_CHECKS",
+            Switch::LoopEarlyOuts => "VICTORY_LOOP_EARLY_OUTS",
         }
     }
 
@@ -578,9 +596,14 @@ fn without_branches(
     local: bool,
 ) -> Option<HostShader> {
     let why = std::env::var_os("VICTORY_WHY").is_some();
+    // (`VICTORY_LOOP_EARLY_OUTS=0`: early-outs on loops left out too)
     let forms: [(&str, fn(&ir::Program) -> Option<ir::Program>); 2] = [
-        ("without early-outs", ir::without_early_outs),
-        ("without skips", |p| ir::without_skips(p, false)),
+        ("without early-outs", |p| {
+            ir::without_early_outs(p, !Switch::LoopEarlyOuts.on())
+        }),
+        ("without skips", |p| {
+            ir::without_skips(p, false, !Switch::LoopEarlyOuts.on())
+        }),
     ];
     let mut before: Option<ir::Program> = None;
     for (name, form) in forms {
@@ -732,7 +755,7 @@ fn emit_program(
                 found.is_ok()
             };
             let meetable = || {
-                let met = lower::lds_meetable(p, st);
+                let met = lower::lds_meetable(p, st, res.addresses);
                 if !met && std::env::var_os("VICTORY_WHY").is_some() {
                     eprintln!("local waves: LDS the two host waves cannot meet around");
                 }

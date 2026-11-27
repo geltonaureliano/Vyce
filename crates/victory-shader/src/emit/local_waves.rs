@@ -351,3 +351,186 @@ pub(crate) fn independent(p: &Program, st: &Structured) -> Result<(), (usize, &'
     }
     pass(&mut kind, &mut firsts, true)
 }
+
+/// Values the two host waves of a console wave run as local waves may hold
+/// apart, though the lanes of each hold them alike: what a lane read
+/// (`v_readfirstlane_b32`, `v_readlane_b32`) takes from a value the lanes
+/// may hold apart (what the first lane's atomic of the allocation idiom
+/// returned among them: each host wave reserves slots of its own), lane
+/// masks read as numbers, the hardware's state, what is made of those, and
+/// what a lane branch's region leaves behind (what is set in it, joins where
+/// it ends: one host wave may have run it, or gone round in it more often,
+/// and the other not). A uniform branch on one of them may send the two
+/// host waves different ways, so it has a region too
+/// ([`super::lower::lane_regions`]); what that region leaves behind is
+/// found in turn, to a fixpoint. Vector loads are not taken to be alike in
+/// the lanes, whatever their address. By value (`Value.0`).
+/// shortcut: a scalar load of an address both host waves hold alike reads
+/// the same in both (nothing the group writes comes between them).
+pub(crate) fn host_wave_varying(
+    p: &Program,
+    st: &Structured,
+    g: &super::lower::LaneGraph,
+) -> Vec<bool> {
+    let n = p.blocks.len().min(g.succ.len());
+    // SSA values are numbered densely: sets of them are bit vectors.
+    let values = p
+        .inputs
+        .iter()
+        .map(|i| i.1)
+        .chain(p.blocks.iter().flat_map(|b| {
+            let phis = b.phis.iter().map(|phi| phi.value);
+            phis.chain(b.insts.iter().flat_map(|i| i.writes.iter().map(|w| w.1)))
+        }))
+        .map(|v| v.0 as usize + 1)
+        .max()
+        .unwrap_or(0);
+    let mut masks = vec![false; values];
+    for v in st.masks.keys().chain(st.highs.keys()) {
+        if let Some(m) = masks.get_mut(v.0 as usize) {
+            *m = true;
+        }
+    }
+    let is_mask = |v: Value| masks.get(v.0 as usize).copied().unwrap_or(false);
+    let has = |set: &[bool], v: Value| set.get(v.0 as usize).copied().unwrap_or(false);
+    let exec = |r: Reg| matches!(r, Reg::S(c) if c == EXEC || c == EXEC + 1);
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    // A lane mask (or a wave-wide test of one) as an operand of a vector
+    // instruction: each lane's bit, or the host wave's lanes as a number.
+    let mask_operand = |inst: &Inst, o: &Operand| match *o {
+        Operand::Scalar { code, dwords } if code != NULL => (0..dwords).any(|k| {
+            code.checked_add(k).is_none_or(|c| {
+                exec(Reg::S(c)) || inst.read(Reg::S(c)).is_some_and(is_mask)
+            })
+        }),
+        // vccz, execz, lds_direct
+        Operand::Const(c) => matches!(c, 251 | 252 | 254),
+        _ => false,
+    };
+    // VGPR values every lane holds alike: written, unguarded, by a lane's
+    // own operation on scalars, constants and such values (a partial write
+    // keeps the rest of the old value, which must be alike too).
+    let mut alike = vec![false; values];
+    for &b in &order {
+        for (i, inst) in p.blocks[b].insts.iter().enumerate() {
+            let Fields::Valu(v) = &inst.fields else {
+                continue;
+            };
+            let name = inst.name();
+            let lanes = v.dpp.is_some()
+                || ["v_mbcnt", "v_permlane", "v_writelane", "v_interp", "v_movrel", "v_swaprel"]
+                    .iter()
+                    .any(|l| name.starts_with(l));
+            let guarded = st.guards.get(b).and_then(|g| g.get(i)).is_some_and(|g| g.is_some());
+            if lanes || guarded {
+                continue;
+            }
+            let sources = v.src.iter().all(|o| match *o {
+                Operand::Vector { reg, dwords } => (0..dwords).all(|k| {
+                    reg.checked_add(k)
+                        .and_then(|r| inst.read(Reg::V(r)))
+                        .is_some_and(|x| has(&alike, x))
+                }),
+                _ => !mask_operand(inst, o),
+            });
+            let partial = v.sdwa.is_some() || v.opsel & 8 != 0 || name.contains("16");
+            let kept = !partial
+                || inst
+                    .reads
+                    .iter()
+                    .filter(|r| matches!(r.0, Reg::V(_)) && inst.writes.iter().any(|w| w.0 == r.0))
+                    .all(|r| has(&alike, r.1));
+            if sources && kept {
+                for w in inst.writes.iter().filter(|w| matches!(w.0, Reg::V(_))) {
+                    if let Some(a) = alike.get_mut(w.1.0 as usize) {
+                        *a = true;
+                    }
+                }
+            }
+        }
+    }
+    // Whether what `inst` writes may differ between the host waves.
+    let apart = |inst: &Inst, varying: &[bool]| -> bool {
+        let name = inst.name();
+        // the hardware's state, each wave its own
+        if matches!(
+            name,
+            "s_getreg_b32" | "s_memtime" | "s_memrealtime" | "s_get_waveid_in_workgroup"
+        ) || name.starts_with("s_sendmsg") && name.ends_with("_rtn")
+        {
+            return true;
+        }
+        match &inst.fields {
+            // a lane read of a value the lanes may hold apart: each host
+            // wave reads a lane of its own
+            Fields::Valu(v) if matches!(name, "v_readfirstlane_b32" | "v_readlane_b32") => {
+                let from = match v.src.first() {
+                    Some(&Operand::Vector { reg, .. }) => inst.read(Reg::V(reg)),
+                    _ => None,
+                };
+                if !from.is_some_and(|x| has(&alike, x)) {
+                    return true;
+                }
+            }
+            // a lane mask read as a number: the lanes of one host wave
+            Fields::Sop { .. } if inst.reads.iter().any(|&(r, x)| exec(r) || is_mask(x)) => {
+                return true;
+            }
+            Fields::Valu(v) if v.src.iter().any(|o| mask_operand(inst, o)) => return true,
+            _ => {}
+        }
+        inst.reads.iter().any(|&(r, x)| !exec(r) && has(varying, x))
+    };
+    let mut varying = vec![false; values];
+    let mut count = 0;
+    loop {
+        let before = count;
+        // The regions of lane branches and of branches on what is apart so
+        // far, and the blocks their lanes leave them to.
+        let mut inside = vec![false; n];
+        let mut joined = vec![false; n];
+        for (d, r) in super::lower::lane_regions(st, g, &|v| has(&varying, v), true) {
+            for b in (0..n).filter(|&b| r[b] || b == d) {
+                inside[b] |= r[b];
+                for &t in g.succ[b].iter().filter(|&&t| t < n) {
+                    joined[t] |= !r[t];
+                }
+            }
+        }
+        let mut put = |v: Value, varying: &mut [bool]| match varying.get_mut(v.0 as usize) {
+            Some(x) if !*x => {
+                *x = true;
+                count += 1;
+                true
+            }
+            _ => false,
+        };
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &b in order.iter().filter(|&&b| b < n) {
+                let block = &p.blocks[b];
+                for phi in &block.phis {
+                    if exec(phi.reg) || is_mask(phi.value) {
+                        continue;
+                    }
+                    if inside[b] || joined[b] || phi.args.iter().any(|&a| has(&varying, a)) {
+                        changed |= put(phi.value, &mut varying);
+                    }
+                }
+                for inst in &block.insts {
+                    if inside[b] || apart(inst, &varying) {
+                        for &(r, w) in &inst.writes {
+                            if !exec(r) && !is_mask(w) {
+                                changed |= put(w, &mut varying);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if count == before {
+            return varying;
+        }
+    }
+}

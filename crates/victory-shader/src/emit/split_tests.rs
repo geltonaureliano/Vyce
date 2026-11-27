@@ -958,3 +958,283 @@ fn local_waves_of_one_wave_groups_keep_their_lds_order() {
         }
     }
 }
+
+/// A one-wave group with LDS whose lanes leave a loop after different
+/// numbers of turns: lane t goes round t + 1 times, adding 1 to LDS[0] each
+/// time, then every lane reads LDS[0]: 2080. On the console the wave goes
+/// round while any lane does; as local waves no two threads run the loop
+/// as often, so the host waves may meet only before and after it.
+const LDS_LOOP: &[u32] = &[
+    0x7E02_0280, // v_mov_b32 v1, 0
+    0x7E08_0280, // v_mov_b32 v4, 0
+    0xD834_0000,
+    0x0000_0401, // ds_write_b32 v1, v4
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x7E08_0281, // v_mov_b32 v4, 1
+    0x7E04_0280, // v_mov_b32 v2, 0
+    0xBE8A_047E, // s_mov_b64 s[10:11], exec
+    // loop:
+    0xD800_0000,
+    0x0000_0401, // ds_add_u32 v1, v4
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+    0x7D88_0102, // v_cmp_gt_u32 vcc, v2, v0
+    0x8AFE_6A7E, // s_andn2_b64 exec, exec, vcc
+    0xBF89_FFF9, // s_cbranch_execnz loop
+    0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+    0xD8D8_0000,
+    0x0200_0001, // ds_read_b32 v2, v1
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+];
+
+/// The allocation idiom of [`LDS_IDIOM`] over every lane (each lane's t in
+/// the list from dword 4097 at the reserved base plus its rank), then a
+/// uniform branch on that base: the lanes whose base has bit 5 clear add 1
+/// to LDS[0], and every lane reads LDS[0] after the branch. On the console
+/// the wave's base is a multiple of 64: 64 in every group. As local waves
+/// each host wave reserves 32 slots of its own, so of the two host waves of
+/// a group one may go into the branch and the other not.
+const LDS_BASE: &[u32] = &[
+    0x7E02_0280, // v_mov_b32 v1, 0
+    0x7E08_0280, // v_mov_b32 v4, 0
+    0xD834_0000,
+    0x0000_0401, // ds_write_b32 v1, v4
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBE8C_107E, // s_bcnt1_i32_b64 s12, exec
+    0xD765_0006,
+    0x0001_00C1, // v_mbcnt_lo_u32_b32 v6, -1, 0
+    0xD766_0006,
+    0x0002_0CC1, // v_mbcnt_hi_u32_b32 v6, -1, v6
+    0xD765_0007,
+    0x0001_007E, // v_mbcnt_lo_u32_b32 v7, exec_lo, 0
+    0xD766_0007,
+    0x0002_0E7F, // v_mbcnt_hi_u32_b32 v7, exec_hi, v7
+    0xBE8D_147E, // s_ff1_i32_b64 s13, exec
+    0x7E12_02FF,
+    0x0000_4000, // v_mov_b32 v9, 0x4000
+    0x7E10_020C, // v_mov_b32 v8, s12
+    0xBE90_047E, // s_mov_b64 s[16:17], exec
+    0x7DA4_0C0D, // v_cmpx_eq_u32 exec, s13, v6
+    0xE0C8_5000,
+    0x8001_0809, // buffer_atomic_add v8, v9, s[4:7], 0 offen glc
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xBEFE_0410, // s_mov_b64 exec, s[16:17]
+    0x7E24_0508, // v_readfirstlane_b32 s18, v8
+    0x4A14_0E12, // v_add_nc_u32 v10, s18, v7
+    0x3416_1482, // v_lshlrev_b32 v11, 2, v10
+    0x4A16_16FF,
+    0x0000_4004, // v_add_nc_u32 v11, 0x4004, v11
+    0xE070_1000,
+    0x8001_000B, // buffer_store_dword v0, v11, s[4:7], 0 offen
+    0x8713_A012, // s_and_b32 s19, s18, 32
+    0xBF06_8013, // s_cmp_eq_u32 s19, 0
+    0xBF84_0004, // s_cbranch_scc0 +4
+    0x7E18_0281, // v_mov_b32 v12, 1
+    0xD800_0000,
+    0x0000_0C01, // ds_add_u32 v1, v12
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xD8D8_0000,
+    0x0200_0001, // ds_read_b32 v2, v1
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+];
+
+/// `native` lowered as local waves, as [`super::emit`] lowers a one-wave
+/// group with LDS, with `VICTORY_LOCAL_MEET_CHECKS` as `checks` says.
+fn local_lowered(native: &crate::NativeProgram, target: super::Target, checks: bool) -> super::lower::Lowered {
+    local_lowered_with(native, target, checks, false).expect("local waves")
+}
+
+/// [`local_lowered`], of a program that reaches memory by address where
+/// `addresses` says ([`crate::resource::Resources::addresses`]).
+fn local_lowered_with(
+    native: &crate::NativeProgram,
+    target: super::Target,
+    checks: bool,
+    addresses: bool,
+) -> Result<super::lower::Lowered, crate::ShaderError> {
+    let p = crate::ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
+    let res = crate::resource::track_with(&p, &native.layout, native.stage, addresses).expect("resources");
+    let io = crate::io::raise(&p, native).expect("io");
+    let st = crate::structure::structure(&p).expect("structure");
+    let parts = super::lower::Parts {
+        native,
+        psv: None,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        target,
+        console_cf: false,
+        per_lane_only: false,
+        local: true,
+    };
+    super::with_switch(super::Switch::LocalMeetChecks, checks, || super::lower::lower(&parts))
+}
+
+/// A program that reaches memory by address returns at its entry in the
+/// threads of its last group past the dispatch, each alone: its local waves
+/// cannot meet, as its shared-wave and lockstep forms cannot.
+#[test]
+fn local_waves_of_programs_by_address_do_not_meet() {
+    let nvidia = super::Target { lanes_min: 32, lanes_max: 32, exact_views: false };
+    let p = with_lds(LDS_SHARED);
+    assert!(local_lowered_with(&p, nvidia, true, false).is_ok());
+    let refused = local_lowered_with(&p, nvidia, true, true).err().expect("refused");
+    assert!(refused.to_string().contains("by address"), "{refused}");
+    assert!(local_lowered_with(&p, nvidia, false, true).is_ok(), "the fork's rule met there");
+}
+
+/// Local waves meet only where both host waves run as often: not inside a
+/// loop their lanes leave after different numbers of turns, not inside a
+/// branch on the slots each host wave reserved. The translation's group
+/// barriers are then met as often on every way through the program, and
+/// none sits between a loop's header and its back edge; the fork's
+/// meetings (`VICTORY_LOCAL_MEET_CHECKS=0`) failed both (checked here
+/// without the card: run there they could hang it).
+#[test]
+fn local_waves_meet_only_where_both_host_waves_run_as_often() {
+    let nvidia = super::Target { lanes_min: 32, lanes_max: 32, exact_views: false };
+    for (label, body) in [("a loop lanes leave apart", LDS_LOOP), ("a branch on the reserved base", LDS_BASE)] {
+        let p = with_lds(body);
+        let l = local_lowered(&p, nvidia, true);
+        assert_eq!(l.barriers.0, 0, "{label}: no barrier inside a loop");
+        assert_eq!(l.barriers.1.len(), 1, "{label}: as many barriers on every way: {:?}", l.barriers.1);
+        assert!(l.barriers.1[0] > 0, "{label}: the waves meet around their LDS accesses");
+        // The production path takes this very translation.
+        let emitted = emit_for(&p, nvidia).expect("translates");
+        assert_eq!(emitted.dxil, l.dxil, "{label}: emit gives the local waves checked here");
+        assert_eq!(wave_size(&emitted.dxil), Some(32));
+        let fork = local_lowered(&p, nvidia, false);
+        assert!(
+            fork.barriers.0 > 0 || fork.barriers.1.len() > 1,
+            "{label}: the fork's meetings part the threads: {:?}",
+            fork.barriers
+        );
+    }
+    // The loop's block is in its own region, the branch's body in its: no
+    // block there is a meeting place.
+    for body in [LDS_LOOP, LDS_BASE] {
+        let l = local_lowered(&with_lds(body), nvidia, true);
+        assert_eq!(l.all_lane, Some(vec![true, false, true]));
+    }
+    // The shared-LDS and idiom programs keep their meetings.
+    for body in [LDS_SHARED, LDS_IDIOM] {
+        let p = with_lds(body);
+        assert_eq!(local_lowered(&p, nvidia, true).dxil, local_lowered(&p, nvidia, false).dxil);
+    }
+}
+
+/// What the two host waves of local waves may hold apart: a lane read of a
+/// lane's own value (a thread id) and the slots a first lane reserved are,
+/// a lane read of a scalar every lane holds is not; nor is a user SGPR.
+#[test]
+fn host_waves_hold_lane_reads_and_reserved_slots_apart() {
+    use crate::structure::{Atom, LaneExit};
+    let words = [
+        0x7E0A_0200, // v_mov_b32 v5, s0
+        0x7E0C_0505, // v_readfirstlane_b32 s6, v5
+        0x7E0E_0500, // v_readfirstlane_b32 s7, v0
+        0xBF06_8006, // s_cmp_eq_u32 s6, 0
+        0xBF85_0001, // s_cbranch_scc1 +1
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xBF06_8007, // s_cmp_eq_u32 s7, 0
+        0xBF85_0001, // s_cbranch_scc1 +1
+        0x7E02_0281, // v_mov_b32 v1, 1
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0001, // s_cbranch_scc1 +1
+        0x7E02_0282, // v_mov_b32 v1, 2
+        S_ENDPGM,
+    ];
+    // The SCC each block's branch reads, and whether the host waves may
+    // hold it apart.
+    let apart = |words: &[u32]| -> Vec<(usize, bool)> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, true, 16).expect("IR");
+        let st = crate::structure::structure(&p).expect("structure");
+        let g = super::lower::LaneGraph::of(&st).expect("graph");
+        let varying = super::local_waves::host_wave_varying(&p, &st, &g);
+        (0..st.exits.len())
+            .filter_map(|b| match st.exits[b] {
+                LaneExit::Branch { when, .. } => match st.bools.support(when)[..] {
+                    [Atom::Uniform(scc)] => Some((b, varying[scc.0 as usize])),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    };
+    let found = apart(&words);
+    assert_eq!(found.iter().map(|f| f.1).collect::<Vec<_>>(), [false, true, false], "{found:?}");
+    // The reserved base's bit: apart.
+    let found = apart(&LDS_BASE.iter().copied().chain([S_ENDPGM]).collect::<Vec<_>>());
+    assert_eq!(found.iter().map(|f| f.1).collect::<Vec<_>>(), [true], "{found:?}");
+}
+
+/// [`LDS_LOOP`] and [`LDS_BASE`] on every host of 32-lane waves, as local
+/// waves and in the console flow: every lane of a group reads the LDS total
+/// its group made, and the idiom's slots are each lane's own.
+#[test]
+fn local_waves_of_loops_and_reserved_branches_match_the_console() {
+    let nvidia = super::Target { lanes_min: 32, lanes_max: 32, exact_views: false };
+    let local = |p: &crate::NativeProgram| emit_for(p, nvidia).expect("local waves");
+    let console = |p: &crate::NativeProgram| {
+        super::with_switch(super::Switch::LdsLocal, false, || emit_for(p, nvidia)).expect("console flow")
+    };
+    let (looped, base) = (with_lds(LDS_LOOP), with_lds(LDS_BASE));
+    for p in [&looped, &base] {
+        let (l, c) = (local(p), console(p));
+        assert_ne!(l.dxil, c.dxil, "local waves are not the console flow");
+        // The barriers are checked before anything runs on the card.
+        let checked = local_lowered(p, nvidia, true);
+        assert_eq!(checked.dxil, l.dxil);
+        assert_eq!((checked.barriers.0, checked.barriers.1.len()), (0, 1));
+        if let Ok(mut v) =
+            super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut l.dxil.clone()).expect("local waves validate");
+            v.validate(&mut c.dxil.clone()).expect("the console flow validates");
+        }
+    }
+    for name in adapters().unwrap_or_default() {
+        let Ok(host) = Host::on(&name) else {
+            continue;
+        };
+        if host.target().runs(64) {
+            continue; // the forms are for hosts of 32-lane waves
+        }
+        let groups = 8;
+        for form in ["local", "console"] {
+            let make = |p: &crate::NativeProgram| if form == "local" { local(p) } else { console(p) };
+            let out = run_dwords(&host, &make(&looped), 64, groups, 0).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(out.iter().all(|&x| x == 2080), "{name}: {form}: the loop's LDS total: {:?}", &out[..64]);
+            let out = run_dwords(&host, &make(&base), 64, groups, 4097 + 64 * groups)
+                .unwrap_or_else(|e| panic!("{name}: {form}: {e}"));
+            let mut total = 0;
+            for g in 0..groups as usize {
+                let lanes = &out[64 * g..64 * (g + 1)];
+                assert!(lanes.iter().all(|&x| x == lanes[0]), "{name}: {form}: group {g} reads one total: {lanes:?}");
+                if form == "console" {
+                    assert_eq!(lanes[0], 64, "{name}: console: the wave's base is a multiple of 64");
+                } else {
+                    assert!(matches!(lanes[0], 0 | 32 | 64), "{name}: local: group {g}: {}", lanes[0]);
+                }
+                total += lanes[0];
+            }
+            // Local waves: of the 2 * groups host waves, those that reserved
+            // at an even multiple of 32 went into the branch.
+            let want = if form == "console" { 64 * groups } else { 32 * groups };
+            assert_eq!(total, want, "{name}: {form}: the lanes that went into the branch");
+            assert_eq!(out[4096], 64 * groups, "{name}: {form}: reserved slots");
+            let mut list = out[4097..(4097 + 64 * groups) as usize].to_vec();
+            list.sort_unstable();
+            let mut want: Vec<u32> = (0..groups).flat_map(|_| 0..64).collect();
+            want.sort_unstable();
+            assert_eq!(list, want, "{name}: {form}: the slots");
+            eprintln!("{name}: loops and reserved branches of one-wave LDS groups exact ({form})");
+        }
+    }
+}

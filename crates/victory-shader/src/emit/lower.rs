@@ -110,6 +110,14 @@ pub(crate) struct Lowered {
     /// Test builds: the property words of each handle annotation, in order.
     #[cfg(test)]
     pub annotations: Vec<(u32, u32)>,
+    /// Test builds: group barriers inside loops, and the numbers of them on
+    /// the ways to the returns other than the abort's
+    /// (`bitcode::Module::calls_on_paths`).
+    #[cfg(test)]
+    pub barriers: (usize, Vec<usize>),
+    /// Test builds: the blocks local waves meet around ([`Lower::lds_meet`]).
+    #[cfg(test)]
+    pub all_lane: Option<Vec<bool>>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -685,92 +693,140 @@ fn lds_access(inst: &Inst) -> bool {
         && !(name.starts_with("ds_swizzle") || name.contains("permute") || name == "ds_nop")
 }
 
+/// The blocks of a structured program as its lanes go through them: the
+/// successors by each block's lane exit, and the post-dominators.
+pub(super) struct LaneGraph {
+    pub(super) succ: Vec<Vec<usize>>,
+    /// Post-dominators of each block as bit sets (every End leads to one
+    /// exit after it).
+    pdom: Vec<Vec<u64>>,
+}
+
+impl LaneGraph {
+    /// `None` with an indirect exit (not followed).
+    pub(super) fn of(st: &Structured) -> Option<Self> {
+        let n = st.exits.len();
+        let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (b, e) in st.exits.iter().enumerate() {
+            match *e {
+                LaneExit::Jump(t) => succ[b].push(t),
+                LaneExit::Branch { taken, not_taken, .. } => {
+                    succ[b].push(taken);
+                    succ[b].push(not_taken);
+                }
+                LaneExit::End => {}
+                LaneExit::Indirect => return None,
+            }
+        }
+        let words = n.div_ceil(64);
+        let full = vec![u64::MAX; words];
+        let mut pdom: Vec<Vec<u64>> = (0..n)
+            .map(|b| {
+                if succ[b].is_empty() {
+                    let mut v = vec![0; words];
+                    v[b / 64] |= 1 << (b % 64);
+                    v
+                } else {
+                    full.clone()
+                }
+            })
+            .collect();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for b in (0..n).rev() {
+                if succ[b].is_empty() {
+                    continue;
+                }
+                let mut v = full.clone();
+                for &t in &succ[b] {
+                    for (w, x) in v.iter_mut().enumerate() {
+                        *x &= pdom[t][w];
+                    }
+                }
+                v[b / 64] |= 1 << (b % 64);
+                if v != pdom[b] {
+                    pdom[b] = v;
+                    changed = true;
+                }
+            }
+        }
+        Some(LaneGraph { succ, pdom })
+    }
+
+    /// The region of a branch at `d` that sends lanes different ways: the
+    /// blocks reachable from it that do not post-dominate it, which only
+    /// some lanes run; with `loops`, `d` too where such a way leads back to
+    /// it (a loop lanes leave after different numbers of turns: no block of
+    /// it, the branch's own included, is run as often by every lane).
+    pub(super) fn region(&self, d: usize, loops: bool) -> Vec<bool> {
+        let n = self.succ.len();
+        let mut seen = vec![false; n];
+        let mut stack: Vec<usize> = self.succ[d].clone();
+        while let Some(b) = stack.pop() {
+            if seen[b] {
+                continue;
+            }
+            if b == d {
+                seen[b] = loops;
+                continue; // (its successors are on the stack already)
+            }
+            if self.pdom[d][b / 64] >> (b % 64) & 1 == 1 {
+                continue;
+            }
+            seen[b] = true;
+            stack.extend(self.succ[b].iter().copied());
+        }
+        seen
+    }
+}
+
 /// Per IR block: every lane of the wave that started the program runs it,
-/// no per-lane branch separates it from the entry (it lies in no lane
-/// branch's region: the blocks reachable from the branch that do not
-/// post-dominate it). `None` with an indirect exit (not followed).
+/// as often as every other lane: no lane branch separates it from the entry
+/// (it lies in no region of [`lane_regions`]). With local waves, both host
+/// waves then run it as often too, and a group barrier there is met.
 /// From VIctory-7900XTX `all_lane_blocks` (GPL-3.0-or-later).
-fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
+fn all_lane_blocks(
+    st: &Structured,
+    g: &LaneGraph,
+    varying: &dyn Fn(Value) -> bool,
+    loops: bool,
+) -> Vec<bool> {
     let n = st.exits.len();
     let mut all = vec![true; n];
-    for (_, region) in lane_regions(st)? {
+    for (_, region) in lane_regions(st, g, varying, loops) {
         for b in (0..n).filter(|&b| region[b]) {
             all[b] = false;
         }
     }
-    Some(all)
+    all
 }
 
-/// Every per-lane branch (by its block) with its region: the blocks
-/// reachable from it that do not post-dominate it, which only some lanes
-/// run. Not branches on uniform conditions, which all lanes take alike.
-/// `None` with an indirect exit. From VIctory-7900XTX `lane_regions`.
-fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
-    let n = st.exits.len();
-    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (b, e) in st.exits.iter().enumerate() {
-        match *e {
-            LaneExit::Jump(t) => succ[b].push(t),
-            LaneExit::Branch { taken, not_taken, .. } => {
-                succ[b].push(taken);
-                succ[b].push(not_taken);
-            }
-            LaneExit::End => {}
-            LaneExit::Indirect => return None,
-        }
-    }
-    // Post-dominators as bit sets (every End leads to one exit after it).
-    let words = n.div_ceil(64);
-    let full = vec![u64::MAX; words];
-    let mut pdom: Vec<Vec<u64>> = (0..n)
-        .map(|b| {
-            if succ[b].is_empty() {
-                let mut v = vec![0; words];
-                v[b / 64] |= 1 << (b % 64);
-                v
-            } else {
-                full.clone()
-            }
-        })
-        .collect();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for b in (0..n).rev() {
-            if succ[b].is_empty() {
-                continue;
-            }
-            let mut v = full.clone();
-            for &t in &succ[b] {
-                for (w, x) in v.iter_mut().enumerate() {
-                    *x &= pdom[t][w];
-                }
-            }
-            v[b / 64] |= 1 << (b % 64);
-            if v != pdom[b] {
-                pdom[b] = v;
-                changed = true;
-            }
-        }
-    }
+/// Every lane branch (by its block) with its region ([`LaneGraph::region`]):
+/// a branch on a per-lane condition, or on a uniform one (SCC) that
+/// `varying` says the two host waves of local waves may hold apart
+/// ([`super::local_waves::host_wave_varying`]): one host wave can go one
+/// way and the other the other. Not branches on other uniform conditions,
+/// which all lanes of both take alike. With `loops`, a branch that a lane
+/// way leads back to is in its own region. After VIctory-7900XTX
+/// `lane_regions` (GPL-3.0-or-later): the branch's own block and the
+/// varying conditions are Vyce's.
+pub(super) fn lane_regions(
+    st: &Structured,
+    g: &LaneGraph,
+    varying: &dyn Fn(Value) -> bool,
+    loops: bool,
+) -> Vec<(usize, Vec<bool>)> {
+    let even = |a: &Atom| matches!(*a, Atom::Uniform(v) if !varying(v));
     let mut regions = Vec::new();
     for (d, e) in st.exits.iter().enumerate() {
         let LaneExit::Branch { when, .. } = *e else { continue };
-        if st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))) {
+        if st.bools.support(when).iter().all(even) {
             continue; // all lanes go the same way
         }
-        let mut seen = vec![false; n];
-        let mut stack: Vec<usize> = succ[d].clone();
-        while let Some(b) = stack.pop() {
-            if seen[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 {
-                continue;
-            }
-            seen[b] = true;
-            stack.extend(succ[b].iter().copied());
-        }
-        regions.push((d, seen));
+        regions.push((d, g.region(d, loops)));
     }
-    Some(regions)
+    regions
 }
 
 /// LDS accesses of a console wave run as two host waves, where some sit in
@@ -857,8 +913,32 @@ fn lds_meetings(p: &Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool,
 /// own barriers must stand where every lane runs: on the console the wave
 /// reaches one if any lane does, here a host wave without such a lane
 /// would leave the other waiting.
-fn local_lds(p: &Program, st: &Structured) -> Option<(Vec<bool>, Vec<(bool, bool)>)> {
-    let all = all_lane_blocks(st)?;
+///
+/// A group barrier must be met by every thread as often. Lanes that leave
+/// a loop after different numbers of turns, and the two host waves on two
+/// sides of a branch on a scalar they hold apart (the slots each reserved,
+/// a lane read), would not: those blocks are lane-branch regions too. Nor
+/// would a program that reaches memory by address (`addresses`): the
+/// threads of its last group past the dispatch return at the entry, each
+/// alone, as the shared-wave and lockstep forms know
+/// (`VICTORY_LOCAL_MEET_CHECKS=0`: the fork's regions and no such check).
+fn local_lds(
+    p: &Program,
+    st: &Structured,
+    addresses: bool,
+) -> Option<(Vec<bool>, Vec<(bool, bool)>)> {
+    let checks = super::Switch::LocalMeetChecks.on();
+    if addresses && checks {
+        return None;
+    }
+    let g = LaneGraph::of(st)?;
+    let varying = if checks {
+        super::local_waves::host_wave_varying(p, st, &g)
+    } else {
+        Vec::new()
+    };
+    let apart = |v: Value| varying.get(v.0 as usize).copied().unwrap_or(false);
+    let all = all_lane_blocks(st, &g, &apart, checks);
     let barriers = p
         .blocks
         .iter()
@@ -873,8 +953,8 @@ fn local_lds(p: &Program, st: &Structured) -> Option<(Vec<bool>, Vec<(bool, bool
 
 /// Whether the LDS accesses of a one-wave group run as two local 32-lane
 /// waves can keep the console's order ([`local_lds`]).
-pub(super) fn lds_meetable(p: &Program, st: &Structured) -> bool {
-    local_lds(p, st).is_some()
+pub(super) fn lds_meetable(p: &Program, st: &Structured, addresses: bool) -> bool {
+    local_lds(p, st, addresses).is_some()
 }
 
 /// Samples whose level comes from derivatives across each quad of lanes.
@@ -1498,7 +1578,7 @@ impl<'a> Lower<'a> {
                 // accesses of one wave: the two host waves meet around
                 // them (VIctory-7900XTX's local waves of one-wave groups).
                 if one_wave && s.lds_dwords > 0 {
-                    lds_meet = Some(local_lds(p, x.st));
+                    lds_meet = Some(local_lds(p, x.st, x.res.addresses));
                 }
             }
             if split || x.local {
@@ -2309,6 +2389,8 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let stride_table = self.s.stride_table.is_some();
         let cmp_samplers = self.s.cmp_samplers;
+        #[cfg(test)]
+        let barriers = self.s.m.calls_on_paths("dx.op.barrier", self.abort);
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
@@ -2320,6 +2402,13 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             annotations: std::mem::take(&mut self.s.annotations),
+            #[cfg(test)]
+            barriers,
+            #[cfg(test)]
+            all_lane: match &self.lds_meet {
+                Some(Some((all, _))) => Some(all.clone()),
+                _ => None,
+            },
             stride_table,
             dxil: self.s.finish(),
             user_data,
@@ -2334,7 +2423,11 @@ impl<'a> Lower<'a> {
         if matches!(self.lds_meet, Some(None)) {
             return Err(unsupported(
                 0,
-                "an LDS read and write (or a barrier) in a lane-branch region of local waves",
+                if self.x.res.addresses && super::Switch::LocalMeetChecks.on() {
+                    "LDS of local waves in a program that reaches memory by address"
+                } else {
+                    "an LDS read and write (or a barrier) in a lane-branch region of local waves"
+                },
             ));
         }
         if let Some(n) = self.s.wave_size
