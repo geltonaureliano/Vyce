@@ -32,9 +32,10 @@
 //!   (+0x204/+0x208), then the title's own else-path (screen size set,
 //!   +0xd8c3a0 if the height changed). Everything that reads the settings
 //!   after it (the device parameters +0x1e0fb30, the render size +0x7b4e10)
-//!   sees the same size. The back buffers' pool (64 MB on Series X) is
-//!   checked to be used up but for 2 MB (+0x247af25, an `int3`); for another
-//!   size that check is jumped over.
+//!   sees the same size. The back buffers' pool (64 MB on Series X, 82 MB
+//!   on Series S) is checked to be used up but for 2 MB (+0x247af25, an
+//!   `int3`); with any output size asked for, 3840x2160 too, that check is
+//!   jumped over.
 //! - **Render scale.** The upscaler the title picks (+0x7e93f0: 6, its own,
 //!   except on Series S with a flag, 7, AMD FidelityFX) gives the render
 //!   size from the output size (+0x7e92f0 → the upscaler's +0x50 method):
@@ -135,10 +136,13 @@ pub const OUTPUT: Site = Site {
 };
 
 /// +0x247ad10, after the back buffers are made in their pool (64 MB on
-/// Series X, 82 MB on Series S, from +0x247ad45): `int3` unless less than
-/// 2 MB of the pool is left over. Sized for 3840x2160; at 1920x1080 49 MB
-/// are left (upstream's run res-1 stopped here). With another output size
-/// the check becomes a jump over the `int3`; the pool stays as large.
+/// Series X, 82 MB on Series S, chosen by the console at +0x247ad3e to
+/// +0x247ad59): `int3` unless less than 2 MB of the pool is left over. Sized
+/// for 3840x2160 on Series X; at 1920x1080 49 MB are left (upstream's run
+/// res-1 stopped here), and Series S's pool leaves more than 2 MB at
+/// 3840x2160 too. With any output size asked for the check becomes a jump
+/// over the `int3`, to where `jbe` goes: at the title's own size that
+/// changes nothing. The pool stays as large.
 pub const POOL_CHECK: Site = Site {
     at: 0x247af25,
     what: "back buffer pool's left-over check",
@@ -227,9 +231,8 @@ pub fn plan(output: Option<(u32, u32)>, scale: Option<f32>, upscaler: Option<u32
     let mut changes: Vec<Change> = Vec::new();
     if let Some((w, h)) = output {
         changes.push((&OUTPUT, output_code(w, h), format!("{w}x{h}")));
-        if (w, h) != (3840, 2160) {
-            changes.push((&POOL_CHECK, pool_check_code(), format!("{w}x{h}")));
-        }
+        // At any size: the pool's size depends on the console, not on it.
+        changes.push((&POOL_CHECK, pool_check_code(), format!("{w}x{h}")));
     }
     if let Some(s) = scale {
         changes.push((&OWN_SCALE, own_scale_code(s), format!("{s}")));
@@ -420,13 +423,17 @@ mod tests {
         }
     }
 
-    /// What each switch changes: the output's block and, for any size but
-    /// 4K, the pool's check; the scale; the picker.
+    /// What each switch changes: the output's block and, at any size (4K
+    /// too: Series S's pool is larger), the pool's check; the scale; the
+    /// picker.
     #[test]
     fn the_switches_plan_their_places() {
         let at = |changes: &[Change]| changes.iter().map(|c| c.0.at).collect::<Vec<_>>();
-        assert_eq!(at(&plan(Some((1920, 1080)), None, None)), [OUTPUT.at, POOL_CHECK.at]);
-        assert_eq!(at(&plan(Some((3840, 2160)), None, None)), [OUTPUT.at]);
+        for size in MODES {
+            let changes = plan(Some(size), None, None);
+            assert_eq!(at(&changes), [OUTPUT.at, POOL_CHECK.at], "{size:?}");
+            assert_eq!(changes[1].1, pool_check_code());
+        }
         assert_eq!(at(&plan(None, Some(1.0), None)), [OWN_SCALE.at]);
         assert_eq!(at(&plan(None, None, Some(6))), [PICKER.at]);
         let all = plan(Some((1280, 720)), Some(0.75), Some(6));

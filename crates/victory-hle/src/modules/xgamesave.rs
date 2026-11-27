@@ -263,6 +263,27 @@ enum Source<'a> {
     Kept(PathBuf),
 }
 
+/// The folder to write version `number` in: `v<N>.new`, or, while an
+/// unfinished one left there cannot be removed ([`remove_left_over`]; the
+/// number is the newest's plus one, so every later update of the container
+/// would fail on it), the first `v<N>.<k>.new` free. `current` removes any
+/// of them as unfinished.
+fn staging(dir: &Path, number: u64) -> std::io::Result<PathBuf> {
+    for k in 0..64 {
+        let staged = match k {
+            0 => dir.join(format!("v{number}.new")),
+            k => dir.join(format!("v{number}.{k}.new")),
+        };
+        if staged.exists() {
+            remove_left_over(&staged)?;
+        }
+        if !staged.exists() {
+            return Ok(staged);
+        }
+    }
+    Err(std::io::Error::other("every staging folder of the version is held"))
+}
+
 /// Writes version `number` of the container in `dir` and commits it.
 fn commit(
     dir: &Path,
@@ -271,10 +292,7 @@ fn commit(
     display: &str,
     blobs: &[(&str, Source<'_>)],
 ) -> std::io::Result<()> {
-    let staged = dir.join(format!("v{number}.new"));
-    if staged.exists() {
-        std::fs::remove_dir_all(&staged)?;
-    }
+    let staged = staging(dir, number)?;
     std::fs::create_dir_all(&staged)?;
     let write = |path: PathBuf, data: &[u8]| -> std::io::Result<()> {
         let mut file = std::fs::File::create(path)?;
@@ -1357,8 +1375,9 @@ mod tests {
 
     /// An older version, or an unfinished one, that cannot be removed (a
     /// file of it held open without sharing its deletion) does not hide
-    /// the newest: the container is still listed and read whole, and the
-    /// left-over goes at a later read once it can.
+    /// the newest: the container is still listed and read whole, an update
+    /// whose own staging folder is the one held stages beside it, and the
+    /// left-overs go at a later read once they can.
     #[cfg(windows)]
     #[test]
     fn a_version_that_cannot_go_does_not_hide_the_newest() {
@@ -1374,17 +1393,34 @@ mod tests {
         // The update's own removal of v1 fails, and so does the next read's.
         assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK);
         assert!(slot.join("v1").exists(), "the held version stays");
-        let staged = slot.join("v7.new");
-        std::fs::create_dir_all(&staged).unwrap();
-        std::fs::write(staged.join("0"), b"half").unwrap();
-        let held_too = hold(staged.join("0"));
+        // Unfinished versions held: one above the newest, and the one the
+        // next update (v3) would stage in.
+        let unfinished = |name: &str| {
+            let staged = slot.join(name);
+            std::fs::create_dir_all(&staged).unwrap();
+            std::fs::write(staged.join("0"), b"half").unwrap();
+            let held = hold(staged.join("0"));
+            (staged, held)
+        };
+        let (far, held_far) = unfinished("v7.new");
+        let (next, held_next) = unfinished("v3.new");
         let newest = Some(("two".into(), vec![("a".into(), "new a".into())]));
         assert_eq!(state(root), newest);
         assert_eq!(containers(root).len(), 1, "still listed");
         assert_eq!(update(root, "three", &[("b", Some("b"))]), S_OK);
-        drop((held, held_too));
-        let newest = Some(("three".into(), vec![("a".into(), "new a".into()), ("b".into(), "b".into())]));
-        assert_eq!(state(root), newest);
-        assert!(!slot.join("v1").exists() && !staged.exists(), "gone once they can go");
+        let three = Some(("three".into(), vec![("a".into(), "new a".into()), ("b".into(), "b".into())]));
+        assert_eq!(state(root), three);
+        let mut left: Vec<String> = std::fs::read_dir(&slot)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["v1", "v3", "v3.new", "v7.new"], "committed beside the held v3.new");
+        // And the update after it too.
+        assert_eq!(update(root, "four", &[("c", Some("c"))]), S_OK);
+        drop((held, held_far, held_next));
+        let four = vec![("a".into(), "new a".into()), ("b".into(), "b".into()), ("c".into(), "c".into())];
+        assert_eq!(state(root), Some(("four".into(), four)));
+        assert!(!slot.join("v1").exists() && !far.exists() && !next.exists(), "gone once they can go");
     }
 }

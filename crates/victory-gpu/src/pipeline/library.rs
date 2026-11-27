@@ -233,9 +233,12 @@ fn available_memory() -> Option<u64> {
 
 /// How long the driver's compiler may work on a pipeline before
 /// [`endless`] stops it: past `endless` it is stopped once the process has
-/// grown by `growth` bytes since, or once the machine has less than
-/// `least_free` bytes of memory free (0: never for that); past `even_so`
-/// in any case.
+/// grown by `growth` bytes since it got there; past `even_so` in any case.
+/// While the machine has less than `least_free` bytes of memory free (0:
+/// never for that), one at work for more than [`FLOOR_FROM`] (`endless` if
+/// sooner) is stopped if the process grew by [`OWN_GROWTH`] since it was
+/// first watched; else the shortage is not its doing, which is said, and
+/// it is watched on.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Hold {
     endless: Duration,
@@ -258,9 +261,79 @@ const HOLD: Hold = Hold {
     least_free: 2 << 30,
 };
 
+/// From when a compile is watched against the memory floor (`endless`
+/// if sooner): the hold before upstream's 7263339. A compile that never
+/// ends fills the floor's 2 GiB in a quarter of a minute.
+const FLOOR_FROM: Duration = Duration::from_secs(20);
+
+/// What the process must grow by while a compile is watched for a shortage
+/// to be laid to it: with less, the shortage is the title's (its 13 to 19
+/// GB while the world loads) or another program's, and a good pipeline
+/// would be left out in every later session.
+const OWN_GROWTH: u64 = 1 << 30;
+
+/// What [`endless`] does with a compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// Left to work.
+    Work,
+    /// Memory runs short, but the process grew less than [`OWN_GROWTH`]
+    /// while it was watched: said, never noted, watched on.
+    NotItsShortage,
+    /// Stopped and left out from the next run on, for this reason.
+    Stop(&'static str),
+}
+
+/// A compile [`endless`] watches, on the thread `thread`: the process's
+/// commit when it was first watched and when first seen past `endless`,
+/// and whether a shortage not its doing was said.
+struct Watched {
+    report: Arc<CompileReport>,
+    thread: u32,
+    seen: u64,
+    late: Option<u64>,
+    told: bool,
+}
+
+impl Watched {
+    fn new(report: &Arc<CompileReport>, thread: u32, commit: u64) -> Watched {
+        Watched { report: report.clone(), thread, seen: commit, late: None, told: false }
+    }
+
+    fn is(&self, report: &Arc<CompileReport>, thread: u32) -> bool {
+        Arc::ptr_eq(&self.report, report) && self.thread == thread
+    }
+}
+
+/// The hold's verdict on a compile at work for `busy`, while the process
+/// grew by `grown` bytes since the compile was first watched and by
+/// `grown_late` since it was first seen past `endless`, with `free` bytes
+/// of the machine's memory free (if Windows tells). Pure, for testing.
+fn verdict(hold: &Hold, busy: Duration, grown: u64, grown_late: u64, free: Option<u64>) -> Verdict {
+    if busy > hold.even_so {
+        return Verdict::Stop("too long");
+    }
+    if busy > hold.endless && grown_late > hold.growth {
+        return Verdict::Stop("the process grew");
+    }
+    let short = hold.least_free > 0 && free.is_some_and(|free| free < hold.least_free);
+    if short && busy > FLOOR_FROM.min(hold.endless) {
+        return if grown >= OWN_GROWTH {
+            Verdict::Stop("memory runs short")
+        } else {
+            Verdict::NotItsShortage
+        };
+    }
+    Verdict::Work
+}
+
 /// `VICTORY_COMPILE_HOLD=<s>,<s>,<GiB>,<GiB>`: [`Hold`]'s four, in that order;
 /// those left out keep [`HOLD`]'s. `20,150,3,0` is the hold before upstream's
-/// 7263339. Pure, for testing.
+/// 7263339. The four mean what they did; only the fourth, the memory floor,
+/// is watched from [`FLOOR_FROM`] of work instead of from the first number's,
+/// and stops only a compile the process grew by [`OWN_GROWTH`] beside
+/// ([`verdict`]): one caught by a shortage it did not cause is never noted.
+/// Pure, for testing.
 fn parse_hold(value: Option<&str>) -> Option<Hold> {
     let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
         return Some(HOLD);
@@ -410,9 +483,11 @@ fn endless(report: &Arc<CompileReport>, begins: bool) {
             .name("victory-compiles".into())
             .spawn(|| {
                 let hold = hold();
+                // From when any rule of the hold may stop a compile.
+                let from = FLOOR_FROM.min(hold.endless).min(hold.even_so);
                 let mut noted: Vec<String> = Vec::new();
-                // The process's commit when a compile was first seen late.
-                let mut late: Option<u64> = None;
+                // The compiles at work for more than `from`.
+                let mut watched: Vec<Watched> = Vec::new();
                 let mut next_scan = Instant::now() + SCAN_INTERVAL;
                 loop {
                     for id in LOST.take_until(next_scan) {
@@ -424,41 +499,47 @@ fn endless(report: &Arc<CompileReport>, begins: bool) {
                         continue;
                     }
                     next_scan = now + SCAN_INTERVAL;
-                    let long: Vec<(Arc<CompileReport>, u32)> = AT_WORK
+                    let long: Vec<(Arc<CompileReport>, u32, Duration)> = AT_WORK
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .iter()
-                        .filter(|w| w.1.elapsed() > hold.endless && !noted.contains(&w.0.name))
-                        .map(|w| (w.0.clone(), w.2))
+                        .map(|w| (w.0.clone(), w.2, w.1.elapsed()))
+                        .filter(|w| w.2 > from && !noted.contains(&w.0.name))
                         .collect();
+                    watched.retain(|w| long.iter().any(|l| w.is(&l.0, l.1)));
                     if long.is_empty() {
-                        late = None;
                         continue;
                     }
-                    let now = committed();
-                    let grown = now.saturating_sub(*late.get_or_insert(now)) > hold.growth;
-                    let short =
-                        hold.least_free > 0 && available_memory().is_some_and(|free| free < hold.least_free);
-                    let why = if grown {
-                        "the process grew"
-                    } else if short {
-                        "memory runs short"
-                    } else {
-                        "too long"
-                    };
-                    let long: Vec<(Arc<CompileReport>, u32)> = if grown || short {
-                        late = None;
-                        long
-                    } else {
-                        AT_WORK
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .iter()
-                            .filter(|w| w.1.elapsed() > hold.even_so && !noted.contains(&w.0.name))
-                            .map(|w| (w.0.clone(), w.2))
-                            .collect()
-                    };
-                    for (report, id) in long {
+                    let commit = committed();
+                    let free = if hold.least_free > 0 { available_memory() } else { None };
+                    for (report, id, busy) in long {
+                        let i = watched.iter().position(|w| w.is(&report, id)).unwrap_or_else(|| {
+                            watched.push(Watched::new(&report, id, commit));
+                            watched.len() - 1
+                        });
+                        let w = &mut watched[i];
+                        if busy > hold.endless {
+                            w.late.get_or_insert(commit);
+                        }
+                        let grown = commit.saturating_sub(w.seen);
+                        let grown_late = w.late.map_or(0, |late| commit.saturating_sub(late));
+                        let why = match verdict(&hold, busy, grown, grown_late, free) {
+                            Verdict::Work => continue,
+                            Verdict::NotItsShortage => {
+                                if !std::mem::replace(&mut w.told, true) {
+                                    tracing::warn!(
+                                        name = report.name.as_str(),
+                                        seconds = busy.as_secs(),
+                                        free_mib = free.unwrap_or(0) >> 20,
+                                        grown_mib = grown >> 20,
+                                        "memory runs short, but the process hardly grew while \
+                                         the driver made this pipeline: it goes on, not left out"
+                                    );
+                                }
+                                continue;
+                            }
+                            Verdict::Stop(why) => why,
+                        };
                         let stopped = suspend(id);
                         if stopped {
                             super::make::worker_lost(id);
@@ -722,6 +803,42 @@ mod tests {
         for bad in ["sixty", "60,-1", "1,2,3,4,5", "60,,8", "inf"] {
             assert_eq!(parse_hold(Some(bad)), None, "{bad}");
         }
+    }
+
+    /// The memory floor is watched from 20 s of work, and stops (and notes)
+    /// only a compile the process grew 1 GiB beside: one caught by a
+    /// shortage it did not cause (the title loading the world) goes on, at
+    /// 25 s or at 90 s. The other two rules are as they were.
+    #[test]
+    fn the_hold_lays_a_shortage_only_to_a_compile_that_grew() {
+        let s = Duration::from_secs;
+        let gib = |n: f64| (n * f64::from(1u32 << 30)) as u64;
+        let (short, plenty) = (Some(gib(1.5)), Some(gib(10.0)));
+        let v = |busy, grown, grown_late, free| verdict(&HOLD, s(busy), grown, grown_late, free);
+        // Not watched before 20 s, short or not.
+        assert_eq!(v(15, gib(4.0), 0, short), Verdict::Work);
+        // Short past 20 s: stopped if the process grew 1 GiB, else kept.
+        assert_eq!(v(25, gib(1.0), 0, short), Verdict::Stop("memory runs short"));
+        assert_eq!(v(25, gib(0.5), 0, short), Verdict::NotItsShortage);
+        assert_eq!(v(90, 0, 0, short), Verdict::NotItsShortage);
+        assert_eq!(v(90, gib(2.0), gib(1.0), short), Verdict::Stop("memory runs short"));
+        // Plenty free, or nothing known: only the growth and the time count.
+        assert_eq!(v(25, gib(4.0), 0, plenty), Verdict::Work);
+        assert_eq!(v(90, gib(9.0), gib(7.0), None), Verdict::Work);
+        assert_eq!(v(90, gib(9.0), gib(9.0), plenty), Verdict::Stop("the process grew"));
+        assert_eq!(v(55, gib(9.0), gib(9.0), plenty), Verdict::Work, "not past `endless`");
+        assert_eq!(v(301, 0, 0, plenty), Verdict::Stop("too long"));
+        assert_eq!(v(301, 0, 0, short), Verdict::Stop("too long"));
+        // The hold before upstream's 7263339 has no floor.
+        let before = parse_hold(Some("20,150,3,0")).unwrap();
+        let old = |busy, grown_late, free| verdict(&before, s(busy), gib(5.0), grown_late, free);
+        assert_eq!(old(25, gib(2.0), Some(0)), Verdict::Work);
+        assert_eq!(old(25, gib(4.0), Some(0)), Verdict::Stop("the process grew"));
+        assert_eq!(old(151, 0, plenty), Verdict::Stop("too long"));
+        // A first number below 20 s brings the floor's watch with it.
+        let soon = parse_hold(Some("5")).unwrap();
+        assert_eq!(verdict(&soon, s(6), gib(1.0), 0, short), Verdict::Stop("memory runs short"));
+        assert_eq!(verdict(&soon, s(4), gib(1.0), 0, short), Verdict::Work);
     }
 
     #[test]

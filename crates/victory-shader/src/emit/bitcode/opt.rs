@@ -1,6 +1,14 @@
-//! From the VIctory fork at commit ba8697aa (its `emit/bitcode/opt.rs`,
-//! GPL-3.0-or-later), adapted to this tree's module: local arrays and
-//! doubles, and no first-lane pass.
+//! From Belobug's fork, github.com/Belobug/VIctory-Belobug-AMD, at ae75a66
+//! (GPL-3.0-or-later), which adapted it to this tree's module: local arrays
+//! and doubles, joins of a register nothing writes, and no first-lane pass.
+//! That commit names its source "the VIctory fork at commit ba8697aa", a
+//! commit found in none of the clones of the related repositories at hand
+//! (Belobug's; avatarmanz/VIctory-7900XTX, whose 200a9cc says the same of
+//! its own copy; DexNom/VIctory; fxceless/victory-fork's history as
+//! gabrielcruzg3/victory-3060TI keeps it). The file itself is
+//! github.com/fxceless/victory-fork's, as its 1684989 ("Shader clean-up
+//! passes", 2026-11-24) made it and as it stayed there until after ae75a66:
+//! Belobug's copy differs from that one by the changes above only.
 //!
 //! Clean-up of a finished module before it is written: the lowering emits
 //! one instruction after another as the console code names them, and
