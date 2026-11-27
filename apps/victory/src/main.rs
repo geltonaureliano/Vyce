@@ -238,10 +238,14 @@ fn warm(paths: &[PathBuf], pipelines: Option<&std::path::Path>, jobs: Option<usi
         },
     );
     println!(
-        "{} translated, {} refused, {} pipelines made, {} refused by the host, {:.0} s",
+        "{} translated ({} from the shader cache, {} now), {} refused, {} pipelines made ({} compiled now, {} from the library), {} refused by the host, {:.0} s",
         warmed.translated,
+        warmed.from_cache,
+        warmed.translated_now,
         warmed.refused,
         warmed.pipelines,
+        warmed.compiled,
+        warmed.loaded,
         warmed.failed,
         started.elapsed().as_secs_f64()
     );

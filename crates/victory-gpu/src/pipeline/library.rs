@@ -696,7 +696,13 @@ pub(crate) fn save(now: bool) {
         }
     };
     let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    // Read first if this process has not read it: one that makes pipelines
+    // and draws with none (`victory warm`) writes the list back as it was,
+    // not empty.
+    let used: Vec<String> = {
+        let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
+        listed_or_read(&mut used, Some(dir)).iter().cloned().collect()
+    };
     let written = std::fs::create_dir_all(dir)
         .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
@@ -750,15 +756,24 @@ static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
     let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
     if used.is_none() {
-        let listed = DIR
-            .get()
-            .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
-            .unwrap_or_default();
-        let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
+        let set = listed_or_read(&mut used, DIR.get().map(PathBuf::as_path));
         tracing::info!(pipelines = set.len(), "title pipelines to start early");
-        *used = Some(set);
     }
     used
+}
+
+/// The early list `used` holds, read from `dir` first (empty without a
+/// list there) if it holds none yet.
+fn listed_or_read<'a>(
+    used: &'a mut Option<HashSet<String>>,
+    dir: Option<&std::path::Path>,
+) -> &'a HashSet<String> {
+    used.get_or_insert_with(|| {
+        let listed = dir
+            .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
+            .unwrap_or_default();
+        listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect()
+    })
 }
 
 /// Whether the title pipeline with `key` was drawn with in an earlier run.
@@ -876,6 +891,25 @@ mod tests {
         let soon = parse_hold(Some("5")).unwrap();
         assert_eq!(verdict(&soon, s(6), gib(1.0), 0, short), Verdict::StopThisRun("memory runs short"));
         assert_eq!(verdict(&soon, s(4), gib(1.0), 0, short), Verdict::Work);
+    }
+
+    /// A save in a process that never read the early list (`victory warm`
+    /// makes pipelines and draws with none) writes back the list on disk,
+    /// not an empty one; a list already read is the one written.
+    #[test]
+    fn a_save_keeps_an_early_list_it_never_read() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(EARLY_FILE), "aa\n\nbb\n").unwrap();
+        let mut never_read = None;
+        let mut keys: Vec<String> = listed_or_read(&mut never_read, Some(dir.path())).iter().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["aa", "bb"]);
+        assert!(never_read.is_some(), "read once, kept");
+        let mut read = Some(HashSet::from(["cc".to_owned()]));
+        assert_eq!(listed_or_read(&mut read, Some(dir.path())), &HashSet::from(["cc".to_owned()]));
+        let mut nothing = None;
+        assert!(listed_or_read(&mut nothing, Some(&dir.path().join("none"))).is_empty());
+        assert!(listed_or_read(&mut None, None).is_empty());
     }
 
     #[test]

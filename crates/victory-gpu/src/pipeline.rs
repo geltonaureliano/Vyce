@@ -508,6 +508,12 @@ pub struct Warmed {
     /// Compute pipelines in the library now, and those the host refused.
     pub pipelines: usize,
     pub failed: usize,
+    /// Translations found in the shader cache, and made now.
+    pub from_cache: u64,
+    pub translated_now: u64,
+    /// Host pipelines compiled now, and loaded from the library.
+    pub compiled: u64,
+    pub loaded: u64,
 }
 
 /// Translates the shader containers a run would meet into the shader cache
@@ -573,7 +579,11 @@ pub fn warm(
         }
     });
     library::save(true);
-    total.into_inner().unwrap_or_else(|e| e.into_inner())
+    let mut warmed = total.into_inner().unwrap_or_else(|e| e.into_inner());
+    (warmed.from_cache, warmed.translated_now) = crate::shader_cache::counts();
+    warmed.compiled = library::MADE.load(Ordering::Relaxed);
+    warmed.loaded = library::LOADED.load(Ordering::Relaxed);
+    warmed
 }
 
 /// Host pipelines queued and not made yet.
