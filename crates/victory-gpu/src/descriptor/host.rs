@@ -116,6 +116,17 @@ pub(crate) struct Run {
 /// under the same lock.
 const RUNS_A_LOCK: usize = 1024;
 
+/// Whether the search for free dynamic slots goes on past its cursor as
+/// far as a run that crosses it needs ([`HostHeap::take_dynamic`]).
+/// `VICTORY_SLOTS_ACROSS_CURSOR=0`: the walk stops at the cursor, as
+/// before, and misses such a run in both of its passes; it then also notes
+/// that no run of that size is free ([`Free::no_run`]), and tables of that
+/// size or larger are not made until slots come back.
+fn across_cursor() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SLOTS_ACROSS_CURSOR").is_none_or(|v| v != "0"))
+}
+
 struct StrideTable {
     _resource: ID3D12Resource,
     ptr: usize,
@@ -1151,8 +1162,14 @@ impl HostHeap {
         let clean = free.lent_count > 0
             && n < free.no_clean_run
             && (free.clean_misses.1 < WALKS || n < free.clean_misses.2);
-        // Search from `next` on, then from the start.
-        let starts = (free.next as usize..spare).chain(0..free.next as usize);
+        // Search from `next` on, then from the start and on past `next` by
+        // up to n - 1 slots, never past the last: a run that crosses the
+        // cursor ends there ([`across_cursor`]). Every run of n free slots
+        // is then in the walk, so a search that finds none notes it rightly
+        // below.
+        let next = free.next as usize;
+        let past = if next > 0 && across_cursor() { (next + n - 1).min(spare) } else { next };
+        let starts = (next..spare).chain(0..past);
         let (mut run, mut clean_run) = (0, 0);
         let (mut found, mut found_clean) = (None, None);
         let mut last = usize::MAX;
@@ -3915,6 +3932,99 @@ void main() {
         assert!(!heap.retake(&[e]));
         assert_eq!(heap.give_back(&[e], false), 0);
         assert_eq!(heap.lent(), 0);
+    }
+
+    /// The search for free dynamic slots finds a run that crosses its
+    /// cursor, in both of its passes (a run of free slots not lent, looked
+    /// for first, then a run of any free slots); runs still do not wrap
+    /// past the end, and from a cursor near the end the walk stops at the
+    /// last slot. After upstream's test of the same name (072fde0).
+    #[test]
+    fn dynamic_search_can_find_a_run_across_the_cursor() {
+        if !across_cursor() {
+            return; // VICTORY_SLOTS_ACROSS_CURSOR=0: the old search
+        }
+        // (`again`: past the frame's bound on failed walks, which other
+        // tests share.)
+        fn take(heap: &HostHeap, n: u32) -> Option<Run> {
+            let (first, tag) = heap.take_dynamic(n, true)?;
+            Some(Run { first, n, tag })
+        }
+        // A run's place among the dynamic slots.
+        fn at(heap: &HostHeap, run: Option<Run>) -> Option<u32> {
+            run.map(|r| r.first - heap.count())
+        }
+        let Some((heap, slots)) = HostHeap::capped_samplers() else {
+            return; // no host GPU
+        };
+        let first = take(&heap, 1).unwrap();
+        let left = take(&heap, 2).unwrap();
+        let right = take(&heap, 2).unwrap();
+        let rest = take(&heap, slots - 5).unwrap();
+        assert_eq!([first, left, right, rest].map(|r| at(&heap, Some(r))), [0, 1, 3, 5].map(Some));
+        // Taking the left pair again puts the cursor between the pairs.
+        heap.release(left.first, 2);
+        assert_eq!(at(&heap, take(&heap, 2)), Some(1));
+        heap.release(left.first, 2);
+        heap.release(right.first, 2);
+        assert_eq!(at(&heap, take(&heap, 4)), Some(1));
+        assert_eq!(take(&heap, 1), None);
+        // A free slot at each end is no run of two.
+        heap.release(first.first, 1);
+        heap.release(heap.count() + slots - 1, 1);
+        assert_eq!(take(&heap, 2), None);
+
+        // A cursor two slots before the end: the walk past it ends there.
+        let Some((heap, slots)) = HostHeap::capped_samplers() else {
+            return;
+        };
+        let most = take(&heap, slots - 4).unwrap();
+        let low = take(&heap, 2).unwrap();
+        let high = take(&heap, 2).unwrap();
+        assert_eq!([most, low, high].map(|r| at(&heap, Some(r))), [0, slots - 4, slots - 2].map(Some));
+        heap.release(low.first, 2);
+        assert_eq!(at(&heap, take(&heap, 2)), Some(slots - 4));
+        heap.release(low.first, 2);
+        heap.release(high.first, 2);
+        assert_eq!(at(&heap, take(&heap, 4)), Some(slots - 4));
+
+        // Lent slots after the cursor: the run of others that crosses it
+        // is taken, not the run that reaches into the lent ones, found
+        // first.
+        let Some((heap, slots)) = HostHeap::capped_samplers() else {
+            return;
+        };
+        let _first = take(&heap, 1).unwrap();
+        let left = take(&heap, 2).unwrap();
+        let right = take(&heap, 2).unwrap();
+        let lent = take(&heap, 4).unwrap();
+        let _rest = take(&heap, slots - 9).unwrap();
+        assert_eq!(heap.give_back(&[lent], true), 4);
+        heap.release(left.first, 2);
+        assert_eq!(at(&heap, take(&heap, 2)), Some(1));
+        heap.release(left.first, 2);
+        heap.release(right.first, 2);
+        assert_eq!(at(&heap, take(&heap, 4)), Some(1));
+        assert_eq!(heap.lent(), 4);
+        assert!(heap.retake(&[lent]));
+
+        // Lent slots before the cursor and no run of others that fits: the
+        // run of both that crosses it is taken.
+        let Some((heap, slots)) = HostHeap::capped_samplers() else {
+            return;
+        };
+        let _first = take(&heap, 1).unwrap();
+        let left = take(&heap, 2).unwrap();
+        let right = take(&heap, 2).unwrap();
+        let _rest = take(&heap, slots - 5).unwrap();
+        heap.release(left.first, 2);
+        let again = take(&heap, 2).unwrap();
+        assert_eq!(at(&heap, Some(again)), Some(1));
+        assert_eq!(heap.give_back(&[again], true), 2);
+        heap.release(right.first, 2);
+        assert_eq!(at(&heap, take(&heap, 4)), Some(1));
+        assert_eq!(heap.lent(), 0);
+        assert!(!heap.retake(&[again]));
     }
 
     /// A sampler heap within the limit has a slot per title slot and no

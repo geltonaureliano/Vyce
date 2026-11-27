@@ -259,6 +259,7 @@ Chaves de comparação do trabalho da CPU (todas ligadas por padrão; o valor
 | VYCE_SHARED_LOOKUPS=0 | As buscas de memória das gravações tomam a tabela só para si |
 | VICTORY_FREE_TABLES_AT_LANDING=0 | Os descritores dinâmicos das tabelas de uma lista só voltam quando o jogo reinicia ou solta a lista, sem empréstimo, espera nem nova tentativa quando faltam (hoje voltam quando a GPU termina a última submissão da lista, para as listas que o jogo usa uma vez por gravação) |
 | VICTORY_TABLE_RETRY_MS=0 | Uma tabela sem descritores dinâmicos livres é descartada na hora (hoje espera até 100 ms a submissão mais antiga em voo terminar e tenta de novo uma vez; outro número muda essa espera, no máximo 2000) |
+| VICTORY_SLOTS_ACROSS_CURSOR=0 | A busca de descritores dinâmicos livres para no ponto onde começou, como antes, e não acha uma faixa livre que passa por esse ponto; aí também anota que não há faixa daquele tamanho, e tabelas desse tamanho ou maiores deixam de ser feitas até algum descritor voltar (hoje a busca segue até n - 1 descritores depois desse ponto, nunca além do último, nas duas passadas: a dos livres não emprestados e a de quaisquer livres) |
 | VICTORY_NULL_COPY=0 | Uma cópia pedida pelo jogo à memcpy do VCRUNTIME140 a partir da página nula volta a encerrar o processo (hoje, só nesse caso estreito, o destino recebe zeros e a chamada volta; é a queda da missão do barco, aviso "a copy from the null page read as zeros") |
 
 Campos de VYCE_TELEMETRY desse trabalho (por quadro): gpu_idle_ms (GPU
