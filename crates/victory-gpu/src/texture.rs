@@ -195,6 +195,27 @@ pub(crate) fn rewritten(resource: usize) {
     }
 }
 
+/// Runs `write`, our own write into the memory of title texture `resource`
+/// of what shaders wrote into its host copy (`crate::texback`). A staging
+/// buffer of the texture that held what its memory held before is taken to
+/// hold it still: the host texture has those texels, and uploading them as
+/// the title's would put an older frame over what a later list's shaders
+/// wrote. A title write before ours is kept for the next upload.
+///
+/// shortcut: a title write that comes between the look before and ours is
+/// taken for ours.
+pub(crate) fn writing_back(resource: usize, write: impl FnOnce()) {
+    let staging = STAGING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|map| map.get(&resource).cloned());
+    match staging {
+        Some(s) => s.writing_back(write),
+        None => write(),
+    }
+}
+
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -399,6 +420,37 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         (size, true)
+    }
+
+    /// [`writing_back`] for this staging buffer. Its lock is held through
+    /// `write`, so no refresh reads the memory halfway.
+    fn writing_back(&self, write: impl FnOnce()) {
+        let size = self.layout.reach(self.skip) as usize;
+        let start = self.memory as usize;
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.not_watched.load(Ordering::Relaxed) {
+            // Never filled: its first refresh takes the memory anyway.
+            if last.asked == 0 {
+                return write();
+            }
+            let current = crate::watch::writes(start, start + size, false)
+                .is_some_and(|(_, written)| written.iter().all(|&(_, w)| w <= last.asked));
+            write();
+            // What the kernel finds written now is ours.
+            if current && let Some((now, _)) = crate::watch::writes(start, start + size, false) {
+                last.asked = now;
+            }
+            return;
+        }
+        // Memory that cannot be watched goes by its hash (none: never filled).
+        let Some(held) = last.hash else {
+            return write();
+        };
+        let current = hashed(self.memory, size) == Some(held);
+        write();
+        if current && let Some(now) = hashed(self.memory, size) {
+            last.hash = Some(now);
+        }
     }
 
     /// Records `CopyTextureRegion` for every subresource from this staging
@@ -613,6 +665,19 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
         p = info.BaseAddress as usize + info.RegionSize;
     }
     true
+}
+
+/// The hash of the `size` bytes of title memory at `memory`, if all of them
+/// read.
+fn hashed(memory: *const u8, size: usize) -> Option<blake3::Hash> {
+    SCRATCH.with_borrow_mut(|tiled| {
+        tiled.resize(size, 0);
+        let hash = read_complete(memory, &mut tiled[..size]).then(|| blake3::hash(&tiled[..size]));
+        if tiled.capacity() > 64 << 20 {
+            *tiled = Vec::new();
+        }
+        hash
+    })
 }
 
 /// Reads a complete staging image and retains the copy timing counters.
@@ -1239,6 +1304,48 @@ mod tests {
         assert_eq!(staging.gpu_uploads(), 2);
 
         // SAFETY: freeing our own allocation.
+        unsafe { VirtualFree(raw.cast(), 0, MEM_RELEASE) };
+    }
+
+    /// Our own write of what shaders wrote into a texture's memory
+    /// (`crate::texback`) is not taken for the title's: its staging buffer
+    /// stays clean. A title write after ours, or before it, still uploads.
+    #[test]
+    fn our_write_back_is_not_taken_for_the_titles() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let Some(host) = Host::new_warp() else {
+            return;
+        };
+        let (copy, tex) = make_rgba_texture(&host, 4, 4);
+        let layout = tex.planes[0].layout.clone();
+        let size = (layout.size as usize).max(crate::watch::PAGE);
+        let kind = MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH;
+        // SAFETY: a private write-watched allocation, freed before returning.
+        let raw = unsafe { VirtualAlloc(std::ptr::null(), size, kind, PAGE_READWRITE) } as *mut u8;
+        assert!(!raw.is_null());
+        // SAFETY: committed read-write memory of `size` bytes.
+        let write = |at: usize, value: u8| unsafe { raw.add(at).write_volatile(value) };
+        // SAFETY: as above.
+        let memory = unsafe { std::slice::from_raw_parts_mut(raw, layout.size as usize) };
+        fill_linear_rgba(&layout, memory, [1, 2, 3, 4]);
+        let staging =
+            create_staging(&host, None, std::ptr::null(), &copy.texture, layout.clone(), raw, &copy)
+                .expect("create staging");
+        assert!(staging.refresh(), "a first use uploads");
+        assert!(!staging.refresh());
+        staging.writing_back(|| write(0, 0x11));
+        assert!(!staging.refresh(), "our own write taken for the title's");
+        write(1, 0x22);
+        assert!(staging.refresh(), "a title write after ours");
+        assert!(!staging.refresh());
+        write(2, 0x33);
+        staging.writing_back(|| write(3, 0x44));
+        assert!(staging.refresh(), "a title write before ours was lost");
+        assert!(!staging.refresh());
+        // SAFETY: our own allocation.
         unsafe { VirtualFree(raw.cast(), 0, MEM_RELEASE) };
     }
 

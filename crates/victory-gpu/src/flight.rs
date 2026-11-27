@@ -1,7 +1,8 @@
 //! Submissions sent to the host GPU and not waited for ("flights"), in the
 //! order they were sent, and what is left to do once each has run (its
 //! landing): what its shaders wrote goes back into title memory, then its
-//! read-backs, then its bottom-of-pipe writes, then the dynamic descriptor
+//! read-backs, then the textures its shaders wrote that the title reads
+//! (`crate::texback`), then its bottom-of-pipe writes, then the dynamic descriptor
 //! slots of its lists that no other submission runs
 //! (`crate::host::HostList::landed`), then what the title's queues put
 //! behind it (fence signals).
@@ -87,6 +88,10 @@ pub(crate) struct Flight {
     pub(crate) lists: Vec<Arc<HostList>>,
     /// The ranges its shaders write.
     pub(crate) back: Vec<Range>,
+    /// The textures its shaders write that go back into title memory
+    /// (`crate::texback`), in its lists' order; [`crate::texback::Back::range`]
+    /// is the title memory each may write.
+    pub(crate) textures: Vec<Arc<crate::texback::Back>>,
     pub(crate) writes: Vec<Write>,
     /// What takes the host GPU's time around it.
     pub(crate) timed: Option<Pair>,
@@ -108,6 +113,7 @@ impl Flight {
             submission,
             lists,
             back: Vec::new(),
+            textures: Vec::new(),
             writes: Vec::new(),
             timed: None,
             sent: Instant::now(),
@@ -458,7 +464,7 @@ impl Line {
                 clock.ran(pair);
             }
             crate::host::ran(runs.len(), took);
-            crate::host::finish(&self.queue, &runs, &flight.back, &flight.writes);
+            crate::host::finish(&self.queue, &runs, &flight.back, &flight.textures, &flight.writes);
             // The dynamic descriptor slots of lists no other submission
             // runs come back, before the title is told.
             for list in &runs {

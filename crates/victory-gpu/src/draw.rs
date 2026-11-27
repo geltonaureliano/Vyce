@@ -2220,6 +2220,9 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, writes: bool) {
                 crate::twin::note(*resource as This, desc.as_ref());
                 return;
             }
+            // A texture the title also reads on the CPU is copied before the
+            // shaders may write it and when the list closes (`crate::texback`).
+            list.texture_written(*resource as This);
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
         }
         _ => {}
