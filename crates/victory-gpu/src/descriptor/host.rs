@@ -67,6 +67,12 @@ pub(crate) struct HostHeap {
     memory_seen: Mutex<u64>,
     /// Which heap it is ([`super::wait_for`]).
     number: u64,
+    /// Slots that go on showing a texture whose memory went away
+    /// ([`HostHeap::stays_away`]): the record they were made from, and when
+    /// that was first found ([`crate::resource::now_ms`]); and whether there
+    /// are any.
+    away: Mutex<HashMap<u32, (u64, u64)>>,
+    any_away: std::sync::atomic::AtomicBool,
 }
 
 /// The dword of the stride table the element counts start at.
@@ -206,8 +212,11 @@ struct Bindless {
     /// texture (held, so its address names it alone) and the frame last
     /// uploaded.
     uploaded: HashMap<usize, (ID3D12Resource, u64)>,
-    /// Uploaded textures by frame, oldest first, to look at again.
+    /// Uploaded textures by frame, oldest first, to look at again
+    /// (`VICTORY_HEAP_RECHECK=0`).
     recheck: VecDeque<(u64, usize)>,
+    /// The looks to come at uploaded textures ([`ladder_on`]).
+    looks: Looks,
     /// A frame and the uploads of known textures done in it.
     rechecks: (u64, u32),
     /// When the slot-making budget was last refilled, and the microseconds
@@ -346,6 +355,107 @@ fn recheck_cost(bytes: u64) -> u32 {
     let by_size = *BY_SIZE
         .get_or_init(|| std::env::var_os("VICTORY_TEXTURE_RECHECK").is_none_or(|v| v != "0"));
     1 + if by_size { (bytes / RECHECK_BYTES) as u32 } else { 0 }
+}
+
+/// Whether each placed texture reached through slots is looked at again on
+/// a ladder of its own after its upload ([`LADDER`], [`Looks`]) instead of
+/// [`RECHECKS`] a frame from one line every [`RECHECK_FRAMES`]
+/// (`VICTORY_HEAP_RECHECK=0`: as before). The title often fills a
+/// texture's memory only after it wrote the view (its streaming reads land
+/// later), with no descriptor write and nothing from the runtime to tell of
+/// it; behind thousands of others in the line, the host copy showed what the
+/// memory held at the first look for minutes: without the ladder fxceless
+/// saw a black face and pale hair in three launches of four.
+///
+/// From github.com/fxceless/victory-fork (a803c87) and
+/// github.com/avatarmanz/VIctory-7900XTX (7130d52).
+fn ladder_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK").is_none_or(|v| v != "0"))
+}
+
+/// Whether a texture a look found changed is looked at again in the next
+/// frame (`VICTORY_RECHECK_SOON=0`: after the ladder's first step): those
+/// the title paints all the time showed each change a step late.
+fn recheck_soon() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_SOON").is_none_or(|v| v != "0"))
+}
+
+/// Frames after an upload at which a texture's memory is looked at again,
+/// each counted from the look before; a look that finds it changed uploads
+/// it again and starts over.
+const LADDER: [u64; 5] = [4, 12, 40, 120, 400];
+
+/// Looks of [`LADDER`] a frame at most (each reads up to 48 KiB of title
+/// memory); those left are the first of the next frame.
+const LOOKS: usize = 192;
+
+/// Looks done since the start: that found a texture as it was, and changed.
+pub(crate) static LOOKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// A look to come at a texture ([`Looks`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Look {
+    /// Its step of [`LADDER`].
+    step: u8,
+    /// Where its memory is, and its fingerprint at the upload
+    /// ([`crate::texture::fingerprint`]).
+    at: u64,
+    len: u64,
+    print: u64,
+}
+
+/// The looks to come at the textures a heap's slots reached, by the frame
+/// they are due in.
+#[derive(Default)]
+struct Looks {
+    due: BTreeMap<(u64, usize), Look>,
+    of: HashMap<usize, u64>,
+}
+
+impl Looks {
+    /// Texture `texture` is looked at in frame `frame` (instead of when it
+    /// was to be).
+    fn plan(&mut self, texture: usize, frame: u64, look: Look) {
+        self.forget(texture);
+        self.due.insert((frame, texture), look);
+        self.of.insert(texture, frame);
+    }
+
+    fn forget(&mut self, texture: usize) {
+        if let Some(frame) = self.of.remove(&texture) {
+            self.due.remove(&(frame, texture));
+        }
+    }
+
+    /// Up to `most` looks due by `frame`, taken out.
+    fn take(&mut self, frame: u64, most: usize) -> Vec<(usize, Look)> {
+        let mut taken = Vec::new();
+        while taken.len() < most
+            && let Some((&(at, texture), _)) = self.due.first_key_value()
+            && at <= frame
+        {
+            let look = self.due.remove(&(at, texture)).unwrap_or(Look { step: 0, at: 0, len: 0, print: 0 });
+            self.of.remove(&texture);
+            taken.push((texture, look));
+        }
+        taken
+    }
+
+    /// The first frame a look is due in.
+    fn next(&self) -> u64 {
+        self.due.first_key_value().map_or(u64::MAX, |(&(at, _), _)| at)
+    }
+
+    fn retain(&mut self, live: &std::collections::HashSet<usize>) {
+        self.due.retain(|(_, t), _| live.contains(t));
+        self.of.retain(|t, _| live.contains(t));
+    }
+
+    fn len(&self) -> usize {
+        self.due.len()
+    }
 }
 
 /// Bumped when views go stale (a resource was released): their views'
@@ -907,6 +1017,8 @@ impl HostHeap {
             recheck_at: AtomicU64::new(u64::MAX),
             rewrites_seen: AtomicU64::new(0),
             memory_seen: Mutex::new(0),
+            away: Mutex::default(),
+            any_away: std::sync::atomic::AtomicBool::new(false),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1267,6 +1379,12 @@ impl HostHeap {
         resource: Option<ID3D12Resource>,
         texture: Option<Arc<crate::resource::HostTexture>>,
     ) {
+        // Made otherwise: no longer one that stays shown.
+        if self.any_away.load(Ordering::Acquire) {
+            let mut away = self.away.lock().unwrap_or_else(|e| e.into_inner());
+            away.remove(&index);
+            self.any_away.store(!away.is_empty(), Ordering::Release);
+        }
         // A running submission may still read the old resource through
         // this slot; it is retired outside the lock.
         let old = {
@@ -1385,6 +1503,16 @@ impl HostHeap {
         if for_draw && let Some(texture) = waiting.take() {
             let _ = crate::resource::host_copy(texture as crate::object::This);
         }
+        // So is a target of the title's that a placed view a draw reads is
+        // of, if the slot is to be made.
+        if for_draw
+            && matches!(&view, View::Placed(false, r, _) if r[0] != 1)
+            && self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] != key
+            && let Some(View::Shader(texture, _)) = placed_texture(&view)
+            && crate::resource::waits(texture as crate::object::This)
+        {
+            let _ = crate::resource::host_copy(texture as crate::object::This);
+        }
         {
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             let gone = is_buf
@@ -1396,8 +1524,18 @@ impl HostHeap {
                     .get(index as usize)
                     .and_then(Option::as_ref)
                     .is_some_and(crate::shadow::gone);
-            if made[index as usize] != key || gone {
-                let later = !for_draw && is_buf || waiting.is_some();
+            let later = !for_draw && is_buf || waiting.is_some();
+            // A slot that shows a texture another view of the same, or one
+            // that can stand for it, is written with goes on showing it until
+            // the submission's plan makes the new one and uploads what it
+            // shows before its lists run ([`HostHeap::keeps_shown`]). Made
+            // null here, it read as nothing for as long as it waited, every
+            // time a streamed texture got sharper.
+            let kept_shown = later
+                && !gone
+                && made[index as usize] != key
+                && self.keeps_shown(made[index as usize], index, &view);
+            if made[index as usize] != key && !kept_shown || gone {
                 made[index as usize] = if later { 0 } else { key };
                 let kept = if later {
                     None
@@ -1492,6 +1630,76 @@ impl HostHeap {
             null_for(view, self.cpu(index));
         }
         self.keep(index, None);
+    }
+
+    /// Whether slot `index`, made from record `shown` (0: none), goes on
+    /// showing what it shows although the title wrote `view` into it: it
+    /// shows a texture, and the one `view` shows may be stood for by it
+    /// ([`Kin`], `VICTORY_KEEP_SHOWN`). Under the slots' lock (`made`).
+    fn keeps_shown(&self, shown: u64, index: u32, view: &View) -> bool {
+        let keep = keep_shown();
+        if keep == 0 || shown == 0 || self.sampler || !is_texture_view(view) {
+            return false;
+        }
+        let showing = self
+            .kept
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)
+            .is_some_and(Option::is_some);
+        if !showing {
+            return false;
+        }
+        let Some(old) = view_at(shown as u32, (shown >> 32) as u32) else {
+            return false;
+        };
+        let kin = kin(&old, view);
+        let kept = kin.kept(keep);
+        SHOWN_KEPT[kin as usize].fetch_add(u64::from(kept), Ordering::Relaxed);
+        kept
+    }
+
+    /// Whether slot `index`, which is to show `view` (record `key`) and
+    /// cannot yet (its memory is not there, or its texture not made), goes on
+    /// showing what it shows: a texture that may stand for it, for
+    /// [`away_ms`] from when it was first found so. A title that moves a
+    /// streamed texture unmaps it before it maps it again: faces, books,
+    /// posters and sleeves went black for 0.3 to 2 s on the fork.
+    ///
+    /// From github.com/avatarmanz/VIctory-7900XTX (descriptor/host.rs
+    /// `texture_slot_gone`, 1f1a433).
+    fn stays_away(&self, index: u32, view: &View, key: u64) -> bool {
+        let wait = away_ms();
+        if wait == 0 || self.sampler {
+            return false;
+        }
+        let shown = self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize];
+        if shown == 0 {
+            return false;
+        }
+        // Its own view whose memory went, or another that it may stand for.
+        if shown != key {
+            if !self.keeps_shown(shown, index, view) {
+                return false;
+            }
+        } else if self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize].is_none() {
+            return false;
+        }
+        let now = crate::resource::now_ms();
+        let mut away = self.away.lock().unwrap_or_else(|e| e.into_inner());
+        let stays = match away.get(&index) {
+            Some(&(was, since)) if was == shown => now.saturating_sub(since) < wait,
+            _ => {
+                away.insert(index, (shown, now));
+                true
+            }
+        };
+        if !stays {
+            away.remove(&index);
+        }
+        self.any_away.store(!away.is_empty(), Ordering::Release);
+        AWAY[usize::from(!stays)].fetch_add(1, Ordering::Relaxed);
+        stays
     }
 
     fn ensure_placed_slot(
@@ -1704,7 +1912,7 @@ impl HostHeap {
         // Asked before taking the heap's lock: the placed textures' lock is
         // taken first where both are held.
         let live = evictions.then(crate::resource::placed_live);
-        let (todo, due) = {
+        let (todo, mut due, looks) = {
             // The submission may hold the heap's lock for a while: the work
             // waits for a later draw rather than this one waiting.
             let mut b = match self.bindless.try_lock() {
@@ -1715,6 +1923,7 @@ impl HostHeap {
             let b = &mut *b;
             if let Some(live) = &live {
                 b.uploaded.retain(|t, _| live.contains(t));
+                b.looks.retain(live);
                 for (&slot, &(_, t)) in &b.recorded {
                     if !live.contains(&t) {
                         b.record_pending.insert(slot);
@@ -1754,14 +1963,14 @@ impl HostHeap {
                 b.recheck.pop_front();
                 due.push(t as crate::object::This);
             }
-            self.recheck_at.store(
-                b.recheck.front().map_or(u64::MAX, |&(f, _)| f + RECHECK_FRAMES),
-                Ordering::Release,
-            );
+            let looks = b.looks.take(frame, LOOKS);
+            self.recheck_at.store(self.next_recheck(b), Ordering::Release);
             self.record_hint
                 .store(!b.record_pending.is_empty(), Ordering::Release);
-            (todo, due)
+            (todo, due, looks)
         };
+        let soon = self.look_again(looks, frame);
+        due.extend(soon.iter().map(|&t| t as crate::object::This));
         if todo.is_empty() && due.is_empty() {
             return;
         }
@@ -1792,6 +2001,8 @@ impl HostHeap {
         }
         over.extend(todo.map(|(i, _)| i));
         reached.extend(due);
+        let ladder = ladder_on() && crate::resource::textures() == crate::resource::Textures::Stream;
+        let mut planned = Vec::new();
         for texture in reached {
             // The texture may be evicted meanwhile: a reference keeps it.
             let Some(_held) = crate::resource::hold_placed(texture) else {
@@ -1806,9 +2017,24 @@ impl HostHeap {
             {
                 crate::texture::upload_first(texture, host_tex);
                 crate::texture::upload(list, texture, host_tex);
+                // Looked at again from the memory as it is now: what the
+                // title writes after this is newer than what the upload
+                // reads at submission, never older.
+                if ladder && let Some((at, len)) = crate::resource::held_memory(texture) {
+                    let print = crate::texture::fingerprint(at, len);
+                    let wait = if soon.contains(&(texture as usize)) && recheck_soon() { 1 } else { LADDER[0] };
+                    planned.push((texture as usize, frame + wait, Look { step: 0, at, len, print }));
+                }
             }
             const SHADER_RESOURCE: u32 = 0x40 | 0x80;
             crate::list::ensure_state(list, texture, SHADER_RESOURCE);
+        }
+        if !planned.is_empty() {
+            let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+            for (texture, at, look) in planned {
+                b.looks.plan(texture, at, look);
+            }
+            self.recheck_at.store(self.next_recheck(&b), Ordering::Release);
         }
         {
             let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
@@ -1851,22 +2077,45 @@ impl HostHeap {
             self.set_unmapped_null(index, &view);
             return Ok(None);
         }
+        let key = u64::from(generation) << 32 | u64::from(vi);
+        // A slot that goes on showing what it shows is made anew by the
+        // submission's plan, with nothing running and the upload of what it
+        // is to show before the submission's lists: here lists in flight
+        // would read a texture whose upload comes later ([`keep_shown`]).
+        let shown = self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize];
+        let kept = shown != 0 && keep_shown() > 0 && self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize].is_some();
+        if kept && shown != key && self.keeps_shown(shown, index, &view) {
+            return Ok(None);
+        }
         let Some(shader_view @ View::Shader(tex_res, _)) = placed_texture(&view) else {
-            self.set_unmapped_null(index, &view);
+            if !kept {
+                self.set_unmapped_null(index, &view);
+            }
             return Ok(None);
         };
         let tex_this = tex_res as crate::object::This;
         if crate::resource::waits(tex_this) {
             // A texture of the title's nothing has used yet.
-            self.set_unmapped_null(index, &view);
+            if !kept {
+                self.set_unmapped_null(index, &view);
+            }
             super::wait_for(tex_res, self.number, index);
             return Ok(None);
         }
         let Some(host_tex) = crate::resource::host_resource(tex_this) else {
-            self.set_unmapped_null(index, &view);
+            if !kept {
+                self.set_unmapped_null(index, &view);
+            }
             return Ok(None);
         };
-        let key = u64::from(generation) << 32 | u64::from(vi);
+        // Made again since (a better copy, or after its memory went): the
+        // plan shows that one.
+        let same = self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize]
+            .as_ref()
+            .is_some_and(|k| k.as_raw() == host_tex.as_raw());
+        if kept && !same {
+            return Ok(None);
+        }
         self.ensure_placed_slot(index, key, &shader_view, host_tex.as_raw());
         Ok(Some(tex_this))
     }
@@ -1885,6 +2134,9 @@ impl HostHeap {
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
         let b = &mut *b;
         let mode = crate::resource::textures();
+        // Looked at again on a ladder of their own (the caller plans it), or
+        // from the line.
+        let ladder = ladder_on() && mode == crate::resource::Textures::Stream;
         let due = match b.uploaded.get(&(texture as usize)) {
             None => true,
             Some((h, _)) if mode == crate::resource::Textures::Keep && h.as_raw() == host.as_raw() => false,
@@ -1898,7 +2150,7 @@ impl HostHeap {
                 let (before, last) = (b.rechecks.1, *last);
                 b.rechecks.1 += recheck_cost(bytes);
                 let room = before == 0 || b.rechecks.1 <= RECHECKS;
-                if !room {
+                if !room && !ladder {
                     // Next frame, first.
                     b.recheck.push_front((last, texture as usize));
                     self.recheck_at.store(last + RECHECK_FRAMES, Ordering::Release);
@@ -1910,13 +2162,66 @@ impl HostHeap {
         if due {
             b.uploaded
                 .insert(texture as usize, (host.clone(), frame));
-            b.recheck.push_back((frame, texture as usize));
-            self.recheck_at.store(
-                b.recheck.front().map_or(u64::MAX, |&(f, _)| f + RECHECK_FRAMES),
-                Ordering::Release,
-            );
+            if !ladder {
+                b.recheck.push_back((frame, texture as usize));
+            }
+            self.recheck_at.store(self.next_recheck(b), Ordering::Release);
         }
         due
+    }
+
+    /// The first frame something is to be looked at again in.
+    fn next_recheck(&self, b: &Bindless) -> u64 {
+        let line = b.recheck.front().map_or(u64::MAX, |&(f, _)| f + RECHECK_FRAMES);
+        line.min(b.looks.next())
+    }
+
+    /// The looks of [`LADDER`] due in `frame`: a texture found as it was is
+    /// looked at again at the next step (none after the last), one found
+    /// changed is to be uploaded again, as one reached for the first time:
+    /// those are returned. Outside the heap's lock while memory is read.
+    fn look_again(&self, looks: Vec<(usize, Look)>, frame: u64) -> std::collections::HashSet<usize> {
+        let mut changed = std::collections::HashSet::new();
+        if looks.is_empty() {
+            return changed;
+        }
+        let mut again = Vec::with_capacity(looks.len());
+        for (texture, look) in looks {
+            // Write-watched memory says exactly; other memory by its print.
+            let same = match crate::texture::written_since_upload(texture as crate::object::This) {
+                Some(written) => !written,
+                None => crate::texture::fingerprint(look.at, look.len) == look.print,
+            };
+            if same {
+                LOOKED[0].fetch_add(1, Ordering::Relaxed);
+                let step = usize::from(look.step) + 1;
+                if let Some(&wait) = LADDER.get(step) {
+                    again.push((texture, frame + wait, Look { step: step as u8, ..look }));
+                }
+                continue;
+            }
+            let n = LOOKED[1].fetch_add(1, Ordering::Relaxed);
+            if n < 64 || n.is_multiple_of(1000) {
+                tracing::debug!(
+                    texture = format_args!("{texture:#x}"),
+                    address = format_args!("{:#x}", look.at),
+                    bytes = look.len,
+                    step = look.step,
+                    changed = n + 1,
+                    "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
+                );
+            }
+            changed.insert(texture);
+        }
+        let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+        for (texture, at, look) in again {
+            b.looks.plan(texture, at, look);
+        }
+        for texture in &changed {
+            b.uploaded.remove(texture);
+        }
+        self.recheck_at.store(self.next_recheck(&b), Ordering::Release);
+        changed
     }
 
     /// At submission: what the heap's bindless slots need. Only slots
@@ -2347,8 +2652,14 @@ impl HostHeap {
                 if let Some(View::Shader(tex_res, _)) = shown
                     && crate::resource::waits(tex_res as crate::object::This)
                 {
-                    // A texture of the title's nothing has used yet.
-                    self.set_unmapped_null(index, &view);
+                    // A texture of the title's nothing has used yet. (One
+                    // that stands for it meanwhile is looked at again.)
+                    if self.stays_away(index, &view, key) {
+                        slot.unmapped = true;
+                        slot.at = (address, address + (4 << 20));
+                    } else {
+                        self.set_unmapped_null(index, &view);
+                    }
                     super::wait_for(tex_res, self.number, index);
                     slot.placed = Some(tex_res);
                 } else if let Some(shader_view @ View::Shader(tex_res, _)) = shown
@@ -2367,7 +2678,10 @@ impl HostHeap {
                         slot.at = (address, address + (4 << 20));
                     }
                 } else {
-                    self.set_unmapped_null(index, &view);
+                    // What it showed stands for it a while ([`HostHeap::stays_away`]).
+                    if !self.stays_away(index, &view, key) {
+                        self.set_unmapped_null(index, &view);
+                    }
                     // Its pages may come later.
                     slot.unmapped = true;
                     slot.at = (address, address + (4 << 20));
@@ -3221,6 +3535,138 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     let texture = crate::resource::texture_at(address, resource, largest_mip(resource, desc))?;
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
 }
+
+/// Whether `view` shows a texture: a placed one, or a texture object's.
+fn is_texture_view(view: &View) -> bool {
+    match view {
+        View::Placed(false, resource, _) => resource[0] != 1,
+        View::Shader(r, _) => crate::resource::buffer_bytes(*r as crate::object::This).is_none(),
+        _ => false,
+    }
+}
+
+/// Whether two views of memory are of the same placed texture (address and
+/// description; words 1 and 13 are the description's filler).
+fn same_placed_texture(a: &View, b: &View) -> bool {
+    match (a, b) {
+        (View::Placed(false, resource, desc), View::Placed(false, other, other_desc)) => {
+            resource[0] != 1
+                && resource[0] == other[0]
+                && resource[2..13] == other[2..13]
+                && desc[10..12] == other_desc[10..12]
+        }
+        _ => false,
+    }
+}
+
+/// What the texture view a slot is written with has to do with the one it
+/// shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kin {
+    /// A view of the same placed texture.
+    Same = 0,
+    /// A texture of the same description placed elsewhere (moved, or one of
+    /// its kind).
+    Moved = 1,
+    /// One of the same format and shape in another size: the same texture
+    /// with more or fewer mips, as a title streams it.
+    Sized = 2,
+    /// A view of the same dimension, of another texture.
+    Other = 3,
+    /// A view no shader that reads the one can read.
+    None = 4,
+}
+
+impl Kin {
+    /// Whether the slot goes on showing what it shows, by [`keep_shown`].
+    fn kept(self, keep: u8) -> bool {
+        match self {
+            Kin::Same => true,
+            Kin::Moved | Kin::Sized => keep >= 1,
+            Kin::Other => keep >= 2,
+            Kin::None => false,
+        }
+    }
+}
+
+/// [`Kin`] of the view `old`, which a slot shows, and `new`.
+fn kin(old: &View, new: &View) -> Kin {
+    if same_placed_texture(old, new) {
+        return Kin::Same;
+    }
+    if let (View::Placed(false, a, from), View::Placed(false, b, to)) = (old, new) {
+        if a[0] == 1 || b[0] == 1 || from[1] != to[1] {
+            return Kin::None;
+        }
+        // (Width, 64 bits, height, depth and mips, format: words 4 to 8.)
+        if a[0] == b[0] && a[2..13] == b[2..13] {
+            return Kin::Moved;
+        }
+        let (wide, high) = ([a[4], b[4]].map(u64::from), [a[6], b[6]].map(u64::from));
+        return if from[0] == to[0] && a[0] == b[0] && wide[0] * high[1] == wide[1] * high[0] {
+            Kin::Sized
+        } else {
+            Kin::Other
+        };
+    }
+    let dimension = |view: &View| match view {
+        View::Placed(false, resource, desc) if resource[0] != 1 => desc[1],
+        View::Shader(r, Some(desc)) if crate::resource::buffer_bytes(*r as crate::object::This).is_none() => {
+            desc[1]
+        }
+        _ => 0,
+    };
+    match (dimension(old), dimension(new)) {
+        (0, _) | (_, 0) => Kin::None,
+        (a, b) if a == b => Kin::Other,
+        _ => Kin::None,
+    }
+}
+
+/// Whether a slot that shows a texture and is written with a view of
+/// another goes on showing the one it shows until the new one is made and
+/// its upload has run (`VICTORY_KEEP_SHOWN`): 0: never, it reads as zeros
+/// meanwhile, as before; 1 (by default): one of the same kind in another
+/// place or size; 2: any of the same dimension.
+///
+/// From github.com/avatarmanz/VIctory-7900XTX (descriptor/host.rs `Kin`,
+/// `keep_shown`, d1c412c).
+fn keep_shown() -> u8 {
+    static KEEP: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *KEEP.get_or_init(|| {
+        let set = std::env::var("VICTORY_KEEP_SHOWN").ok();
+        set.and_then(|v| v.trim().parse::<u8>().ok()).map_or(1, |k| k.min(2))
+    })
+}
+
+/// How long a slot whose texture's memory went away goes on showing it, in
+/// milliseconds (`VICTORY_TEXTURE_AWAY_MS`, 3000; 0: null at once, as
+/// before).
+fn away_ms() -> u64 {
+    #[cfg(test)]
+    if let Some(ms) = AWAY_IN_TEST.get() {
+        return ms;
+    }
+    static WAIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *WAIT.get_or_init(|| {
+        let set = std::env::var("VICTORY_TEXTURE_AWAY_MS").ok();
+        set.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(3000)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`away_ms`] in this test.
+    static AWAY_IN_TEST: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Slots written with another texture's view that kept showing theirs, by
+/// [`Kin`], since the start.
+pub(crate) static SHOWN_KEPT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Looks at slots whose texture is away: that kept showing it, and that
+/// made it null after [`away_ms`].
+pub(crate) static AWAY: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 /// A null view of the kind `view` is, for a slot whose view the host
 /// cannot make: unordered access (to a buffer or a 2D texture) or a shader
@@ -4318,9 +4764,14 @@ void main(uint3 id : SV_DispatchThreadID) {
         let again: Vec<bool> =
             large.iter().map(|&t| heap.upload_due(t, &a, bytes, frame)).collect();
         assert_eq!(again, [true, false, false, false]);
+        // (On the ladder each texture has looks of its own: none in the line.)
         let b = heap.bindless.lock().unwrap();
-        assert_eq!(b.recheck.len(), waiting + 1 + 3, "the looks refused are kept");
-        assert!(b.recheck.iter().take(3).all(|r| large[1..].contains(&(r.1 as This))));
+        if ladder_on() {
+            assert_eq!(b.recheck.len(), waiting);
+        } else {
+            assert_eq!(b.recheck.len(), waiting + 1 + 3, "the looks refused are kept");
+            assert!(b.recheck.iter().take(3).all(|r| large[1..].contains(&(r.1 as This))));
+        }
         drop(b);
         let huge = 100 * bytes;
         assert!(heap.upload_due(large[1], &a, huge, frame + 1), "the first of a frame always");
@@ -4598,6 +5049,189 @@ void main() { out_.Store4(0, asuint(seen.Load(int3(700, 300, 0)))); }
         assert_eq!(shown(), Some(1024));
         crate::watch::title_memory_remapped(address as usize, 8 << 20);
         caps(0);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(title_heap), 0);
+    }
+
+    /// RGBA8, 64x64, one mip, linear, as description words.
+    const SMALL: [u32; 14] = [3, 0, 0, 0, 64, 0, 64, 0x0001_0001, 28, 1, 0, 0x100, 0, 0];
+
+    /// A shader view of `dimension` of the texture placed at `at`.
+    fn placed_view(at: u64, dimension: u32) -> [u32; 16] {
+        let mut view = [0u32; 16];
+        view[..6].copy_from_slice(&[28, dimension, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, 0, 0, 1]);
+        view[10] = at as u32;
+        view[11] = (at >> 32) as u32;
+        view
+    }
+
+    /// What host slot `index` of `heap` shows, as the host texture's address.
+    fn shows(heap: &HostHeap, index: usize) -> Option<usize> {
+        let kept = heap.kept.lock().unwrap();
+        kept[index].as_ref().map(|k| windows::core::Interface::as_raw(k) as usize)
+    }
+
+    /// The host texture made for the copy of `desc` placed at `at`.
+    fn placed_host(at: u64, desc: &[u32; 14]) -> Option<usize> {
+        let texture = crate::resource::texture_at(at, desc, 0)?;
+        crate::resource::made_resource(texture).map(|t| windows::core::Interface::as_raw(t) as usize)
+    }
+
+    /// A slot that shows a texture goes on showing it when the title writes
+    /// a view of one of its kind elsewhere into it, until the submission's
+    /// plan makes the new one (not at recording); a view no shader that reads
+    /// it can read makes it null at once.
+    #[test]
+    fn a_slot_shows_its_texture_until_the_plan_makes_the_new_one() {
+        let Some(host) = host().filter(|_| keep_shown() > 0) else {
+            return; // no host GPU, or `VICTORY_KEEP_SHOWN=0`
+        };
+        let null = std::ptr::null();
+        let memory = crate::resource::Memory::zeroed(1 << 20, 64 << 10).unwrap();
+        let (a, b) = (memory.address(), memory.address() + (512 << 10));
+        let (title_heap, start) = make_shader_heap(4);
+        let host_heap = heap(title_heap).host_arc().unwrap();
+        create_placed_srv(null, &SMALL, &placed_view(a, 4), start + 32);
+        assert_eq!(shows(&host_heap, 1), None, "made by the plan");
+        host_heap.bindless_plan();
+        assert!(shows(&host_heap, 1).is_some() && shows(&host_heap, 1) == placed_host(a, &SMALL));
+        let moved = SHOWN_KEPT[Kin::Moved as usize].load(Ordering::Relaxed);
+        create_placed_srv(null, &SMALL, &placed_view(b, 4), start + 32);
+        assert_eq!(shows(&host_heap, 1), placed_host(a, &SMALL), "kept");
+        assert!(SHOWN_KEPT[Kin::Moved as usize].load(Ordering::Relaxed) > moved);
+        // Lists in flight would read the new one before its upload.
+        let list = host.new_list().unwrap();
+        host_heap.prepare_bindless_record(&list);
+        assert_eq!(shows(&host_heap, 1), placed_host(a, &SMALL), "kept at recording");
+        host_heap.bindless_plan();
+        assert_eq!(shows(&host_heap, 1), placed_host(b, &SMALL), "made by the plan");
+        // An array view of a texture shown as a plain one: null at once.
+        create_placed_srv(null, &SMALL, &placed_view(a, 5), start + 32);
+        assert_eq!(shows(&host_heap, 1), None);
+        assert!(!kin(&View::Placed(false, SMALL, placed_view(a, 4)), &View::Placed(false, SMALL, placed_view(b, 5)))
+            .kept(2));
+        drop(list);
+        crate::watch::title_memory_remapped(memory.address() as usize, 1 << 20);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(title_heap), 0);
+    }
+
+    /// A slot whose texture's memory goes away goes on showing it for a
+    /// while ([`away_ms`]), then reads nothing; once the memory is there the
+    /// slot shows the texture made from it.
+    #[test]
+    fn a_slot_whose_texture_went_away_shows_it_a_while() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        if host().is_none() || keep_shown() == 0 {
+            return; // no host GPU, or `VICTORY_KEEP_SHOWN=0`
+        }
+        crate::resource::PAGES_IN_TEST.set(true);
+        AWAY_IN_TEST.set(Some(50));
+        let null = std::ptr::null();
+        let memory = crate::resource::Memory::zeroed(1 << 20, 64 << 10).unwrap();
+        let a = memory.address();
+        // SAFETY: a reservation at an address chosen by Windows, committed
+        // later in the test.
+        let gone = unsafe { VirtualAlloc(std::ptr::null(), 1 << 20, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!gone.is_null());
+        let (title_heap, start) = make_shader_heap(4);
+        let host_heap = heap(title_heap).host_arc().unwrap();
+        create_placed_srv(null, &SMALL, &placed_view(a, 4), start + 32);
+        host_heap.bindless_plan();
+        let first = shows(&host_heap, 1);
+        assert!(first.is_some());
+        // Moved where nothing is mapped yet: it stays shown, for a while.
+        create_placed_srv(null, &SMALL, &placed_view(gone as u64, 4), start + 32);
+        host_heap.bindless_plan();
+        assert_eq!(shows(&host_heap, 1), first, "stays");
+        assert!(host_heap.away.lock().unwrap().contains_key(&1));
+        host_heap.bindless.lock().unwrap().dirty.insert(1);
+        host_heap.bindless_plan();
+        assert_eq!(shows(&host_heap, 1), first, "still");
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        host_heap.bindless.lock().unwrap().dirty.insert(1);
+        host_heap.bindless_plan();
+        assert_eq!(shows(&host_heap, 1), None, "away too long");
+        assert!(host_heap.away.lock().unwrap().is_empty());
+        // Mapped: shown.
+        // SAFETY: commits the reservation's first megabyte.
+        assert!(!unsafe { VirtualAlloc(gone, 1 << 20, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        host_heap.bindless.lock().unwrap().dirty.insert(1);
+        host_heap.bindless_plan();
+        assert!(shows(&host_heap, 1).is_some() && shows(&host_heap, 1) == placed_host(gone as u64, &SMALL));
+        AWAY_IN_TEST.set(None);
+        crate::resource::PAGES_IN_TEST.set(false);
+        crate::watch::title_memory_remapped(gone as usize, 1 << 20);
+        crate::watch::title_memory_remapped(a as usize, 1 << 20);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(title_heap), 0);
+        // SAFETY: nothing names the reservation any more.
+        assert_ne!(unsafe { VirtualFree(gone, 0, MEM_RELEASE) }, 0);
+    }
+
+    /// A texture uploaded through a slot is looked at again on its ladder: a
+    /// look that finds its memory as it was plans the next step, one that
+    /// finds it changed has it uploaded again; after the last step, none;
+    /// looks left over a frame come first the next.
+    #[test]
+    fn uploaded_textures_are_looked_at_again_on_their_ladder() {
+        let Some(host) = host() else {
+            return;
+        };
+        if !ladder_on() || crate::resource::textures() != crate::resource::Textures::Stream {
+            return; // `VICTORY_HEAP_RECHECK=0`, or `VICTORY_TEXTURES`
+        }
+        let null = std::ptr::null();
+        let memory = crate::resource::Memory::zeroed(1 << 20, 64 << 10).unwrap();
+        let a = memory.address();
+        let (title_heap, start) = make_shader_heap(4);
+        let host_heap = heap(title_heap).host_arc().unwrap();
+        create_placed_srv(null, &SMALL, &placed_view(a, 4), start + 32);
+        host_heap.bindless_plan();
+        let before = crate::queue::presented();
+        let list = host.new_list().unwrap();
+        host_heap.prepare_bindless_record(&list);
+        let texture = crate::resource::texture_at(a, &SMALL, 0).unwrap() as usize;
+        let planned = || host_heap.bindless.lock().unwrap().looks.of.get(&texture).copied();
+        let due = planned().expect("planned at its upload");
+        assert!(due >= before + LADDER[0] && due <= crate::queue::presented() + LADDER[0]);
+        let look = host_heap.bindless.lock().unwrap().looks.due[&(due, texture)];
+        assert_eq!(look.step, 0);
+        assert_eq!(Some((look.at, look.len)), crate::resource::held_memory(texture as This));
+        assert!(host_heap.bindless.lock().unwrap().looks.take(due - 1, LOOKS).is_empty(), "not before");
+        // As it was: the next step.
+        let taken = host_heap.bindless.lock().unwrap().looks.take(due, LOOKS);
+        assert!(host_heap.look_again(taken, due).is_empty());
+        assert_eq!(planned(), Some(due + LADDER[1]));
+        // Changed: uploaded again, as one reached the first time.
+        // SAFETY: the test's own memory, the texture's first texel.
+        unsafe { (a as *mut u8).write(0x7f) };
+        let at = due + LADDER[1];
+        let taken = host_heap.bindless.lock().unwrap().looks.take(at, LOOKS);
+        assert!(host_heap.look_again(taken, at).contains(&texture));
+        assert!(!host_heap.bindless.lock().unwrap().uploaded.contains_key(&texture));
+        assert_eq!(planned(), None, "planned again by its upload");
+        // The last step plans none.
+        let print = crate::texture::fingerprint(look.at, look.len);
+        let last = Look { step: (LADDER.len() - 1) as u8, print, ..look };
+        host_heap.bindless.lock().unwrap().looks.plan(texture, 5, last);
+        let taken = host_heap.bindless.lock().unwrap().looks.take(5, LOOKS);
+        assert!(host_heap.look_again(taken, 5).is_empty());
+        assert_eq!(planned(), None);
+        // More than a frame's looks.
+        let mut looks = Looks::default();
+        for t in 0..LOOKS + 10 {
+            looks.plan(t, 7 + (t % 3) as u64, last);
+        }
+        looks.plan(3, 100, last);
+        assert_eq!(looks.len(), LOOKS + 10, "planned again, not twice");
+        assert_eq!(looks.take(9, LOOKS).len(), LOOKS);
+        assert_eq!(looks.take(9, LOOKS).len(), 9);
+        assert_eq!(looks.next(), 100);
+        drop(list);
+        crate::watch::title_memory_remapped(a as usize, 1 << 20);
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(title_heap), 0);
     }

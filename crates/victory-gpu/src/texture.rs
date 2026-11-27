@@ -66,12 +66,132 @@ pub(crate) struct Staging {
 /// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
+    hash: Option<Sum>,
     asked: u64,
     /// How often in a row it had not changed, and the frame to look at it
     /// next in.
     still: u32,
     next: u64,
+}
+
+/// What a texture's memory hashed to: a [`digest`], or blake3's
+/// (`VICTORY_TEXTURE_HASH=blake3`, as before).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Sum {
+    Digest(u128),
+    Blake3([u8; 32]),
+}
+
+impl Sum {
+    /// Its first 64 bits.
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    fn short(&self) -> u64 {
+        match self {
+            Sum::Digest(d) => *d as u64,
+            Sum::Blake3(b) => u64::from_le_bytes(b[..8].try_into().unwrap_or([0; 8])),
+        }
+    }
+}
+
+/// Whether texture memory is hashed with blake3, as before.
+fn blake3_sums() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TEXTURE_HASH").is_ok_and(|v| v.trim() == "blake3"))
+}
+
+/// What `bytes` hash to.
+fn sum(bytes: &[u8]) -> Sum {
+    if blake3_sums() {
+        Sum::Blake3(*blake3::hash(bytes).as_bytes())
+    } else {
+        Sum::Digest(digest(bytes))
+    }
+}
+
+/// A 128-bit digest of `bytes`, to tell a texture's memory changed: four
+/// lanes of folded multiplications over 64 bytes at a time. Not a
+/// cryptographic one: nobody makes textures up to collide, and blake3 took
+/// 0.29-0.32 ms a MiB on the i7-8700K against 0.063-0.093 for this
+/// (lab\xtx\textures\hash-bench.txt).
+///
+/// From github.com/avatarmanz/VIctory-7900XTX (texture.rs `digest`, commit
+/// 2dfba4d).
+pub(crate) fn digest(bytes: &[u8]) -> u128 {
+    const K: [u64; 8] = [
+        0xa076_1d64_78bd_642f,
+        0xe703_7ed1_a0b4_28db,
+        0x8ebc_6af0_9c88_c6e3,
+        0x5899_65cc_7537_4cc3,
+        0x1d8e_4e27_c47d_124f,
+        0xeb44_acca_b455_d165,
+        0x9e37_79b9_7f4a_7c15,
+        0xc2b2_ae3d_27d4_eb4f,
+    ];
+    let fold = |a: u64, b: u64| {
+        let p = u128::from(a) * u128::from(b);
+        p as u64 ^ (p >> 64) as u64
+    };
+    let word = |b: &[u8]| {
+        let mut w = [0; 8];
+        w[..b.len()].copy_from_slice(b);
+        u64::from_le_bytes(w)
+    };
+    let mut lanes = [K[0], K[1], K[2], K[3]];
+    let mut step = |block: &[u8; 64]| {
+        for (i, lane) in lanes.iter_mut().enumerate() {
+            let a = word(&block[16 * i..16 * i + 8]);
+            let b = word(&block[16 * i + 8..16 * i + 16]);
+            // (What went in is added again: a product with a factor of zero
+            // forgets neither the lane nor the block.)
+            *lane = fold(a ^ K[4 + i], b ^ *lane).wrapping_add(a.rotate_left(23) ^ lane.rotate_left(41)) ^ b;
+        }
+    };
+    let mut blocks = bytes.chunks_exact(64);
+    for block in &mut blocks {
+        step(block.try_into().unwrap_or(&[0; 64]));
+    }
+    let rest = blocks.remainder();
+    let mut last = [0u8; 64];
+    last[..rest.len()].copy_from_slice(rest);
+    step(&last);
+    let len = bytes.len() as u64;
+    let low = fold(lanes[0] ^ K[1], lanes[1] ^ len) ^ fold(lanes[2] ^ K[3], lanes[3] ^ K[5]);
+    let high = fold(lanes[0].rotate_left(32) ^ K[6], lanes[2] ^ len)
+        ^ fold(lanes[1].rotate_left(32) ^ K[7], lanes[3] ^ K[2]);
+    u128::from(low) << 64 | u128::from(high)
+}
+
+/// A fingerprint of the title memory `[at, at + len)`, never 0: of all of
+/// it up to 48 KiB, else of 16 KiB at its start, its middle and its end (a
+/// texture streams in whole mips; the small ones lie at one end). Read
+/// through the kernel, so pages not there count as zeros.
+///
+/// From github.com/fxceless/victory-fork (a803c87) as in
+/// github.com/avatarmanz/VIctory-7900XTX (texture.rs `fingerprint`), with
+/// [`digest`] for the hash.
+pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
+    const WINDOW: usize = 16 << 10;
+    thread_local! {
+        static READ: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    }
+    let len = len as usize;
+    let mut print = 0u128;
+    READ.with_borrow_mut(|read| {
+        read.resize(3 * WINDOW, 0);
+        let mut take = |from: usize, bytes: usize| {
+            read[..bytes].fill(0);
+            crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
+            print = print.rotate_left(37) ^ digest(&read[..bytes]);
+        };
+        if len <= 3 * WINDOW {
+            take(0, len);
+        } else {
+            take(0, WINDOW);
+            take((len / 2) & !0xfff, WINDOW);
+            take(len - WINDOW, WINDOW);
+        }
+    });
+    (print as u64 ^ (print >> 64) as u64) | 1
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -207,6 +327,153 @@ pub(crate) fn forget(resource: usize) {
     if let Some(set) = set.as_mut() {
         set.remove(&resource);
     }
+}
+
+/// For a look at title texture `resource` after its upload: whether its
+/// memory was written since its staging buffer was last filled, if the
+/// memory is write-watched and was filled through the watch; `None` if not
+/// (no staging buffer, or memory the kernel does not watch): a fingerprint
+/// tells then ([`fingerprint`]). The journal keeps what it finds for the
+/// refresh that uploads it.
+pub(crate) fn written_since_upload(resource: This) -> Option<bool> {
+    let staging = STAGING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()?
+        .get(&(resource as usize))?
+        .clone();
+    if staging.not_watched.load(Ordering::Relaxed) {
+        return None;
+    }
+    let asked = staging.last.lock().unwrap_or_else(|e| e.into_inner()).asked;
+    if asked == 0 {
+        return None;
+    }
+    let start = staging.memory as usize;
+    let size = staging.layout.reach(staging.skip) as usize;
+    let (_, written) = crate::watch::writes(start, start + size, false)?;
+    Some(written.iter().any(|&(_, w)| w > asked))
+}
+
+/// Whether title texture `resource` has a staging buffer: an upload of its
+/// memory was recorded.
+pub(crate) fn is_staged(resource: This) -> bool {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref().is_some_and(|map| map.contains_key(&(resource as usize)))
+}
+
+/// Whether the host wrote title texture `resource` by a copy or resolve.
+pub(crate) fn host_wrote(resource: This) -> bool {
+    let set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    set.as_ref().is_some_and(|set| set.contains(&(resource as usize)))
+}
+
+/// What the first copy into a texture the title fills goes over
+/// (`VICTORY_COPY_OVER_TITLE`): zeros (by default), as in a texture that
+/// was an allocation of its own; `title`: what title memory holds, which may
+/// be another texture's; `0`: whatever the memory of the host copy held, as
+/// before (another texture's, in a pool's block).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Over {
+    Zeros,
+    Title,
+    AsBefore,
+}
+
+pub(crate) fn copy_over() -> Over {
+    static OVER: std::sync::OnceLock<Over> = std::sync::OnceLock::new();
+    *OVER.get_or_init(|| match std::env::var("VICTORY_COPY_OVER_TITLE").as_deref().map(str::trim) {
+        Ok("0") => Over::AsBefore,
+        Ok("title") => Over::Title,
+        _ => Over::Zeros,
+    })
+}
+
+/// Records copies of zeros into every subresource of `texture`, which is in
+/// the copy destination state, in `list`. From one buffer of zeros for all
+/// (the list holds it until it is reset).
+///
+/// From github.com/avatarmanz/VIctory-7900XTX (texture.rs `zeros`,
+/// 59bccac): a 2048x2048 BC3 atlas the title copies its baked decorations
+/// into, 256x256 at most at a time, was drawn over a character's face with
+/// other textures' bytes wherever nothing was baked.
+pub(crate) fn zeros(list: &HostList, texture: &ID3D12Resource) -> bool {
+    let Some(host) = host() else {
+        return false;
+    };
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { 1 } else { u32::from(d.DepthOrArraySize) };
+    let count = u32::from(d.MipLevels) * layers;
+    let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+    let mut rows = vec![0u32; count as usize];
+    // SAFETY: outputs for `count` subresources.
+    unsafe {
+        host.device.GetCopyableFootprints(
+            &d,
+            0,
+            count,
+            0,
+            Some(footprints.as_mut_ptr()),
+            Some(rows.as_mut_ptr()),
+            None,
+            None,
+        );
+    }
+    // Every copy reads the buffer from its start.
+    let most = footprints
+        .iter()
+        .zip(&rows)
+        .map(|(f, &r)| u64::from(f.Footprint.RowPitch) * u64::from(r) * u64::from(f.Footprint.Depth))
+        .max()
+        .unwrap_or(0);
+    let Some(buffer) = zero_buffer(host, most) else {
+        return false;
+    };
+    for (i, footprint) in footprints.iter().enumerate() {
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above; the list holds the buffer until it is reset.
+            pResource: unsafe { std::mem::transmute_copy(&buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, ..*footprint },
+            },
+        };
+        // SAFETY: an open list; both locations name live resources.
+        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+    }
+    list.keep(&buffer);
+    true
+}
+
+/// Upload memory of at least `bytes` zeros, shared by every first copy; a
+/// smaller one before is retired when it is replaced.
+fn zero_buffer(host: &crate::host::Host, bytes: u64) -> Option<ID3D12Resource> {
+    static ZEROS: Mutex<Option<(ID3D12Resource, u64)>> = Mutex::new(None);
+    if bytes == 0 || bytes == u64::MAX || bytes > 1 << 30 {
+        return None;
+    }
+    let mut zeros = ZEROS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((buffer, size)) = zeros.as_ref()
+        && *size >= bytes
+    {
+        return Some(buffer.clone());
+    }
+    let size = bytes.next_power_of_two().max(1 << 20);
+    let (buffer, data) = host.upload_buffer(size)?;
+    crate::host::name(&buffer, || format!("zeros {size:#x}"));
+    // SAFETY: a mapped buffer of `size` bytes, just made.
+    unsafe { std::ptr::write_bytes(data, 0, size as usize) };
+    if let Some((old, _)) = zeros.replace((buffer.clone(), size)) {
+        crate::host::retire(old);
+    }
+    Some(buffer)
 }
 
 /// Whether `resource`'s host copy takes its contents from title memory:
@@ -383,7 +650,7 @@ impl Staging {
     /// staging buffer got new contents.
     fn changed(&self, last: &mut Last, tiled: &[u8], told: bool) -> (usize, bool) {
         let size = tiled.len();
-        let hash = blake3::hash(tiled);
+        let hash = sum(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -501,15 +768,14 @@ pub(crate) mod flips {
         }
     }
 
-    pub(super) fn note(s: &Staging, hash: &blake3::Hash, tiled: &[u8], told: bool, again: bool) {
+    pub(super) fn note(s: &Staging, hash: &Sum, tiled: &[u8], told: bool, again: bool) {
         let frame = crate::queue::presented();
         let d = &s.layout.desc;
         let key = (
             s.memory as usize,
             [s.layout.size as u32, s.mips, s.footprints.len() as u32, s.skip],
         );
-        let mut h = [0u8; 8];
-        h.copy_from_slice(&hash.as_bytes()[..8]);
+        let h = hash.short().to_le_bytes();
         let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
         let e = seen.get_or_insert_with(HashMap::new).entry(key).or_default();
         if e.hashes.is_empty() {
@@ -1261,6 +1527,70 @@ mod tests {
             "host-written textures must not queue CPU-to-GPU uploads"
         );
         forget(fake_resource as usize);
+    }
+
+    /// The digest tells apart memories that differ in one byte, wherever it
+    /// is and whatever the length (tails of fewer than 64 bytes too), and
+    /// those of zeros of other lengths.
+    #[test]
+    fn the_digest_tells_one_byte_apart() {
+        let base: Vec<u8> = (0..4099u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        let mut seen = std::collections::HashSet::new();
+        for len in [0, 1, 7, 63, 64, 65, 127, 128, 4096, 4099] {
+            let d = digest(&base[..len]);
+            assert_eq!(d, digest(&base[..len]), "the same each time");
+            assert!(seen.insert(d), "length {len}");
+            for at in [0, len / 3, len.saturating_sub(1)] {
+                if len == 0 {
+                    continue;
+                }
+                let mut other = base[..len].to_vec();
+                other[at] ^= 0x10;
+                assert_ne!(digest(&other), d, "byte {at} of {len}");
+            }
+        }
+        let zeros = |n: usize| digest(&vec![0u8; n]);
+        assert_ne!(zeros(64), zeros(128));
+        assert_ne!(zeros(0), zeros(64));
+        // Swapped halves of a block are another memory.
+        let mut swapped = base[..64].to_vec();
+        swapped.rotate_left(8);
+        assert_ne!(digest(&swapped), digest(&base[..64]));
+        assert!(matches!(sum(&base), Sum::Digest(_)) || blake3_sums());
+    }
+
+    /// A fingerprint reads all of small memories and three windows of large
+    /// ones: a change in a window shows, one between them does not, and
+    /// memory that is not mapped reads as zeros.
+    #[test]
+    fn fingerprints_look_at_their_windows() {
+        let memory = crate::resource::Memory::zeroed(1 << 20, 64 << 10).unwrap();
+        let at = memory.address();
+        // SAFETY: the test's own committed memory.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(at as *mut u8, 1 << 20) };
+        bytes.iter_mut().enumerate().for_each(|(i, b)| *b = (i % 251) as u8);
+        let small = fingerprint(at, 40 << 10);
+        let large = fingerprint(at, 1 << 20);
+        assert_ne!(small & 1, 0, "never 0");
+        bytes[(40 << 10) - 1] ^= 1;
+        assert_ne!(fingerprint(at, 40 << 10), small, "all of a small one");
+        bytes[(1 << 20) - 100] ^= 1;
+        let after_end = fingerprint(at, 1 << 20);
+        assert_ne!(after_end, large, "its end");
+        bytes[(1 << 20) / 2 + 100] ^= 1;
+        let after_middle = fingerprint(at, 1 << 20);
+        assert_ne!(after_middle, after_end, "its middle");
+        bytes[200 << 10] ^= 1;
+        assert_eq!(fingerprint(at, 1 << 20), after_middle, "between the windows");
+        // Memory not mapped reads as zeros.
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree};
+        // SAFETY: a reservation at an address chosen by Windows, never committed.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 64 << 10, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        let zeros = vec![0u8; 40 << 10];
+        assert_eq!(fingerprint(base as u64, 40 << 10), fingerprint(zeros.as_ptr() as u64, 40 << 10));
+        // SAFETY: this reservation is no longer used.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
     }
 }
 

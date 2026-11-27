@@ -2158,6 +2158,25 @@ pub(crate) fn host_bytes(this: This) -> u64 {
     made(this).map_or(0, |h| h.bytes)
 }
 
+/// The title memory the host copy of texture `this` holds (address and
+/// bytes: from its first mip kept on), if it is made and the title fills
+/// it; not a use of it.
+#[cfg(windows)]
+pub(crate) fn held_memory(this: This) -> Option<(u64, u64)> {
+    let host = made(this)?;
+    let r = resource(this);
+    (r.desc.flags & 0x7 == 0).then(|| (r.data() as u64, reach(&r.desc, host.skip)))
+}
+
+/// The host copy of title texture `this` if it is made, without making it:
+/// for what is no use of it.
+#[cfg(windows)]
+pub(crate) fn made_resource<'a>(
+    this: This,
+) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    made(this).map(|h| &h.texture)
+}
+
 /// Whether a view of placed texture `this` read mips whose memory was not
 /// there: worth another look when memory is mapped.
 #[cfg(windows)]
@@ -2191,6 +2210,23 @@ fn reach(d: &ResourceDesc, skip: u32) -> u64 {
     }
 }
 
+/// Whether the title's pages of a placed texture are asked for before its
+/// copy is made: tests make them over any memory unless they ask
+/// ([`PAGES_IN_TEST`]).
+#[cfg(windows)]
+fn pages_asked() -> bool {
+    #[cfg(test)]
+    return PAGES_IN_TEST.get();
+    #[cfg(not(test))]
+    true
+}
+
+#[cfg(all(test, windows))]
+thread_local! {
+    /// Placed textures are made in this test only where their pages are.
+    pub(crate) static PAGES_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Makes the copy of the texture placed at `address` (description words
 /// `base`, `d`) that goes without the `skip` largest mips, for a view that
 /// reads from mip `largest` on; another thread's, if it was quicker.
@@ -2207,7 +2243,7 @@ fn place_copy(
     let end = address.saturating_add(size);
     // The title's pages for it may not be there yet (streaming): nothing to
     // show, and the console's whole address space would not fit in memory.
-    if !cfg!(test) && !crate::texture::committed(address as *const u8, size as usize) {
+    if pages_asked() && !crate::texture::committed(address as *const u8, size as usize) {
         return None;
     }
     let mut out = std::ptr::null();
@@ -2275,8 +2311,9 @@ pub(crate) struct Care {
     /// Bytes of host textures to let go for smaller ones.
     pub(crate) cut: u64,
     /// How long nothing showed or used a texture that is let go, in
-    /// milliseconds (`None`: kept).
-    pub(crate) idle_ms: Option<u64>,
+    /// milliseconds, and how many bytes of them go at most, those idle the
+    /// longest first (`None`: kept).
+    pub(crate) idle: Option<(u64, u64)>,
 }
 
 /// Placed textures (resource objects) another copy has taken the place of,
@@ -2365,6 +2402,8 @@ fn care_from(
     // to have their slots made again.
     let mut gone: Vec<(PlacedKey, usize, bool)> = Vec::new();
     let mut shown: Vec<usize> = Vec::new();
+    // Nothing showed or used them for long enough: how long, their bytes.
+    let mut idle_ones: Vec<(u64, u64, PlacedKey, usize)> = Vec::new();
     for _ in 0..LOOKED / AT_ONCE {
         let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
         let from = match *cursor {
@@ -2402,9 +2441,11 @@ fn care_from(
                 continue;
             }
             best = Some(key);
+            // Held, a list or a slot has it ([`HostHeap::keep_with_view`]
+            // holds the copy a slot shows): no shader can read one let go.
             let idle = now.saturating_sub(host.used.load(Relaxed));
-            if !held && what.idle_ms.is_some_and(|ms| idle >= ms) {
-                gone.push((key, placed.resource, false));
+            if !held && what.idle.is_some_and(|(ms, _)| idle >= ms) {
+                idle_ones.push((idle, host.bytes, key, placed.resource));
                 continue;
             }
             let d = described(&key.1);
@@ -2430,6 +2471,18 @@ fn care_from(
         // Who waits for the lock goes first.
         drop(map);
         std::thread::yield_now();
+    }
+    // The longest idle first, as many as the bytes allow (one at least).
+    if let Some((_, most)) = what.idle {
+        idle_ones.sort_unstable_by_key(|i| std::cmp::Reverse(i.0));
+        let mut bytes = 0u64;
+        for (_, size, key, resource) in idle_ones {
+            if bytes >= most {
+                break;
+            }
+            bytes = bytes.saturating_add(size);
+            gone.push((key, resource, false));
+        }
     }
     // Marks a copy to go, if it is still there.
     let mut leave = |key: &PlacedKey, resource: usize, bytes: u64| {
@@ -2833,7 +2886,7 @@ pub(crate) fn test_texture(width: u64, height: u32, format: u32, flags: u32, sta
 pub(crate) fn test_care(address: u64, side: u64) {
     let caps = crate::texcap::Caps { new: side, again: side };
     crate::texcap::FORCED.set(caps);
-    let what = Care { caps, better: [u64::MAX, u64::MAX], cut: 0, idle_ms: None };
+    let what = Care { caps, better: [u64::MAX, u64::MAX], cut: 0, idle: None };
     care_from(&what, &mut None, address..address + 1);
 }
 
@@ -3816,6 +3869,396 @@ mod tests {
         }
     }
 
+    /// A title list and its allocator.
+    #[cfg(windows)]
+    fn title_list() -> (This, This) {
+        let null = std::ptr::null();
+        let (mut allocator, mut list) = (null, null);
+        let allocator_iid =
+            guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]);
+        let list_iid = guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]);
+        assert_eq!(crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator), S_OK);
+        let made = crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list);
+        assert_eq!(made, S_OK);
+        (allocator, list)
+    }
+
+    /// A copy location as titles pass it.
+    #[cfg(windows)]
+    #[repr(C)]
+    struct Location {
+        resource: This,
+        kind: u32,
+        footprint: PlacedFootprint,
+    }
+
+    #[cfg(windows)]
+    type CopyRegion = extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+    #[cfg(windows)]
+    type Barriers = extern "system" fn(This, u32, *const [u64; 4]) -> u32;
+
+    /// A title transition barrier of a whole texture.
+    #[cfg(windows)]
+    fn transition_words(texture: This, before: u32, after: u32) -> [u64; 4] {
+        [0, texture as u64, 0xffff_ffff | u64::from(before) << 32, u64::from(after)]
+    }
+
+    /// Copies a whole host texture into a readback buffer, in `list`.
+    #[cfg(windows)]
+    fn read_back(
+        host: &crate::host::Host,
+        list: &crate::host::HostList,
+        texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        width: u32,
+        height: u32,
+    ) -> *const u8 {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let (back, seen) = host.readback_buffer(u64::from(width * 4 * height)).unwrap();
+        // SAFETY: a live texture.
+        let format = unsafe { texture.GetDesc() }.Format;
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(&back) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: format,
+                        Width: width,
+                        Height: height,
+                        Depth: 1,
+                        RowPitch: width * 4,
+                    },
+                },
+            },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        // SAFETY: an open list; the texture is in the copy source state there.
+        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        list.keep(&back);
+        seen
+    }
+
+    /// A target whose first use is a copy into it is made then, in the state
+    /// the title had it in, and holds what the copy wrote.
+    #[cfg(windows)]
+    #[test]
+    fn a_target_first_used_by_a_copy_holds_what_it_was_given() {
+        use std::sync::atomic::Ordering::Relaxed;
+        const TARGET: u32 = 1;
+        const COPY_DEST: u32 = 0x400;
+        const COPY_SOURCE: u32 = 0x800;
+        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        let Some(host) = crate::host::host().filter(|_| lazy_targets()) else {
+            return; // no host GPU here, or made at once
+        };
+        let null: This = std::ptr::null();
+        let target = test_texture(512, 256, 28, TARGET, SHADER_RESOURCE);
+        let (source, pixels) = (test_buffer(512 * 4 * 256), test_buffer(512 * 4 * 256));
+        assert!(waits(target));
+        let (data, len) = buffer_bytes(source).unwrap();
+        // SAFETY: the buffer's own memory.
+        let given = unsafe { std::slice::from_raw_parts_mut(data, len as usize) };
+        given.iter_mut().enumerate().for_each(|(i, b)| *b = (i * 7 % 253) as u8);
+        let (allocator, list) = title_list();
+        let barrier = |before, after| transition_words(target, before, after);
+        slot::<Barriers>(list, 0xd0)(list, 1, &barrier(SHADER_RESOURCE, COPY_DEST));
+        assert!(!waits(target), "a barrier to a state it is written in");
+        let copy = host_copy(target).unwrap();
+        assert_eq!(copy.state.load(Relaxed), SHADER_RESOURCE, "made in the title's state");
+        let rows = PlacedFootprint { offset: 0, format: 28, width: 512, height: 256, depth: 1, row_pitch: 2048 };
+        let into = Location { resource: target, kind: 0, footprint: rows };
+        let from = Location { resource: source, kind: 1, footprint: rows };
+        slot::<CopyRegion>(list, 0x80)(list, &into, 0, 0, 0, &from, null.cast());
+        slot::<Barriers>(list, 0xd0)(list, 1, &barrier(COPY_DEST, COPY_SOURCE));
+        let to = Location { resource: pixels, kind: 1, footprint: rows };
+        let back = Location { resource: target, kind: 0, footprint: rows };
+        slot::<CopyRegion>(list, 0x80)(list, &to, 0, 0, 0, &back, null.cast());
+        let commands = crate::list::host_list(list).unwrap();
+        commands.close();
+        host.execute(&[commands]);
+        assert_eq!(copy.state.load(Relaxed), COPY_SOURCE);
+        let (out, n) = buffer_bytes(pixels).unwrap();
+        // SAFETY: the buffer's memory, written before `execute` returned.
+        let read = unsafe { std::slice::from_raw_parts(out, n as usize) };
+        assert!(read == &given[..], "the bytes the copy wrote");
+        drop(copy);
+        for object in [list, allocator, target, source, pixels] {
+            assert_eq!(slot::<Release>(object, 0x10)(object), 0);
+        }
+    }
+
+    /// A target first bound for a draw is made then, in the state the title
+    /// had it in, and holds what the draw wrote.
+    #[cfg(windows)]
+    #[test]
+    fn a_target_first_bound_for_a_draw_holds_what_it_drew() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob};
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::core::{PCSTR, s};
+        const TARGET: u32 = 1;
+        const COMMON: u32 = 0;
+        const RENDER_TARGET: u32 = 0x4;
+        const COPY_SOURCE: u32 = 0x800;
+        let Some(host) = crate::host::host().filter(|_| lazy_targets()) else {
+            return; // no host GPU here, or made at once
+        };
+        const SOURCE: &str = r#"
+#define RS "RootFlags(0)"
+[RootSignature(RS)]
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+[RootSignature(RS)]
+float4 ps() : SV_Target { return float4(0.0, 1.0, 1.0, 1.0); }
+"#;
+        fn compile(entry: PCSTR, target: PCSTR) -> ID3DBlob {
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: static source and names; the out pointer is ours.
+            unsafe {
+                D3DCompile(SOURCE.as_ptr().cast(), SOURCE.len(), s!("draw"), None, None, entry, target, 0, 0, &mut code, None)
+            }
+            .unwrap();
+            code.unwrap()
+        }
+        let code = |b: &ID3DBlob| D3D12_SHADER_BYTECODE {
+            // SAFETY: the blob lives through the pipeline's making.
+            pShaderBytecode: unsafe { b.GetBufferPointer() },
+            // SAFETY: as above.
+            BytecodeLength: unsafe { b.GetBufferSize() },
+        };
+        let (vs, ps) = (compile(s!("vs"), s!("vs_5_1")), compile(s!("ps"), s!("ps_5_1")));
+        // SAFETY: the blob's own bytes; a root signature the compiler embedded.
+        let root: ID3D12RootSignature = unsafe {
+            host.device
+                .CreateRootSignature(0, std::slice::from_raw_parts(vs.GetBufferPointer().cast::<u8>(), vs.GetBufferSize()))
+        }
+        .unwrap();
+        let target = test_texture(512, 256, 28, TARGET, COMMON);
+        let view = [0u64; 16];
+        crate::descriptor::create_rtv(std::ptr::null(), target, std::ptr::null(), view.as_ptr() as u64);
+        assert!(waits(target), "a view is no use");
+        let list = host.new_list().unwrap();
+        let mut state = crate::draw::State::default();
+        state.set_targets(&list, &[view.as_ptr() as u64], 0);
+        assert!(!waits(target), "bound for a draw");
+        let copy = host_copy(target).unwrap();
+        assert_eq!(copy.state.load(Relaxed), COMMON, "made in the title's state");
+        // SAFETY: a live texture.
+        let format = unsafe { copy.texture.GetDesc() }.Format;
+        let mut formats = [DXGI_FORMAT_UNKNOWN; 8];
+        formats[0] = format;
+        let mut blend = D3D12_BLEND_DESC::default();
+        blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+        let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            // SAFETY: borrowed for the call; the test holds the root.
+            pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+            VS: code(&vs),
+            PS: code(&ps),
+            BlendState: blend,
+            SampleMask: u32::MAX,
+            RasterizerState: D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_SOLID,
+                CullMode: D3D12_CULL_MODE_NONE,
+                DepthClipEnable: true.into(),
+                ..Default::default()
+            },
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: 1,
+            RTVFormats: formats,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        // SAFETY: a complete description with live shaders and root.
+        let pso: ID3D12PipelineState = unsafe { host.device.CreateGraphicsPipelineState(&desc) }.unwrap();
+        crate::list::ensure_state(&list, target, RENDER_TARGET);
+        // SAFETY: an open list; our root signature and pipeline; the target
+        // bound above.
+        unsafe {
+            let l = &list.list;
+            l.SetGraphicsRootSignature(&root);
+            l.SetPipelineState(&pso);
+            l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            l.RSSetViewports(&[D3D12_VIEWPORT { Width: 512.0, Height: 256.0, MaxDepth: 1.0, ..Default::default() }]);
+            l.RSSetScissorRects(&[RECT { left: 0, top: 0, right: 512, bottom: 256 }]);
+            l.DrawInstanced(3, 1, 0, 0);
+        }
+        crate::list::ensure_state(&list, target, COPY_SOURCE);
+        let seen = read_back(host, &list, &copy.texture, 512, 256);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the readback buffer the list kept, written before
+        // `execute` returned.
+        let read = unsafe { std::slice::from_raw_parts(seen, 512 * 4 * 256) };
+        assert!(read.chunks(4).all(|p| p == [0, 255, 255, 255]), "{:?}", &read[..8]);
+        drop(copy);
+        assert_eq!(slot::<Release>(target, 0x10)(target), 0);
+    }
+
+    /// A depth texture nothing has used yet that a dispatch writes as an
+    /// image is made then, with its twins, in its state; the twins are
+    /// copied into it.
+    #[cfg(windows)]
+    #[test]
+    fn a_depth_target_first_written_as_an_image_gets_its_twins() {
+        use std::sync::atomic::Ordering::Relaxed;
+        const DEPTH_UNORDERED: u32 = 2 | 4;
+        // 16-bit depth with 8-bit stencil, the console's.
+        const D16_S8: u32 = 118;
+        let Some(host) = crate::host::host().filter(|_| lazy_targets()) else {
+            return; // no host GPU here, or made at once
+        };
+        if !crate::twin::wanted(D16_S8, DEPTH_UNORDERED) {
+            return; // `VICTORY_DEPTH_TWINS=0`
+        }
+        let depth = test_texture(512, 512, D16_S8, DEPTH_UNORDERED, 0);
+        assert!(waits(depth));
+        let list = host.new_list().unwrap();
+        // As `draw::readable` for a table entry a dispatch writes.
+        if depth_twin(depth).is_none() {
+            assert_eq!(slot::<Release>(depth, 0x10)(depth), 0);
+            return; // the host makes no such texture
+        }
+        assert!(!waits(depth), "made with its twins");
+        let copy = host_copy(depth).unwrap();
+        assert_eq!(copy.state.load(Relaxed), 0, "made in the title's state");
+        crate::twin::note(depth, None);
+        assert!(crate::twin::resolve(&list), "the twins copied in");
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: a plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        drop(copy);
+        assert_eq!(slot::<Release>(depth, 0x10)(depth), 0);
+    }
+
+    /// Targets made by first uses on recording threads are made in the state
+    /// the title had them in, and their lists' preludes move them from there
+    /// at submission: what each list cleared its own to is read back.
+    #[cfg(windows)]
+    #[test]
+    fn targets_made_on_recording_threads_start_in_their_state() {
+        use std::sync::atomic::Ordering::Relaxed;
+        const TARGET: u32 = 1;
+        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        const RENDER_TARGET: u32 = 0x4;
+        const COPY_SOURCE: u32 = 0x800;
+        if crate::host::host().is_none() || !lazy_targets() {
+            return; // no host GPU here, or made at once
+        }
+        struct Sent<T>(T);
+        // SAFETY: D3D12 objects are free-threaded; each list is recorded by
+        // one thread, then run by this one.
+        unsafe impl<T> Send for Sent<T> {}
+        let targets: Vec<usize> =
+            (0..4).map(|_| test_texture(512, 256, 28, TARGET, SHADER_RESOURCE) as usize).collect();
+        let recorded: Vec<Sent<(crate::host::HostList, usize)>> = std::thread::scope(|s| {
+            let threads: Vec<_> = targets
+                .iter()
+                .enumerate()
+                .map(|(i, &t)| {
+                    s.spawn(move || {
+                        let host = crate::host::host().unwrap();
+                        let t = t as This;
+                        let list = host.new_list().unwrap();
+                        assert!(waits(t));
+                        crate::list::ensure_state(&list, t, RENDER_TARGET);
+                        let copy = host_copy(t).unwrap();
+                        assert_eq!(copy.state.load(Relaxed), SHADER_RESOURCE, "moved at submission");
+                        let rtv = host.rtv(&copy.texture, None);
+                        let color = [i as f32 * 0.2, 1.0, 0.0, 1.0];
+                        // SAFETY: an open list; the target is in the render
+                        // target state there.
+                        unsafe { list.list.ClearRenderTargetView(rtv, &color, None) };
+                        crate::list::ensure_state(&list, t, COPY_SOURCE);
+                        let seen = read_back(host, &list, &copy.texture, 512, 256);
+                        list.close();
+                        Sent((list, seen as usize))
+                    })
+                })
+                .collect();
+            threads.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        let host = crate::host::host().unwrap();
+        let lists: Vec<&crate::host::HostList> = recorded.iter().map(|r| &r.0.0).collect();
+        host.execute(&lists);
+        for (i, r) in recorded.iter().enumerate() {
+            // SAFETY: the readback buffer its list kept, written before
+            // `execute` returned.
+            let read = unsafe { std::slice::from_raw_parts(r.0.1 as *const u8, 512 * 4 * 256) };
+            let red = (i as f32 * 0.2 * 255.0).round() as u8;
+            assert!(read.chunks(4).all(|p| p == [red, 255, 0, 255]), "target {i}: {:?}", &read[..4]);
+            let copy = host_copy(targets[i] as This).unwrap();
+            assert_eq!(copy.state.load(Relaxed), COPY_SOURCE);
+        }
+        drop(recorded);
+        for t in targets {
+            assert_eq!(slot::<Release>(t as This, 0x10)(t as This), 0);
+        }
+    }
+
+    /// The first copy into part of a texture the title fills, which nothing
+    /// uploaded, goes over zeros: what it does not write reads as zeros
+    /// whatever the copy's memory held before.
+    #[cfg(windows)]
+    #[test]
+    fn a_first_copy_into_a_texture_the_title_fills_goes_over_zeros() {
+        use std::sync::atomic::Ordering::Relaxed;
+        const COPY_DEST: u32 = 0x400;
+        const COPY_SOURCE: u32 = 0x800;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        if crate::texture::copy_over() != crate::texture::Over::Zeros {
+            return; // `VICTORY_COPY_OVER_TITLE`
+        }
+        let null: This = std::ptr::null();
+        let texture = test_texture(256, 256, 28, 0, COPY_DEST);
+        let (source, pixels) = (test_buffer(64 * 4 * 64), test_buffer(256 * 4 * 256));
+        let (data, len) = buffer_bytes(source).unwrap();
+        // SAFETY: the buffer's own memory.
+        unsafe { std::slice::from_raw_parts_mut(data, len as usize) }.fill(0x5a);
+        let zeros = crate::list::OVER_ZEROS.load(Relaxed);
+        let (allocator, list) = title_list();
+        let part = PlacedFootprint { offset: 0, format: 28, width: 64, height: 64, depth: 1, row_pitch: 256 };
+        let into = Location { resource: texture, kind: 0, footprint: part };
+        let from = Location { resource: source, kind: 1, footprint: part };
+        slot::<CopyRegion>(list, 0x80)(list, &into, 16, 8, 0, &from, null.cast());
+        slot::<Barriers>(list, 0xd0)(list, 1, &transition_words(texture, COPY_DEST, COPY_SOURCE));
+        let whole = PlacedFootprint { offset: 0, format: 28, width: 256, height: 256, depth: 1, row_pitch: 1024 };
+        let to = Location { resource: pixels, kind: 1, footprint: whole };
+        let back = Location { resource: texture, kind: 0, footprint: whole };
+        slot::<CopyRegion>(list, 0x80)(list, &to, 0, 0, 0, &back, null.cast());
+        assert!(crate::list::OVER_ZEROS.load(Relaxed) > zeros, "over zeros");
+        let commands = crate::list::host_list(list).unwrap();
+        commands.close();
+        host.execute(&[commands]);
+        let (out, n) = buffer_bytes(pixels).unwrap();
+        // SAFETY: the buffer's memory, written before `execute` returned.
+        let read = unsafe { std::slice::from_raw_parts(out, n as usize) };
+        for y in 0..256usize {
+            for x in 0..256usize {
+                let inside = (16..80).contains(&x) && (8..72).contains(&y);
+                let want = if inside { 0x5a } else { 0 };
+                assert_eq!(read[(y * 256 + x) * 4], want, "at {x}, {y}");
+            }
+        }
+        for object in [list, allocator, texture, source, pixels] {
+            assert_eq!(slot::<Release>(object, 0x10)(object), 0);
+        }
+    }
+
     /// A 2048x2048 BC7 texture with all its mips, as description words.
     #[cfg(windows)]
     const STREAMED: [u32; 14] = [3, 0, 0, 0, 2048, 0, 2048, 12 << 16 | 1, 98, 1, 0, 0, 0, 0];
@@ -3893,7 +4336,7 @@ mod tests {
         let at = |i, largest| texture_at(address(i), &STREAMED, largest).unwrap();
         let within = || memory.address()..memory.address() + 3 * APART;
         let care = |what: &Care| care_from(what, &mut None, within());
-        let nothing = |caps| Care { caps, better: [0, 0], cut: 0, idle_ms: None };
+        let nothing = |caps| Care { caps, better: [0, 0], cut: 0, idle: None };
         let tight = caps(256, 256);
         let first: Vec<This> = (0..3).map(|i| at(i, 0)).collect();
         assert_eq!(care(&nothing(tight)), Cared { capped: [3, 3], ..Cared::default() });
@@ -3936,7 +4379,7 @@ mod tests {
         let done = care(&Care { better: [8 * bytes, 8], ..nothing(room) });
         assert_eq!((done.better[0], copies(address(i))), (1, [vec![2], vec![3]]));
         // Unused ones are let go after a while, and not before.
-        let idle = |ms| Care { idle_ms: Some(ms), ..nothing(room) };
+        let idle = |ms| Care { idle: Some((ms, u64::MAX)), ..nothing(room) };
         care(&idle(60_000));
         assert_eq!(copies(address(1))[0], [2]);
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -3944,6 +4387,54 @@ mod tests {
         for i in 0..3 {
             assert_eq!(copies(address(i)), [vec![], vec![]]);
         }
+        caps(0, 0);
+    }
+
+    /// Copies nothing holds go once nothing used them for long enough: those
+    /// idle the longest first, as many as the bytes allow; one a list or a
+    /// slot holds stays until it is let go of; the next view makes another.
+    #[cfg(windows)]
+    #[test]
+    fn idle_copies_go_longest_first_and_never_while_held() {
+        use std::sync::atomic::Ordering::Relaxed;
+        if crate::host::host().is_none() || !share() {
+            return;
+        }
+        const APART: u64 = 8 << 20;
+        let memory = Memory::zeroed(4 * APART, KIB_64).unwrap();
+        let address = |i: u64| memory.address() + i * APART;
+        let within = || memory.address()..memory.address() + 4 * APART;
+        let tight = caps(256, 256);
+        let made: Vec<This> = (0..4).map(|i| texture_at(address(i), &STREAMED, 0).unwrap()).collect();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Idle longest the first; the last in use for good.
+        for (&t, used) in made.iter().zip([1, 2, 3, u64::MAX]) {
+            host_copy(t).unwrap().used.store(used, Relaxed);
+        }
+        let one = host_bytes(made[0]);
+        let held = host_copy(made[1]);
+        let idle = |most| Care { caps: tight, better: [0, 0], cut: 0, idle: Some((1, most)) };
+        let epoch = placed_epoch();
+        let done = care_from(&idle(one), &mut None, within());
+        assert_eq!(done.gone, [1, one], "the longest idle, as many bytes as allowed");
+        assert!(placed_epoch() > epoch, "what names it forgets it");
+        let left = |i| copies(address(i))[0].len();
+        assert_eq!([0, 1, 2, 3].map(left), [0, 1, 1, 1]);
+        care_from(&idle(u64::MAX), &mut None, within());
+        assert_eq!([0, 1, 2, 3].map(left), [0, 1, 0, 1], "held, and in use");
+        drop(held);
+        care_from(&idle(u64::MAX), &mut None, within());
+        assert_eq!([0, 1, 2, 3].map(left), [0, 0, 0, 1]);
+        // Kept: nothing goes.
+        let kept = Care { idle: None, ..idle(u64::MAX) };
+        host_copy(made[3]).unwrap().used.store(1, Relaxed);
+        care_from(&kept, &mut None, within());
+        assert_eq!(left(3), 1);
+        // Viewed again, it is made again.
+        let again = texture_at(address(0), &STREAMED, 0).unwrap();
+        assert!(!waits(again) && host_bytes(again) == one);
+        assert_eq!(left(0), 1);
+        crate::watch::title_memory_remapped(memory.address() as usize, (4 * APART) as usize);
         caps(0, 0);
     }
 

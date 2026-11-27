@@ -2,18 +2,32 @@
 //! video memory is left: all of them whole did not fit, and paging them cost
 //! seconds a frame, or the driver failed.
 //!
-//! The largest side is 1024, 512 and then 256 texels as video memory fills.
-//! A texture made when there was little stays at that size only until there
-//! is room again: some of them are made again every second
+//! Streamed textures are made whole while the card has room, then with a
+//! largest side of 1024, 512 and 256 texels as video memory fills. Room is
+//! the share of the budget in use with some kept for the targets the title
+//! created and nothing has used yet, and with what is on its way out counted
+//! free: the room rule of github.com/avatarmanz/VIctory-7900XTX
+//! (resource.rs `room`, `targets_room_kept`, 0a43566), whose 3 GB for
+//! targets and 90 % line were for 24 GB, scaled to this 8 GB card. A texture
+//! made when there was little stays at that size only until there is room
+//! again: some of them are made again every second
 //! ([`crate::resource::care`]), by a thread of their own, as few as the
-//! thread that uploads them does not notice.
+//! thread that uploads them does not notice. Copies nothing showed or used
+//! for a while are let go while the card is full (the fork's `vram_keep`):
+//! kept 10 minutes below 88 % of the budget, 5 s above and 1.5 s from 95 %,
+//! as many as bring it down to 85 %.
 //!
 //! `VICTORY_TEXTURE_MAX=<texels>` sets one size for all (0: no limit).
 //! `VICTORY_TEXTURE_CAPS=<a>,<b>`: from `a` percent of video memory in use
-//! 512, from `b` percent 256; `0` is as before (70 and 85 of what the driver
-//! says is used). `VICTORY_TEXTURE_UPGRADE_MB=<MiB>` a second are made again
-//! (16 by default; 0: none, as before). `VICTORY_TEXTURE_SWEEP=0` keeps the
-//! copies of textures nothing shows any more, as before.
+//! 512, from `b` percent 256; `0` is as before (1024 below 70 % of what the
+//! driver says is used, 512 below 85, then 256).
+//! `VICTORY_TEXTURE_ROOM_PERCENT=<p>` (92; 50 to 97): whole textures below
+//! 78 %, 1024 below `p`, 512 below `p` + 3, then 256.
+//! `VICTORY_CARD_ROOM_FOR_TARGETS_MB=<MiB>` (1024; 0: none) kept for targets
+//! not made yet, less those made. `VICTORY_TEXTURE_UPGRADE_MB=<MiB>` a second
+//! are made again (16 by default; 0: none, as before).
+//! `VICTORY_TEXTURE_SWEEP=0` keeps every copy until its memory is unmapped,
+//! as before.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
@@ -60,14 +74,20 @@ impl Memory {
         })
     }
 
-    /// The percentage in use, as far as textures to come are concerned: room
-    /// is kept for some of the targets nothing has used yet, and what is on
-    /// its way out counts as free (both within reason: how much of either
-    /// comes true is not known).
-    fn percent(&self) -> u64 {
-        let kept = self.unmade.min(self.budget / 32);
+    /// The bytes in use, as far as textures to come are concerned: room is
+    /// kept for the targets nothing has used yet, up to
+    /// [`targets_room`] less the targets made, and what is on its way out
+    /// counts as free (within reason: how much of it comes true is not
+    /// known).
+    fn room_used(&self) -> u64 {
+        let kept = self.unmade.min(targets_room().saturating_sub(self.targets));
         let back = self.back.min(self.budget / 16);
-        (self.used + kept).saturating_sub(back) * 100 / self.budget.max(1)
+        (self.used + kept).saturating_sub(back)
+    }
+
+    /// [`Memory::room_used`] in percent of the budget.
+    fn percent(&self) -> u64 {
+        self.room_used() * 100 / self.budget.max(1)
     }
 
     /// The percentage the driver says is used, without what is leaving.
@@ -76,22 +96,49 @@ impl Memory {
     }
 }
 
+/// The bytes of video memory kept for targets nothing has used yet, less
+/// the targets made (`VICTORY_CARD_ROOM_FOR_TARGETS_MB`, 1024; 0: none).
+/// The fork kept 3,072 MB on 24 GB: it measured 652 MB of targets before
+/// the world and 2.3 GB after its first frame, made in that frame at once.
+fn targets_room() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        let set = std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB").ok();
+        set.and_then(|v| v.trim().parse::<u64>().ok()).map_or(1024, |mb| mb.min(4096)) << 20
+    })
+}
+
+/// The share of the budget, in percent, up to which streamed textures are
+/// made 1024 texels wide (`VICTORY_TEXTURE_ROOM_PERCENT`, 92; 50 to 97).
+fn room_percent() -> u64 {
+    static PERCENT: OnceLock<u64> = OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        let set = std::env::var("VICTORY_TEXTURE_ROOM_PERCENT").ok();
+        set.and_then(|v| v.trim().parse::<u64>().ok()).map_or(92, |p| p.clamp(50, 97))
+    })
+}
+
 /// Where the sizes change, in percent of video memory.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Limits {
     /// By what the driver says alone.
     AsBefore,
     Set([u64; 2]),
-    Tuned,
+    /// Whole below the first, then 1024, 512 and 256.
+    Tuned([u64; 3]),
 }
+
+/// Below this percent of room in use streamed textures are made whole.
+const WHOLE: u64 = 78;
 
 /// Made again larger only where that size is new ones' with so much more
 /// percent in use: what is made again does not bring the next size down.
 const MARGIN: u64 = 6;
 
 impl Limits {
-    /// The limits `VICTORY_TEXTURE_CAPS` names.
-    fn parse(set: Option<&str>) -> Limits {
+    /// The limits `VICTORY_TEXTURE_CAPS` names, with `room`
+    /// ([`room_percent`]) for the tuned ones.
+    fn parse(set: Option<&str>, room: u64) -> Limits {
         let set = set.map(str::trim).unwrap_or_default();
         if set == "0" {
             return Limits::AsBefore;
@@ -99,24 +146,25 @@ impl Limits {
         let parsed = set
             .split_once(',')
             .and_then(|(a, b)| Some([a.trim().parse().ok()?, b.trim().parse().ok()?]));
-        parsed.map_or(Limits::Tuned, Limits::Set)
+        parsed.map_or(Limits::Tuned([WHOLE.min(room), room, (room + 3).min(99)]), Limits::Set)
     }
 
     /// The sizes that go with `m`.
     ///
     /// Tuned for a card of 8 GB (7.1 GB of which are ours) whose targets are
-    /// made on first use: with less than 2.5 GB of them, textures may fill it
-    /// further than when 4.2 GB of targets were there before any of them.
+    /// made on first use: whole textures while there is room, cut only as
+    /// the card fills (the fork had no cap at all, and waited for room).
     fn caps(self, m: &Memory) -> Caps {
+        // (Never whole as before or with limits set.)
         let (limits, percent) = match self {
-            Limits::AsBefore => ([70, 85], m.plain_percent()),
-            Limits::Set(limits) => (limits, m.percent()),
-            Limits::Tuned if m.targets < m.budget / 100 * 36 => ([78, 90], m.percent()),
-            Limits::Tuned => ([70, 85], m.percent()),
+            Limits::AsBefore => ([0, 70, 85], m.plain_percent()),
+            Limits::Set([a, b]) => ([0, a, b], m.percent()),
+            Limits::Tuned(limits) => (limits, m.percent()),
         };
         let at = |percent: u64| match percent {
-            p if p < limits[0] => 1024,
-            p if p < limits[1] => 512,
+            p if p < limits[0] => 0,
+            p if p < limits[1] => 1024,
+            p if p < limits[2] => 512,
             _ => 256,
         };
         Caps { new: at(percent), again: at(percent + MARGIN) }
@@ -125,7 +173,9 @@ impl Limits {
 
 fn limits() -> Limits {
     static LIMITS: OnceLock<Limits> = OnceLock::new();
-    *LIMITS.get_or_init(|| Limits::parse(std::env::var("VICTORY_TEXTURE_CAPS").ok().as_deref()))
+    *LIMITS.get_or_init(|| {
+        Limits::parse(std::env::var("VICTORY_TEXTURE_CAPS").ok().as_deref(), room_percent())
+    })
 }
 
 /// One size for all, if the user set one.
@@ -176,15 +226,47 @@ pub(crate) fn caps_now() -> Caps {
     if (asked == 0 || now > asked + OLD_MS)
         && ASKED.compare_exchange(asked, now, Relaxed, Relaxed).is_ok()
     {
-        let caps = match (fixed(), Memory::now()) {
+        let memory = Memory::now();
+        let caps = match (fixed(), &memory) {
             (Some(max), _) => Caps { new: max, again: max },
-            (None, Some(m)) => limits().caps(&m),
+            (None, Some(m)) => limits().caps(m),
             (None, None) => Caps { new: 1024, again: 1024 },
         };
-        NEW.store(caps.new, Relaxed);
+        let was = NEW.swap(caps.new, Relaxed);
         AGAIN.store(caps.again, Relaxed);
+        if was != caps.new {
+            changed(was, caps, memory.as_ref());
+        }
     }
     Caps { new: NEW.load(Relaxed), again: AGAIN.load(Relaxed) }
+}
+
+/// A largest side as the log says it.
+fn side(texels: u64) -> String {
+    if texels == 0 { "whole".to_string() } else { texels.to_string() }
+}
+
+/// Logs a change of the size new streamed textures are cut to: the first
+/// and then at most one in 10 s (with how many there were in between).
+fn changed(was: u64, caps: Caps, m: Option<&Memory>) {
+    const EVERY_MS: u64 = 10_000;
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    static SINCE: AtomicU64 = AtomicU64::new(0);
+    let changes = SINCE.fetch_add(1, Relaxed) + 1;
+    let (now, last) = (now_ms() + 1, LOGGED.load(Relaxed));
+    if last != 0 && now < last + EVERY_MS || LOGGED.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
+        return;
+    }
+    SINCE.store(0, Relaxed);
+    tracing::info!(
+        "tex_cap: streamed textures made {} (were {}), made again for {}, at {} % of the room in use \
+         ({} % by the driver; {changes} changes since the last line)",
+        side(caps.new),
+        side(was),
+        side(caps.again),
+        m.map_or(0, Memory::percent),
+        m.map_or(0, Memory::plain_percent),
+    );
 }
 
 /// The size new streamed textures are cut to, for the session panel (0: none).
@@ -215,18 +297,39 @@ const BETTER_MOST: u64 = 64;
 const FULL: u64 = 97;
 const CUT: u64 = 64 << 20;
 
+/// How long a copy nothing showed or used for is kept, in milliseconds, and
+/// how many bytes of such copies go at most, with `m` of memory: the fork's
+/// `vram_keep` (host.rs, 0a43566), with the same room in use as the size
+/// rules. Kept 10 minutes while that is under 88 % of the budget (with room
+/// on its card, 88,000 copies went after 5 s and 24,700 of them had to be
+/// made and uploaded again), else 5 s, 1.5 s from 95 %, as many as bring it
+/// down to 85 %.
+fn keep(m: &Memory) -> (u64, u64) {
+    const KEPT_MS: u64 = 600_000;
+    const IDLE_MS: u64 = 5_000;
+    const SHORT_MS: u64 = 1_500;
+    if m.budget == 0 {
+        return (IDLE_MS, u64::MAX);
+    }
+    let used = m.room_used();
+    let share = |percent: u64| m.budget / 100 * percent;
+    if used < share(88) {
+        (KEPT_MS, u64::MAX)
+    } else if used < share(95) {
+        (IDLE_MS, used - share(85))
+    } else {
+        (SHORT_MS, used - share(85))
+    }
+}
+
 /// What is to be done about the placed textures, with `m` of memory.
 fn plan(m: &Memory, caps: Caps, better: u64, sweeps: bool) -> Care {
-    /// Percent from which textures nothing shows are let go, and how long
-    /// nothing did.
-    const SWEPT: u64 = 60;
-    const IDLE_MS: u64 = 30_000;
     let real = m.used.saturating_sub(m.back.min(m.budget / 16)) * 100 / m.budget.max(1);
     Care {
         caps,
         better: if real < FULL { [better, BETTER_MOST] } else { [0, 0] },
         cut: if better > 0 && real >= FULL { CUT } else { 0 },
-        idle_ms: (sweeps && real >= SWEPT).then_some(IDLE_MS),
+        idle: sweeps.then(|| keep(m)),
     }
 }
 
@@ -245,6 +348,9 @@ pub(crate) fn refused() {
 
 /// Textures made again larger, for the session panel.
 pub(crate) static BETTER: AtomicU64 = AtomicU64::new(0);
+
+/// Copies let go (idle, replaced or cut), for the session panel.
+pub(crate) static LET_GO: AtomicU64 = AtomicU64::new(0);
 
 /// Starts the thread that looks after textures, once.
 pub(crate) fn start() {
@@ -286,6 +392,7 @@ fn tick() {
     }
     let cared = crate::resource::care(&what);
     BETTER.fetch_add(cared.better[0], Relaxed);
+    LET_GO.fetch_add(cared.gone[0], Relaxed);
     let mut all = CARED.lock().unwrap_or_else(|e| e.into_inner());
     let all = &mut *all;
     for (sum, n) in [
@@ -355,8 +462,8 @@ fn log(when: &str) {
         mib(m.budget),
         m.plain_percent(),
         m.percent(),
-        caps.new,
-        caps.again,
+        side(caps.new),
+        side(caps.again),
         targets[1],
         mib(targets[0]),
         used[1],
@@ -381,6 +488,25 @@ fn log(when: &str) {
         cared.gone[0],
         mib(cared.gone[1]),
     );
+    let counts = |c: &[AtomicU64]| c.iter().map(|n| n.load(Relaxed)).collect::<Vec<_>>();
+    let kept = counts(&crate::descriptor::host::SHOWN_KEPT);
+    let away = counts(&crate::descriptor::host::AWAY);
+    let looked = counts(&crate::descriptor::host::LOOKED);
+    tracing::info!(
+        "textures picked by index, so far: looked at again {} times, {} of them found changed and uploaded \
+         again; slots written with another texture that kept showing theirs: {} of the same, {} moved, \
+         {} of another size, {} other; slots whose texture was away that kept showing it {}, made null \
+         after the wait {}; first copies over zeros {}",
+        looked[0] + looked[1],
+        looked[1],
+        kept[0],
+        kept[1],
+        kept[2],
+        kept[3],
+        away[0],
+        away[1],
+        crate::list::OVER_ZEROS.load(Relaxed),
+    );
 }
 
 #[cfg(test)]
@@ -394,35 +520,45 @@ mod tests {
         Memory { used: budget / 100 * used_percent + (1 << 20), budget, targets, ..Memory::default() }
     }
 
-    /// The sizes by the memory in use: later with few targets than with
-    /// many, and those made again sooner back to the next smaller one.
+    /// The sizes by the room in use: whole, then 1024, 512 and 256, and those
+    /// made again sooner back to the next smaller one; as before and with
+    /// limits set never whole.
     #[test]
     fn sizes_follow_the_memory_in_use() {
-        let new = |p, targets| Limits::Tuned.caps(&memory(p, targets)).new;
-        for (percent, size) in [(0, 1024), (77, 1024), (78, 512), (89, 512), (90, 256), (120, 256)] {
-            assert_eq!(new(percent, GIB), size, "{percent} % with few targets");
+        let tuned = Limits::parse(None, 92);
+        let new = |p| tuned.caps(&memory(p, GIB)).new;
+        for (percent, size) in [(0, 0), (77, 0), (78, 1024), (91, 1024), (92, 512), (94, 512), (95, 256), (120, 256)] {
+            assert_eq!(new(percent), size, "{percent} %");
         }
-        for (percent, size) in [(69, 1024), (70, 512), (84, 512), (85, 256)] {
-            assert_eq!(new(percent, 4 * GIB), size, "{percent} % with many targets");
+        for (percent, size) in [(0, 1024), (69, 1024), (70, 512), (84, 512), (85, 256)] {
             assert_eq!(Limits::AsBefore.caps(&memory(percent, GIB)).new, size, "{percent} % as before");
         }
-        let again = |p| Limits::Tuned.caps(&memory(p, GIB)).again;
-        assert_eq!([71, 72, 83, 84].map(again), [1024, 512, 512, 256]);
+        let again = |p| tuned.caps(&memory(p, GIB)).again;
+        assert_eq!([71, 72, 85, 86, 88, 89].map(again), [0, 1024, 1024, 512, 512, 256]);
         assert_eq!(Limits::Set([50, 60]).caps(&memory(55, GIB)), Caps { new: 512, again: 256 });
+        assert_eq!(Limits::Set([50, 60]).caps(&memory(10, GIB)).new, 1024);
+        // A lower line takes the whole band with it.
+        let low = Limits::parse(None, 60);
+        assert_eq!([59, 60, 62, 63].map(|p| low.caps(&memory(p, GIB)).new), [0, 512, 512, 256]);
     }
 
-    /// Room is kept for targets to come, and what is leaving counts as free,
-    /// both to a point.
+    /// Room is kept for targets to come, up to a gigabyte less those made,
+    /// and what is leaving counts as free, to a point.
     #[test]
     fn memory_to_come_and_to_go_counts() {
-        let mut m = memory(80, GIB);
+        let mib = |m: u64| m << 20;
+        let mut m = memory(80, 0);
         assert_eq!(m.percent(), 80);
-        m.unmade = 100 << 20;
-        assert_eq!(m.percent(), 81);
+        m.unmade = mib(213);
+        assert_eq!(m.percent(), 83, "all of the targets to come");
         m.unmade = 4 * GIB;
-        assert_eq!(m.percent(), 83, "a thirty-second of the budget at most");
+        assert_eq!(m.percent(), 94, "a gigabyte of them");
+        m.targets = mib(700);
+        assert_eq!(m.percent(), 84, "less the targets made");
+        m.targets = 2 * GIB;
+        assert_eq!(m.percent(), 80, "none with more made");
         m.unmade = 0;
-        m.back = 300 << 20;
+        m.back = mib(300);
         assert_eq!(m.percent(), 75);
         m.back = 4 * GIB;
         assert_eq!(m.percent(), 73, "a sixteenth of the budget at most");
@@ -431,28 +567,35 @@ mod tests {
 
     #[test]
     fn limits_are_read_from_the_setting() {
-        assert_eq!(Limits::parse(None), Limits::Tuned);
-        assert_eq!(Limits::parse(Some("")), Limits::Tuned);
-        assert_eq!(Limits::parse(Some(" 0 ")), Limits::AsBefore);
-        assert_eq!(Limits::parse(Some("60, 75")), Limits::Set([60, 75]));
-        assert_eq!(Limits::parse(Some("60")), Limits::Tuned);
+        let tuned = Limits::Tuned([78, 92, 95]);
+        assert_eq!(Limits::parse(None, 92), tuned);
+        assert_eq!(Limits::parse(Some(""), 92), tuned);
+        assert_eq!(Limits::parse(Some(" 0 "), 92), Limits::AsBefore);
+        assert_eq!(Limits::parse(Some("60, 75"), 92), Limits::Set([60, 75]));
+        assert_eq!(Limits::parse(Some("60"), 92), tuned);
+        assert_eq!(Limits::parse(None, 97), Limits::Tuned([78, 97, 99]));
     }
 
     /// Textures are cut only when memory is about to run out, and made
-    /// larger only before.
+    /// larger only before; copies nothing uses are kept for minutes with
+    /// room, seconds without, as many going as bring the card to 85 %.
     #[test]
     fn little_is_done_with_much_memory_left() {
         let at = |p| plan(&memory(p, GIB), Caps::NONE, 16 << 20, true);
-        let (free, some, full) = (at(40), at(80), at(98));
-        assert_eq!((free.better, free.cut, free.idle_ms), ([16 << 20, BETTER_MOST], 0, None));
+        let (free, some, full) = (at(40), at(90), at(98));
+        assert_eq!((free.better, free.cut, free.idle), ([16 << 20, BETTER_MOST], 0, Some((600_000, u64::MAX))));
         assert_eq!((some.better, some.cut), ([16 << 20, BETTER_MOST], 0));
-        assert!(some.idle_ms.is_some());
+        let budget = 7114u64 << 20;
+        let over = |p: u64| (budget / 100 * p + (1 << 20)) - budget / 100 * 85;
+        assert_eq!(some.idle, Some((5_000, over(90))));
+        assert_eq!(full.idle, Some((1_500, over(98))));
         assert_eq!(full.better, [0, 0]);
         assert!(full.cut > 0);
+        assert_eq!(at(87).idle.map(|i| i.0), Some(600_000));
         let mut leaving = memory(98, GIB);
         leaving.back = 200 << 20;
         assert_eq!(plan(&leaving, Caps::NONE, 16 << 20, true).cut, 0, "enough is leaving");
         let off = plan(&memory(98, GIB), Caps::NONE, 0, false);
-        assert_eq!((off.better[0], off.cut, off.idle_ms), (0, 0, None));
+        assert_eq!((off.better[0], off.cut, off.idle), (0, 0, None));
     }
 }

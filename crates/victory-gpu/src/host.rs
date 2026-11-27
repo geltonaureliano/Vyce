@@ -3319,6 +3319,12 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    /// Whether the list asked [`HostList::first_use`] of `key` since the
+    /// reset (it uploads that texture, or sampled it), without asking.
+    pub(crate) fn has_used(&self, key: usize) -> bool {
+        self.deferred().textures.contains(&key)
+    }
+
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
@@ -4569,7 +4575,7 @@ impl Meter {
                  \"prewarm_ms\":{prewarm_ms:.2},\"vram_mb\":{},\"vram_budget_mb\":{},\
                  \"shared_mb\":{},\"card_mb\":{},\
                  \"host_tex_mb\":{},\"targets_mb\":{},\"targets_unused_mb\":{},\
-                 \"tex_cap\":{},\"tex_remade\":{},\
+                 \"tex_cap\":{},\"tex_remade\":{},\"tex_let_go\":{},\
                  \"dropped_per_frame\":{dropped:.2},\"pipelines_building\":{}{}}}",
                 self.frames_total,
                 count(Count::Submissions),
@@ -4590,6 +4596,7 @@ impl Meter {
                 crate::memstat::UNMADE[0].load(Ordering::Relaxed) >> 20,
                 crate::texcap::in_force(),
                 crate::texcap::BETTER.swap(0, Ordering::Relaxed),
+                crate::texcap::LET_GO.swap(0, Ordering::Relaxed),
                 crate::pipeline::making(),
                 crate::telemetry::more(frames),
             );

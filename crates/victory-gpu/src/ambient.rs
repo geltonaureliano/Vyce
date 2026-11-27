@@ -474,7 +474,8 @@ fn record(list: &HostList, light: This, depth: Option<This>, held: f32) -> bool 
     // The sky image, if the light follows it and the title has drawn it.
     let sky_image = SKY_IMAGE.load(Ordering::Relaxed) as This;
     let sky = follow().and_then(|f| {
-        let t = crate::resource::host_resource(sky_image)?;
+        // (One nothing drew is no use of it: it has no host copy yet.)
+        let t = crate::resource::made_resource(sky_image)?;
         // SAFETY: a live resource.
         let d = unsafe { t.GetDesc() };
         (d.Format == DXGI_FORMAT_R11G11B10_FLOAT && d.DepthOrArraySize == 1).then_some((t, f))

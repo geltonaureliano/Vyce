@@ -135,7 +135,7 @@ VYCE_TELEMETRY são por quadro, exceto os de memória:
 | prewarm_ms | Cópias adiantadas enquanto a submissão anterior roda (fora do preparo) |
 | vram_mb, vram_budget_mb, shared_mb, card_mb | Memória de vídeo usada e o limite do Windows, memória compartilhada, buffers na VRAM |
 | host_tex_mb, targets_mb, targets_unused_mb | Texturas na VRAM; entre elas, as que a GPU desenha ou escreve (alvos); e os alvos que o jogo criou e nada usou ainda, que não ocupam VRAM |
-| tex_cap, tex_remade | Maior lado, em texels, das texturas transmitidas criadas agora (0: sem limite), e quantas foram refeitas maiores |
+| tex_cap, tex_remade, tex_let_go | Maior lado, em texels, das texturas transmitidas criadas agora (0: sem limite), quantas foram refeitas maiores e quantas cópias sem uso foram liberadas |
 
 O relógio da GPU acrescenta duas listas curtas a cada submissão. Ele só
 existe quando a telemetria está ligada.
@@ -143,19 +143,35 @@ existe quando a telemetria está ligada.
 Para comparar sem mudar de binário, defina no processo que chama o launcher
 VICTORY_ASYNC_SUBMIT=0 (submissões esperadas, como antes),
 VICTORY_STRETCH=0 (sem a memória do jogo usada no lugar por uma segunda
-vista) ou VICTORY_PLAN_REUSE=0 (plano de descritores anterior). Para as
-texturas: VICTORY_LAZY_TEXTURES=0 (todos os alvos criados de uma vez),
-VICTORY_TEXTURE_CAPS=0 (limites de tamanho anteriores),
-VICTORY_TEXTURE_UPGRADE_MB=0 (nenhuma refeita maior),
-VICTORY_TEXTURE_SHARE=0 (uma cópia para cada nível visto),
-VICTORY_TEXTURE_SWEEP=0 (cópias sem uso mantidas),
-VICTORY_TEXTURE_RECHECK=0 (conferências contadas sem o tamanho) e
-VICTORY_INDIRECT_POOL=0 (cada lista guarda os buffers de desenho indireto).
+vista) ou VICTORY_PLAN_REUSE=0 (plano de descritores anterior).
+
+Texturas e memória de vídeo (todas ligadas por padrão; o valor indicado
+volta ao comportamento de antes):
+
+| Variável | Efeito |
+| --- | --- |
+| VICTORY_LAZY_TEXTURES=0 | Todos os alvos (render target, profundidade, UAV) criados quando o jogo os cria; por padrão os de 256 KiB ou mais nascem no primeiro uso (=<KiB> muda o mínimo) |
+| VICTORY_TEXTURE_CAPS=0 | Limites de tamanho de antes (1024 abaixo de 70 % da VRAM, 512 até 85 %, depois 256); =<a>,<b> põe 512 a partir de a % e 256 a partir de b % |
+| VICTORY_TEXTURE_ROOM_PERCENT=<p> | Até onde as texturas transmitidas são feitas com 1024 (92 por padrão): inteiras abaixo de 78 %, 1024 abaixo de p, 512 até p + 3, depois 256 |
+| VICTORY_CARD_ROOM_FOR_TARGETS_MB=<MiB> | VRAM guardada para os alvos que ainda não nasceram, menos os já feitos (1024; 0: nada guardado) |
+| VICTORY_TEXTURE_UPGRADE_MB=0 | Nenhuma textura cortada é refeita maior quando volta a haver espaço (16 MiB por segundo por padrão) |
+| VICTORY_TEXTURE_SHARE=0 | Uma cópia para cada nível visto, como antes |
+| VICTORY_TEXTURE_SWEEP=0 | Cópias sem uso mantidas até a memória delas sumir; por padrão ficam 10 minutos abaixo de 88 % da VRAM, 5 s acima e 1,5 s a partir de 95 %, até voltar a 85 % |
+| VICTORY_HEAP_RECHECK=0 | Volta às 32 conferências por quadro numa fila; por padrão cada textura vista por índice é reconferida 4, 12, 40, 120 e 400 quadros depois do envio (impressão de 48 KiB) |
+| VICTORY_RECHECK_SOON=0 | Uma textura que mudou sem aviso é reconferida após 4 quadros, não no seguinte |
+| VICTORY_TEXTURE_RECHECK=0 | Conferências da fila contadas sem o tamanho |
+| VICTORY_TEXTURE_HASH=blake3 | Conteúdo das texturas comparado com blake3, como antes (por padrão um resumo de 128 bits, 3 a 5 vezes mais rápido neste i7) |
+| VICTORY_KEEP_SHOWN=0 | Um slot reescrito com outra textura fica nulo até ela ser feita; por padrão mostra a anterior se for do mesmo tipo (=2: qualquer uma da mesma dimensão) |
+| VICTORY_TEXTURE_AWAY_MS=0 | Um slot cuja textura perdeu a memória fica nulo na hora; por padrão continua mostrando-a por 3000 ms |
+| VICTORY_COPY_OVER_TITLE=0 | A primeira cópia para uma textura do jogo vai sobre o que a memória dela tinha; por padrão sobre zeros (=title: sobre a memória do jogo) |
+| VICTORY_INDIRECT_POOL=0 | Cada lista guarda os buffers de desenho indireto |
 
 Com a telemetria, o arquivo de erros recebe também uma linha "video memory"
 quando o jogo termina de criar os alvos e a cada minuto: a VRAM por classe
 (alvos usados, alvos nunca usados, texturas transmitidas e seus heaps), o
-limite de tamanho em vigor e quantas texturas ele corta.
+limite de tamanho em vigor e quantas texturas ele corta, seguida de uma
+linha com as reconferências, os slots que mantiveram a textura e as
+cópias sobre zeros. Cada mudança do limite gera uma linha "tex_cap".
 
 Chaves de comparação para a placa NVIDIA (no processo que chama o
 launcher):

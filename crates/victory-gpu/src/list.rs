@@ -993,10 +993,30 @@ extern "system" fn copy_texture_region(
             return;
         }
         ensure_state(&list, dst.resource, COPY_DEST);
-        crate::texture::host_written(
-            dst.resource,
-            crate::resource::host_copy(dst.resource).as_deref(),
-        );
+        // The first copy into a texture the title fills, which nothing
+        // uploaded: what the copy does not write is zeros, not what the
+        // host copy's memory held before ([`crate::texture::copy_over`]).
+        let copy = crate::resource::host_copy(dst.resource);
+        let over = crate::texture::copy_over();
+        if over != crate::texture::Over::AsBefore
+            && crate::texture::title_written(to)
+            && copy.as_ref().is_some_and(|c| !c.initialized.load(std::sync::atomic::Ordering::Acquire))
+            && !crate::texture::host_wrote(dst.resource)
+            && !crate::texture::is_staged(dst.resource)
+            && !list.has_used(dst.resource as usize)
+        {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| format!("zeros under the first copy to {:?}", dst.resource));
+            match over {
+                crate::texture::Over::Zeros => {
+                    let _ = list.first_use(dst.resource as usize);
+                    crate::texture::zeros(&list, to);
+                }
+                _ => crate::texture::upload(&list, dst.resource, to),
+            }
+            OVER_ZEROS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        crate::texture::host_written(dst.resource, copy.as_deref());
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         #[cfg(feature = "diagnostics")]
@@ -1489,6 +1509,11 @@ fn sync_barrier() -> bool {
 
 /// The title's syncs so far.
 static SYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// First copies into textures the title fills that went over zeros (or
+/// title memory, `VICTORY_COPY_OVER_TITLE=title`), since the start.
+#[cfg(windows)]
+pub(crate) static OVER_ZEROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Those since the last call.
 pub(crate) fn take_syncs() -> u64 {
