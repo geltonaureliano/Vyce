@@ -116,11 +116,24 @@ fn last(kind: u32) -> &'static AtomicU64 {
     &LAST[(kind as usize).min(LAST.len() - 1)]
 }
 
+/// Whether a blocking wait for an event that happened since the last wait
+/// for it (a frame took longer than a tick) ends at once, on the tick that
+/// passed (`VYCE_LATE_TICKS=0`: it sleeps on to the next one, as before: two
+/// milliseconds of every frame that takes hundreds). From
+/// github.com/DexNom/VIctory (`VICTORY_LATE_WAITS`).
+fn late_ticks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VYCE_LATE_TICKS").is_none_or(|v| v != "0"))
+}
+
 /// The next tick after now and after the last one a wait for `kind` took
 /// (an event happens once per tick: a wait woken a little early must not
 /// let the next one end on the same tick), and how long until it. A wait
 /// that comes within `limit` takes the tick here, under the clock's lock,
 /// so two threads waiting for one kind never take the same tick.
+///
+/// A wait that would come within `limit` (not a poll) takes the tick before
+/// instead, which has passed, if none took that ([`late_ticks`]).
 fn next_tick(kind: u32, limit: Duration) -> (u64, Duration) {
     let mut clock = clock();
     let c = clock.get_or_insert_with(|| Clock {
@@ -133,7 +146,12 @@ fn next_tick(kind: u32, limit: Duration) -> (u64, Duration) {
     let tick =
         (c.first + (elapsed / interval + 1) as u64).max(last(kind).load(Ordering::Relaxed) + 1);
     let at = u128::from(tick - c.first) * interval;
-    let wait = Duration::from_nanos(at.saturating_sub(elapsed) as u64);
+    let mut wait = Duration::from_nanos(at.saturating_sub(elapsed) as u64);
+    let mut tick = tick;
+    if wait <= limit && late_ticks() && tick > last(kind).load(Ordering::Relaxed) + 1 {
+        // The one before is none's yet, and none after now is.
+        (tick, wait) = (tick - 1, Duration::ZERO);
+    }
     if wait <= limit {
         last(kind).fetch_max(tick, Ordering::Relaxed);
     }
@@ -209,8 +227,12 @@ pub(crate) extern "system" fn statistics(
 mod tests {
     use super::*;
 
+    /// The clock is the process's: one test at a time.
+    static ONE: Mutex<()> = Mutex::new(());
+
     #[test]
     fn waits_end_on_ticks_and_count_frames() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         let null = std::ptr::null();
         assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
         let mut first = 0;
@@ -249,10 +271,34 @@ mod tests {
                 LAST[2].load(Ordering::Relaxed)
             })
             .collect();
-        assert!(flips.windows(2).all(|w| w[1] == w[0] + 1), "{flips:?}");
+        // (Not the very next one if the machine stood still for a tick.)
+        assert!(flips.windows(2).all(|w| w[1] > w[0]), "{flips:?}");
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP, Duration::ZERO);
         assert!(tick > flips[3]);
+
+        // A frame that took three ticks and a half: its flip has passed and
+        // ends at once, the next one is still to come, and those before are
+        // not made up for. A poll takes nothing.
+        if !late_ticks() {
+            return;
+        }
+        let first = last(FLIP).load(Ordering::Relaxed);
+        let second = Duration::from_secs(1);
+        *clock() = Some(Clock {
+            start: Instant::now() - 35 * second,
+            interval: 10 * second,
+            first,
+        });
+        let (tick, rest) = next_tick(FLIP, Duration::ZERO);
+        assert!(tick == first + 4 && rest > Duration::ZERO);
+        assert_eq!(next_tick(FLIP, 100 * second), (first + 3, Duration::ZERO));
+        let (tick, rest) = next_tick(FLIP, Duration::ZERO);
+        assert!(tick == first + 4 && rest > Duration::ZERO);
+        let (tick, rest) = next_tick(FLIP, 100 * second);
+        assert!(tick == first + 4 && rest > second && rest <= 5 * second, "{tick} in {rest:?}");
+        // The other waits' clock again.
+        assert_eq!(set_interval(null, null, 5_000, 3, 0), S_OK);
     }
 
     /// Two waits for one kind that begin together (two threads) take two
@@ -260,6 +306,7 @@ mod tests {
     /// none. The old code marked the tick after the sleep, so both got it.
     #[test]
     fn waits_begun_together_take_different_ticks() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         const VBLANK: u32 = 1;
         let long = Duration::from_secs(1);
         let (first, _) = next_tick(VBLANK, long);

@@ -30,6 +30,8 @@ pub mod device;
 mod draw;
 pub mod dxgi;
 pub mod fence;
+#[cfg(windows)]
+mod flight;
 pub mod frame;
 #[cfg(windows)]
 mod host;
@@ -40,6 +42,7 @@ pub mod list;
 mod memwait;
 #[cfg(windows)]
 mod memory;
+mod pool;
 mod telemetry;
 mod timeline;
 pub mod memstat;

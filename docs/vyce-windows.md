@@ -103,10 +103,40 @@ por quadro e os novos campos ms e prepare_ms do aviso de submissão lenta.
 
 ## Painel de diagnóstico
 
-A ação Run abre o jogo e o painel do Vyce. O painel mostra FPS, tempo e
-desenhos por quadro, quadros apresentados, preparação da CPU, espera pelas
-submissões da GPU, descartes e logs. A atividade de carregamento reflete
-os eventos observados nos logs e no renderizador.
+A ação Run abre o jogo e, na borda direita da tela, o painel do Vyce, sem
+tirar o foco do jogo. A parte de cima mostra o momento:
+
+- o FPS, o tempo de cada quadro, há quanto tempo veio a última medida e um
+  gráfico dos últimos 2 minutos. Sem quadro novo por 4 s, o número fica
+  cinza e o painel diz há quanto tempo o jogo não apresenta nada. No
+  gráfico, 1, 10 e 100 FPS ficam à mesma distância, para poucos quadros por
+  segundo não sumirem ao lado das centenas de um menu;
+- a faixa de carregamento: etapa, porcentagem, tempo que falta e o que o
+  carregamento espera (o disco ou pipelines), das linhas VYCE_LOADING. Sem
+  essas linhas, a etapa é deduzida dos quadros, sem porcentagem. Se o log
+  inteiro para por 10 s, a faixa avisa que o jogo pode estar parado;
+- para onde vai o tempo do quadro: GPU, preparo na CPU, cópia de volta e o
+  resto, numa barra, com uma frase sobre quem segura o quadro. O mouse
+  sobre cada parte mostra os detalhes. Embaixo, os números de como o
+  trabalho chega à GPU que a build informar: envios e chamadas
+  ExecuteCommandLists, esperas pela GPU, sinais adiados, syncs, desenhos
+  indiretos e desenhos deixados de fora;
+- VRAM usada e o limite (e quanto vai em texturas e nas imagens em que o
+  jogo desenha, se a build informar), RAM, processador, limite de textura,
+  desenhos e descartados por quadro, pipelines na fila e buffers na VRAM.
+
+Campos de VYCE_TELEMETRY que a build não tem ficam de fora; os que o painel
+não conhece aparecem, com o nome de origem, em Copiar resumo.
+
+Embaixo, Resumo lista os eventos em português, com as repetições juntas e
+contadas: etapas, avisos e erros. Um clique em um evento mostra o que ele
+quer dizer e as linhas do log de onde veio. Técnico mostra o log limpo, com
+filtro; o filtro também acha as linhas repetitivas, e Mostrar tudo inclui
+essas linhas e as de telemetria.
+Copiar resumo põe na área de transferência um texto curto para colar numa
+conversa: placa, versão, medianas do último minuto, avisos por tipo e os
+últimos erros. Quando o jogo termina, o painel diz como (janela fechada,
+placa de vídeo parou, travamento, código de saída) e continua aberto.
 
 O painel atualiza CPU e RAM do sistema e do jogo a cada segundo. A RAM do
 sistema mostra uso, total e memória disponível. A RAM do jogo corresponde
@@ -115,12 +145,18 @@ total da máquina. O painel também mostra o número de processadores
 lógicos e de threads do jogo.
 
 Use -NoDebugWindow para abrir só o jogo. Fechar o painel mantém a sessão
-do jogo aberta.
+do jogo aberta. VYCE_PANEL_BOUNDS=x,y,largura,altura abre o painel nesse
+lugar. A parte do painel escrita em C# é compilada na primeira vez e
+guardada na pasta temporária; depois o painel abre em cerca de um segundo.
+Se ela não compilar, abre um painel simples com os números e os avisos;
+VYCE_PANEL=simples abre esse painel de propósito. O arquivo .monitor.log ao
+lado dos logs guarda as falhas do próprio painel e quanto tempo ele levou
+para ler o log na abertura.
 
 Os dois registros continuam em Vyce-data\logs. Nas builds com telemetria,
 o arquivo de erros também recebe uma linha VYCE_TELEMETRY por amostra para
-permitir comparações posteriores. O painel omite essas linhas brutas da
-visualização de logs.
+permitir comparações posteriores. O painel lê os registros desde o começo,
+então pode ser aberto a qualquer momento.
 
 A telemetria separa o trabalho da GPU da espera por ela. Estes campos de
 VYCE_TELEMETRY são por quadro, exceto os de memória:
@@ -165,6 +201,33 @@ launcher):
 
 Cada uma dessas chaves do tradutor muda a chave do cache de shaders: com
 uma delas trocada, todos os shaders são traduzidos de novo (o log avisa).
+
+Chaves de comparação do trabalho da CPU (todas ligadas por padrão; o valor
+0 volta ao comportamento de antes, no processo que chama o launcher):
+
+| Variável | Efeito |
+| --- | --- |
+| VYCE_LATE_SIGNAL=0 | Cada sinal de fila e cada fila parada numa espera esperam a GPU terminar tudo (hoje o sinal vai para trás do que a GPU roda e uma thread própria encerra as submissões quando a GPU termina) |
+| VYCE_FREE_PRESENT=0 | O present espera a GPU terminar tudo antes de copiar o quadro |
+| VYCE_LATE_TICKS=0 | Uma espera de quadro cujo tick já passou dorme até o próximo |
+| VYCE_ONE_ECL=0 | Cada lista vai à fila numa chamada própria (hoje uma chamada por submissão, no máximo VYCE_ECL_LISTS listas, 32) |
+| VYCE_KEPT_POOL=0 | Threads novas a cada trabalho dividido (hoje 5 threads mantidas) |
+| VYCE_ONE_PASS=0 | Cópia de referência e comparação a cada faixa declarada (hoje uma passada por submissão) |
+| VYCE_PLAN_EXTRA=0 | O plano de descritores inteiro é refeito por poucos slots novos |
+| VYCE_OPENING=0, VYCE_PIN_ALWAYS=0 | As cópias próprias para a memória do jogo voltam a fixar páginas; o caminho rápido de guarda volta a ignorar as fixações |
+| VYCE_WIDE_REFRESH=0 | As atualizações das cópias de um grupo rodam uma após a outra |
+| VYCE_ASK_AHEAD=0 | Cada atualização pergunta ao kernel pelas páginas escritas da sua faixa (hoje uma pergunta por grupo) |
+| VYCE_JOIN_COPIES=0 | Cópias do jogo que continuam a anterior ficam em passos separados |
+| VYCE_LAZY_PRELUDE=0 | Toda lista nasce com a sua lista de transições, use ou não |
+| VYCE_SHARED_LOOKUPS=0 | As buscas de memória das gravações tomam a tabela só para si |
+
+Campos de VYCE_TELEMETRY desse trabalho (por quadro): gpu_idle_ms (GPU
+parada entre submissões), wait_*_ms e drains_* (tempo e número de esperas
+pela GPU por motivo: execute, signal, work, held, present, fence, list),
+late_signals, late_waits, landed e landed_here (submissões encerradas, e
+as encerradas por quem precisou antes da thread própria), ecl_calls,
+host_lists, watch_asks, watch_ms e watch_ahead (perguntas ao kernel e
+respostas do grupo), copies_joined, flights_max.
 
 Para abrir o painel de uma sessão já em execução sem reiniciar o jogo,
 execute scripts\vyce-monitor.ps1 e passe -GamePid, -StdoutLog e -StderrLog.
