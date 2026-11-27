@@ -121,7 +121,10 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use rectangle::rectangle_geometry;
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE};
+pub use shader::{
+    ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED,
+    VIEW_STRIDE_BITS,
+};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -207,6 +210,164 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
 pub fn rays() -> bool {
     static RAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *RAYS.get_or_init(|| cfg!(test) || std::env::var("VICTORY_RAYS").is_ok_and(|v| v == "1"))
+}
+
+/// Translation rules that can be turned back to compare pictures or GPU
+/// time (A/B). Each is read once from its environment variable (`0` off, `1`
+/// on, anything else the default) and is part of the shader cache key
+/// ([`switches`]), so a changed one translates every shader again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Switch {
+    /// `VICTORY_EXACT_NORM=0`: normalized buffer codes divided by the host
+    /// again, which an RTX 2070 SUPER does one ulp off for 126 of the 256
+    /// 8-bit codes and 512 of the 65,536 16-bit ones (a code stored as a
+    /// material index comes back as the one below).
+    ExactNorm,
+    /// `VICTORY_D16_INTEGER=0`: 16-bit typed accesses of views of integer
+    /// formats converted through f16 again (their bits came out as noise).
+    D16Integer,
+    /// `VICTORY_WAVE_FORMS=0`: a console wave64 program the 32-lane forms
+    /// refuse is refused, without trying it again with its early-outs and
+    /// skips left out ([`crate::ir::without_skips`]); and a one-wave group
+    /// with LDS is not taken as local waves of such a form.
+    WaveForms,
+    /// `VICTORY_INTERP_F16_MODS=0`: a 16-bit interpolation writes its low
+    /// half without its output modifiers again.
+    InterpF16Mods,
+    /// `VICTORY_F16_NEAREST=1` (off by default): 16-bit float results round
+    /// to nearest as on the console, not as the host converts (Turing
+    /// rounds toward zero, measured), at about a dozen instructions each.
+    F16Nearest,
+    /// `VICTORY_STRIDE_ONCE=0`: the host's table of strides read at every
+    /// use again, rather than once per view and block.
+    StrideOnce,
+    /// `VICTORY_LDS_LOCAL=0`: one-wave groups with LDS whose wave
+    /// operations are only the allocation idiom run in the console flow
+    /// again, not as two local 32-lane waves that meet around their LDS
+    /// accesses ([`local_waves`]).
+    LdsLocal,
+    /// `VICTORY_LOCAL_MEET_CHECKS=0`: the two local waves of a one-wave
+    /// group meet where the fork put their group barriers again: also in
+    /// the blocks of a loop that lanes leave after different numbers of
+    /// turns, inside branches on scalars the two host waves may hold apart
+    /// (the slots each reserved, a lane read, a scalar load of memory the
+    /// dispatch writes), and in programs that reach
+    /// memory by address (their last group's threads past the dispatch
+    /// return at once). Each can leave a host thread waiting at a barrier
+    /// the others never reach: a hang (`lower::local_lds`).
+    LocalMeetChecks,
+    /// `VICTORY_LOOP_EARLY_OUTS=0`: the forms without early-outs leave out
+    /// an early-out on a loop too, where it may be the loop's only way out:
+    /// its lanes then go round with EXEC clear until the loop limit
+    /// ([`crate::ir::without_early_outs`]).
+    LoopEarlyOuts,
+    /// `VICTORY_HOST_WAVE_READS=0`: with the meeting checks on, what the two
+    /// host waves may hold apart is found as in 1952aaf again: a value is
+    /// taken as alike in the lanes whatever its instruction reads beside its
+    /// operands (an accumulator's old value, a swap's, `v_div_fmas_f32`'s
+    /// VCC) and whatever lanes a select's or carry's mask holds, and a
+    /// scalar load as alike in both host waves whatever writes its memory.
+    /// A lane read of such a value can then part the host waves at a
+    /// barrier: a hang (`local_waves::host_wave_varying`).
+    HostWaveReads,
+}
+
+impl Switch {
+    /// Every switch, in the order of [`switches`]'s bits.
+    pub const ALL: [Switch; 10] = [
+        Switch::ExactNorm,
+        Switch::D16Integer,
+        Switch::WaveForms,
+        Switch::InterpF16Mods,
+        Switch::F16Nearest,
+        Switch::StrideOnce,
+        Switch::LdsLocal,
+        Switch::LocalMeetChecks,
+        Switch::LoopEarlyOuts,
+        Switch::HostWaveReads,
+    ];
+
+    /// The environment variable that sets it.
+    pub fn var(self) -> &'static str {
+        match self {
+            Switch::ExactNorm => "VICTORY_EXACT_NORM",
+            Switch::D16Integer => "VICTORY_D16_INTEGER",
+            Switch::WaveForms => "VICTORY_WAVE_FORMS",
+            Switch::InterpF16Mods => "VICTORY_INTERP_F16_MODS",
+            Switch::F16Nearest => "VICTORY_F16_NEAREST",
+            Switch::StrideOnce => "VICTORY_STRIDE_ONCE",
+            Switch::LdsLocal => "VICTORY_LDS_LOCAL",
+            Switch::LocalMeetChecks => "VICTORY_LOCAL_MEET_CHECKS",
+            Switch::LoopEarlyOuts => "VICTORY_LOOP_EARLY_OUTS",
+            Switch::HostWaveReads => "VICTORY_HOST_WAVE_READS",
+        }
+    }
+
+    /// Whether it is on when its variable says nothing.
+    pub fn default_on(self) -> bool {
+        !matches!(self, Switch::F16Nearest)
+    }
+
+    /// Whether it is on.
+    pub fn on(self) -> bool {
+        #[cfg(test)]
+        if let Some(on) = FORCED.with(|f| f.get()[self as usize]) {
+            return on;
+        }
+        static READ: std::sync::OnceLock<[bool; Switch::ALL.len()]> = std::sync::OnceLock::new();
+        READ.get_or_init(|| {
+            Switch::ALL.map(|s| match std::env::var(s.var()).as_deref().map(str::trim) {
+                Ok("0") => false,
+                Ok("1") => true,
+                _ => s.default_on(),
+            })
+        })[self as usize]
+    }
+}
+
+/// The switches as bits (bit n set: [`Switch::ALL`]`[n]` is on), for cache
+/// keys and logs.
+pub fn switches() -> u32 {
+    Switch::ALL
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.on())
+        .fold(0, |bits, (n, _)| bits | 1 << n)
+}
+
+/// [`switches`] with every switch at its default.
+pub fn default_switches() -> u32 {
+    Switch::ALL
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.default_on())
+        .fold(0, |bits, (n, _)| bits | 1 << n)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: switches set on this thread, whatever the environment says.
+    static FORCED: std::cell::Cell<[Option<bool>; Switch::ALL.len()]> =
+        const { std::cell::Cell::new([None; Switch::ALL.len()]) };
+}
+
+/// Tests: runs `f` with switch `s` on or off on this thread.
+#[cfg(test)]
+pub(crate) fn with_switch<R>(s: Switch, on: bool, f: impl FnOnce() -> R) -> R {
+    let before = FORCED.with(|c| {
+        let mut all = c.get();
+        let was = all[s as usize];
+        all[s as usize] = Some(on);
+        c.set(all);
+        was
+    });
+    let r = f();
+    FORCED.with(|c| {
+        let mut all = c.get();
+        all[s as usize] = before;
+        c.set(all);
+    });
+    r
 }
 
 /// Slots the host's view heaps have at least (`victory-gpu` pads them); the
@@ -408,6 +569,36 @@ pub fn emit(
     target: Target,
 ) -> Result<HostShader, ShaderError> {
     let original = emit_program(c, native, p, st, io, res, target);
+    let wave64_on_32 =
+        native.stage == HwStage::Cs && native.wave64 && target.runs(32) && !target.runs(64);
+    // A console wave64 compute program the 32-lane forms refuse: once more
+    // without its early-outs, then without the skips its scalars do not
+    // see ([`ir::without_skips`]). Lanes whose EXEC is clear walk the code
+    // masked, as the console's wave does where it has no lane, so the body
+    // becomes code every lane runs, where the halves of a console wave can
+    // meet; each form must still pass the rules of the forms it lowers in
+    // (`lockstep::fits` for groups of several waves, `Local`).
+    if matches!(original, Err(ShaderError::Unsupported { .. }))
+        && wave64_on_32
+        && Switch::WaveForms.on()
+        && let Some(shader) = without_branches(c, native, p, res, target, false)
+    {
+        return Ok(shader);
+    }
+    // A group of one console wave with LDS in the console flow: as two
+    // local waves of such a form where its own LDS accesses keep the
+    // waves apart (the early-out of most culls), which meet around them
+    // instead of at every exchange.
+    if let Ok((_, Form::Console)) = &original
+        && wave64_on_32
+        && Switch::WaveForms.on()
+        && Switch::LdsLocal.on()
+        && one_wave_with_lds(native)
+        && let Some(shader) = without_branches(c, native, p, res, target, true)
+    {
+        return Ok(shader);
+    }
+    let original = original.map(|(shader, _)| shader);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -423,7 +614,85 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track_with(&p, &native.layout, native.stage, res.addresses)?;
-    emit_program(c, native, &p, &st, &io, &res, target)
+    emit_program(c, native, &p, &st, &io, &res, target).map(|(shader, _)| shader)
+}
+
+/// The form a program was lowered in ([`emit_program`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Form {
+    /// Per lane (the host's waves as they are, or halves of console waves).
+    PerLane,
+    /// Each host wave of 32 lanes a console wave of its own.
+    Local,
+    /// As the console runs it ([`lower::CONSOLE_FLOW`]).
+    Console,
+}
+
+/// A compute program whose thread group is one console wave of 64 that
+/// uses LDS.
+fn one_wave_with_lds(native: &NativeProgram) -> bool {
+    match &native.io {
+        crate::native::StageIo::Cs(cs) => {
+            native.wave64 && cs.threads.iter().product::<u32>() <= 64 && cs.lds_bytes() > 0
+        }
+        _ => false,
+    }
+}
+
+/// [`emit`]'s other forms of a console wave64 compute program: without its
+/// early-outs, then without its skips ([`ir::without_early_outs`],
+/// [`ir::without_skips`]); the first that translates (with `local`, the
+/// first that translates as local waves). `VICTORY_WHY=1` says what each
+/// gave. (The forms are VIctory-7900XTX's, tried there in this order
+/// before its approximate ones, which are not taken here.)
+fn without_branches(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    res: &resource::Resources,
+    target: Target,
+    local: bool,
+) -> Option<HostShader> {
+    let why = std::env::var_os("VICTORY_WHY").is_some();
+    // (`VICTORY_LOOP_EARLY_OUTS=0`: early-outs on loops left out too)
+    let forms: [(&str, fn(&ir::Program) -> Option<ir::Program>); 2] = [
+        ("without early-outs", |p| {
+            ir::without_early_outs(p, !Switch::LoopEarlyOuts.on())
+        }),
+        ("without skips", |p| {
+            ir::without_skips(p, false, !Switch::LoopEarlyOuts.on())
+        }),
+    ];
+    let mut before: Option<ir::Program> = None;
+    for (name, form) in forms {
+        let Some(q) = form(p) else {
+            continue;
+        };
+        // (no other branch than the form before left out)
+        if before.as_ref() == Some(&q) {
+            continue;
+        }
+        let mut f = q.clone();
+        before = Some(q);
+        // Renaming from registers undoes forwarded reloads: forward them again.
+        crate::sgpr_spill::forward(&mut f);
+        let r = structure::structure(&f).and_then(|st| {
+            let io = io::raise(&f, native)?;
+            let res = resource::track_with(&f, &native.layout, native.stage, res.addresses)?;
+            emit_program(c, native, &f, &st, &io, &res, target)
+        });
+        if why {
+            match &r {
+                Ok((_, form)) => eprintln!("wave64 form {name}: translated ({form:?})"),
+                Err(e) => eprintln!("wave64 form {name}: {e}"),
+            }
+        }
+        match r {
+            Ok((shader, form)) if !local || form == Form::Local => return Some(shader),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn emit_program(
@@ -434,7 +703,7 @@ fn emit_program(
     io: &io::Io,
     res: &resource::Resources,
     target: Target,
-) -> Result<HostShader, ShaderError> {
+) -> Result<(HostShader, Form), ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -534,7 +803,7 @@ fn emit_program(
         crate::native::StageIo::Cs(cs)
             if native.wave64 && target.runs(32) && !target.runs(64) =>
         {
-            Local::of(cs.threads.iter().product(), uses_lds(p), local_waves::sums(p), || {
+            let independent = || {
                 let found = local_waves::independent(p, st);
                 if let Err((offset, why)) = found
                     && std::env::var_os("VICTORY_WHY").is_some()
@@ -542,16 +811,29 @@ fn emit_program(
                     eprintln!("not independent of how waves are divided: {why} at {offset:#x}");
                 }
                 found.is_ok()
-            })
+            };
+            let meetable = || {
+                let met = lower::lds_meetable(native, p, st, res);
+                if !met && std::env::var_os("VICTORY_WHY").is_some() {
+                    eprintln!("local waves: LDS the two host waves cannot meet around");
+                }
+                met
+            };
+            let threads = cs.threads.iter().product();
+            Local::of(threads, uses_lds(p), local_waves::sums(p), independent, meetable)
         }
         _ => Local::No,
     };
+    let why = std::env::var_os("VICTORY_WHY").is_some();
+    let mut form = Form::PerLane;
     let l = match lower::lower(&parts) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
             if local() == Local::First {
                 parts.local = true;
-                if let Ok(l) = lower::lower(&parts) {
-                    return Ok(host_shader(native, l));
+                match lower::lower(&parts) {
+                    Ok(l) => return Ok((host_shader(native, l), Form::Local)),
+                    Err(e) if why => eprintln!("local waves: {e}"),
+                    Err(_) => {}
                 }
                 parts.local = false;
             }
@@ -560,7 +842,11 @@ fn emit_program(
                 Ok(console) => {
                     parts.st = console;
                     parts.console_cf = true;
-                    lower::lower(&parts)
+                    let l = lower::lower(&parts);
+                    if why && let Err(e) = &l {
+                        eprintln!("console flow: {e}");
+                    }
+                    l
                 }
                 Err(e) => Err(ShaderError::Unsupported {
                     offset: 0,
@@ -571,7 +857,10 @@ fn emit_program(
                 }),
             };
             match lowered {
-                Ok(l) => l,
+                Ok(l) => {
+                    form = Form::Console;
+                    l
+                }
                 // What the console flow cannot lower keeps the per-lane form
                 // where that translates; else the console flow's reason.
                 Err(e) => {
@@ -584,11 +873,17 @@ fn emit_program(
         }
         Err(e @ ShaderError::Unsupported { .. }) if local() != Local::No => {
             parts.local = true;
-            lower::lower(&parts).map_err(|_| e)?
+            form = Form::Local;
+            lower::lower(&parts).map_err(|l| {
+                if why {
+                    eprintln!("local waves: {l}");
+                }
+                e
+            })?
         }
         l => l?,
     };
-    Ok(host_shader(native, l))
+    Ok((host_shader(native, l), form))
 }
 
 /// When a console wave64 compute program on a host of 32-lane waves runs with
@@ -596,10 +891,12 @@ fn emit_program(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Local {
     /// Never: the wave is its whole thread group to it, or it shares LDS
-    /// within the wave without barriers.
+    /// within the wave without barriers where the two host waves cannot
+    /// meet around its accesses (`lower::lds_meetable`).
     No,
-    /// Before the console flow: the same result without exchanges. (What
-    /// translates in the per-lane form keeps it.)
+    /// Before the console flow: the same result without exchanges (the
+    /// idiom's slots in another order). (What translates in the per-lane
+    /// form keeps it.)
     First,
     /// Where nothing else translates it.
     Last,
@@ -608,11 +905,25 @@ enum Local {
 impl Local {
     /// For a program of `threads` per group that uses LDS if `lds` and sums
     /// over its waves if `sums`, where `independent` says its waves may be
-    /// divided another way.
-    fn of(threads: u32, lds: bool, sums: bool, independent: impl FnOnce() -> bool) -> Local {
-        // A group of one wave needs no barriers on the console.
+    /// divided another way, and `meetable` that the two host waves of a
+    /// one-wave group can keep its LDS order with group barriers.
+    fn of(
+        threads: u32,
+        lds: bool,
+        sums: bool,
+        independent: impl FnOnce() -> bool,
+        meetable: impl FnOnce() -> bool,
+    ) -> Local {
+        // A group of one wave needs no barriers on the console: its LDS
+        // accesses are ordered by the two host waves meeting around them
+        // (`VICTORY_LDS_LOCAL=0`: the console flow instead), where the
+        // program uses wave operations only for the allocation idiom.
         if lds && threads <= 64 {
-            return Local::No;
+            return if Switch::LdsLocal.on() && meetable() && independent() {
+                Local::First
+            } else {
+                Local::No
+            };
         }
         if independent() {
             Local::First
@@ -2768,6 +3079,176 @@ mod packed_half_tests {
             validator::Validator::load(validator::Validator::default_path().as_deref())
         {
             v.validate(&mut shader.dxil.clone()).unwrap();
+        }
+    }
+
+    /// A pixel program completing `v_interp_p1_f32 v2, v0, attr0.x` with
+    /// `v_interp_p2_f16 v3, attr0.x, v1, v2` (a 16-bit input of 0.75 from
+    /// every vertex), its op_sel[3], clamp and omod bits as given, exporting
+    /// v3 (0x4000_0000 before) as the target's red.
+    fn interpolated_half(high: bool, omod: u32, clamp: bool) -> Result<HostShader, ShaderError> {
+        let mut w0 = 0x35u32 << 26 | 0x35a << 16 | 3;
+        if high {
+            w0 |= 1 << 14; // op_sel[3]: the high destination half
+        }
+        if clamp {
+            w0 |= 1 << 15;
+        }
+        let w1 = (256 + 1) << 9 | (256 + 2) << 18 | omod << 27;
+        let words = [
+            0x7E06_02FF,
+            0x4000_0000, // v_mov_b32 v3, 0x40000000
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            w0,
+            w1, // v_interp_p2_f16 v3, attr0.x, v1, v2
+            0xF800_180F,
+            0x0303_0303, // exp mrt0 v3, v3, v3, v3 done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![PsInput { pack2: false, ..input(0, 0xf, 0, false, true) }],
+                // PERSP_CENTER.
+                input_addr: 2,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let mut isg1 = container::signature(&[element(0, 0, 4, 9, true)], true);
+        isg1[8 + 16..8 + 20].copy_from_slice(&6u32.to_le_bytes()); // float16
+        let target = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let osg1 = container::signature(&[target], false);
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+        let res = resource::track(&p, &native.layout, native.stage)?;
+        let io = io::raise(&p, &native)?;
+        let st = structure::structure(&p)?;
+        emit(&c, &native, &p, &st, &io, &res, crate::emit::Target::ANY)
+    }
+
+    /// A vertex program for [`interpolated_half`]: a triangle over the whole
+    /// target from the vertex id, TEXCOORD0 0.75 at every vertex.
+    #[cfg(windows)]
+    fn constant_attribute_vs() -> HostShader {
+        use super::bitcode::{Attr, Term};
+        let mut s = super::shader::Shader::new(false);
+        let b = s.entry;
+        let mut id = element(0, 0, 1, 5, false);
+        id.name = "SV_VertexID".into();
+        id.kind = 1;
+        s.inputs = vec![id];
+        let mut position = element(0, 1, 4, 9, false);
+        position.name = "SV_Position".into();
+        position.kind = 3;
+        let mut texcoord = element(0, 0, 4, 9, false);
+        texcoord.interp = 2;
+        s.outputs = vec![texcoord, position];
+        for e in &mut s.outputs {
+            e.usage = 0xf;
+        }
+        let u = s.m.undef(s.t.i32);
+        let args = [s.m.i32(0), s.m.i32(0), s.m.i8(0), u];
+        let v = s.op(b, "loadInput.i32", Attr::ReadNone, s.t.i32, 4, &args);
+        // (-1, -1), (-1, 3), (3, -1): x = (id & 2) * 2 - 1, y = (id & 1) * 4 - 1.
+        let (two, one, four) = (s.m.i32(2), s.m.i32(1), s.m.i32(4));
+        let x = s.m.bin(b, super::bitcode::Bin::And, v, two);
+        let x = s.m.bin(b, super::bitcode::Bin::Mul, x, two);
+        let y = s.m.bin(b, super::bitcode::Bin::And, v, one);
+        let y = s.m.bin(b, super::bitcode::Bin::Mul, y, four);
+        let (x, y) = (
+            s.m.cast(b, super::bitcode::Cast::SiToFp, x, s.t.f32),
+            s.m.cast(b, super::bitcode::Cast::SiToFp, y, s.t.f32),
+        );
+        let minus = s.m.f32((-1.0f32).to_bits());
+        let x = s.m.bin(b, super::bitcode::Bin::Add, x, minus);
+        let y = s.m.bin(b, super::bitcode::Bin::Add, y, minus);
+        let (zero, w) = (s.m.f32(0), s.m.f32(1f32.to_bits()));
+        let attribute = s.m.f32(0.75f32.to_bits());
+        for (id, values) in [(0, [attribute; 4]), (1, [x, y, zero, w])] {
+            for (col, value) in values.into_iter().enumerate() {
+                let args = [s.m.i32(id), s.m.i32(0), s.m.i8(col as u8), value];
+                s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+            }
+        }
+        s.m.terminate(b, Term::Ret);
+        HostShader {
+            stage: HwStage::Vs,
+            dxil: s.finish(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            stride_table: false,
+        }
+    }
+
+    /// A 16-bit interpolation writes the half op_sel[3] picks, the other
+    /// kept, after its output modifier and clamp (VIctory-7900XTX b9c18b0,
+    /// after VIctory e29391f); with `VICTORY_INTERP_F16_MODS=0` the low half
+    /// as before. Drawn on the hardware adapter and WARP.
+    #[cfg(windows)]
+    #[test]
+    fn interpolated_halves_write_the_op_sel_half_with_modifiers() {
+        let vs = constant_attribute_vs();
+        // (shader, the dword exported)
+        let cases = [
+            (interpolated_half(false, 0, false).unwrap(), 0x4000_3A00u32), // low half: 0.75
+            (interpolated_half(true, 0, false).unwrap(), 0x3A00_0000),     // high half: 0.75
+            (interpolated_half(true, 1, true).unwrap(), 0x3C00_0000),      // x2, clamped: 1.0
+            (interpolated_half(false, 3, false).unwrap(), 0x4000_3600),    // /2: 0.375
+            (
+                super::with_switch(super::Switch::InterpF16Mods, false, || interpolated_half(true, 1, true)).unwrap(),
+                0x4000_3A00, // as before: the low half, no modifiers
+            ),
+        ];
+        let mut ran = 0;
+        for warp in [false, true] {
+            let Ok(host) = super::host::Host::new(warp) else { continue };
+            for (n, (ps, want)) in cases.iter().enumerate() {
+                let (root, pso) = host.pipeline(&vs, ps).unwrap_or_else(|e| panic!("warp {warp}: case {n}: {e}"));
+                let texels = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &super::host::Draw {
+                            roots: Vec::new(),
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &[],
+                            stride: 0,
+                            size: (4, 4),
+                            mesh_groups: 0,
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("warp {warp}: case {n}: {e}"));
+                for t in &texels {
+                    assert_eq!(t[0].to_bits(), *want, "warp {warp}: case {n}: {:#010x}", t[0].to_bits());
+                }
+            }
+            ran += 1;
+        }
+        if ran == 0 {
+            eprintln!("no host device; skipped");
         }
     }
 

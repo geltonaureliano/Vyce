@@ -15,8 +15,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::gfx10::{Fields, NULL, Operand};
+use crate::gfx10::{Fields, NULL, Operand, Valu};
 use crate::ir::{EXEC, Inst, Program, Reg, Value};
+use crate::native::{NativeProgram, ResourceType, RootType, UsedResource};
+use crate::resource::{Address, CODE, Resources, Role, Site, Source};
 use crate::structure::{Atom, LaneExit, Structured};
 
 type Why = &'static str;
@@ -350,4 +352,413 @@ pub(crate) fn independent(p: &Program, st: &Structured) -> Result<(), (usize, &'
         return Err((0, MIXED));
     }
     pass(&mut kind, &mut firsts, true)
+}
+
+/// Whether a vector ALU instruction reads its destination's old value
+/// beside its operands: an accumulator (`v_fmac_f32`, `v_mac_f32`,
+/// `v_fmac_legacy_f32`, `v_mac_legacy_f32`, their 16-bit and packed forms,
+/// the `v_dot*c` forms), a swap (its operand takes the destination's old
+/// value), or a write of part of the destination, which keeps the rest
+/// (SDWA, a 16-bit result, a result into the high half by opsel).
+fn reads_destination(name: &str, v: &Valu) -> bool {
+    v.sdwa.is_some()
+        || v.opsel & 8 != 0
+        || name.contains("16")
+        || name.contains("mac")
+        || name.starts_with("v_dot") && name.contains("c_")
+        || name.starts_with("v_swap")
+}
+
+/// Values the two host waves of a console wave run as local waves may hold
+/// apart, though the lanes of each hold them alike: what a lane read
+/// (`v_readfirstlane_b32`, `v_readlane_b32`) takes from a value the lanes
+/// may hold apart (what the first lane's atomic of the allocation idiom
+/// returned among them: each host wave reserves slots of its own), lane
+/// masks read as numbers, the hardware's state, the scalar loads in
+/// `written` (memory the dispatch may write between the two host waves'
+/// loads, [`loads_of_written_memory`]), what is made of those, and what a
+/// lane branch's region leaves behind (what is set in it, joins where it
+/// ends: one host wave may have run it, or gone round in it more often, and
+/// the other not). A uniform branch on one of them may send the two host
+/// waves different ways, so it has a region too
+/// ([`super::lower::lane_regions`]); what that region leaves behind is
+/// found in turn, to a fixpoint. By value (`Value.0`).
+///
+/// A value is alike in the lanes only if its instruction, unguarded and
+/// not reaching across lanes, reads nothing but alike values: its
+/// operands, and beside them the old value of a destination it reads or
+/// keeps part of ([`reads_destination`]), any other VGPR and a lane mask
+/// (`v_div_fmas_f32`'s VCC). Only the old value of a destination written
+/// whole is not read: just lanes that never get there keep it. Vector loads
+/// are never alike. A lane mask read lane by lane must hold the same bit in
+/// every lane: as a select's or a carry's operand, no lane, every lane or a
+/// uniform select (every lane's bit an SCC); as that VCC, also a compare or
+/// carry of alike values, unless the host waves may hold it apart (set in a
+/// region, joined where it ends, made of what is apart).
+/// `VICTORY_HOST_WAVE_READS=0`: 1952aaf's rules, which counted beside the
+/// operands only a partial write's old value, and among the operands a
+/// lane mask only where EXEC or a compare made it.
+/// shortcut: a scalar load not in `written` reads the same in both host
+/// waves when its address is the same.
+pub(crate) fn host_wave_varying(
+    p: &Program,
+    st: &Structured,
+    g: &super::lower::LaneGraph,
+    written: &HashSet<(usize, usize)>,
+) -> Vec<bool> {
+    let reads = super::Switch::HostWaveReads.on();
+    let n = p.blocks.len().min(g.succ.len());
+    // SSA values are numbered densely: sets of them are bit vectors.
+    let values = p
+        .inputs
+        .iter()
+        .map(|i| i.1)
+        .chain(p.blocks.iter().flat_map(|b| {
+            let phis = b.phis.iter().map(|phi| phi.value);
+            phis.chain(b.insts.iter().flat_map(|i| i.writes.iter().map(|w| w.1)))
+        }))
+        .map(|v| v.0 as usize + 1)
+        .max()
+        .unwrap_or(0);
+    let mut masks = vec![false; values];
+    for v in st.masks.keys().chain(st.highs.keys()) {
+        if let Some(m) = masks.get_mut(v.0 as usize) {
+            *m = true;
+        }
+    }
+    let is_mask = |v: Value| masks.get(v.0 as usize).copied().unwrap_or(false);
+    let has = |set: &[bool], v: Value| set.get(v.0 as usize).copied().unwrap_or(false);
+    let exec = |r: Reg| matches!(r, Reg::S(c) if c == EXEC || c == EXEC + 1);
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    // The instruction (block, index) that writes each value; none for the
+    // inputs and phis.
+    let mut defs: Vec<Option<(usize, usize)>> = vec![None; values];
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            for w in &inst.writes {
+                if let Some(d) = defs.get_mut(w.1.0 as usize) {
+                    *d = Some((b, i));
+                }
+            }
+        }
+    }
+    let def = |v: Value| defs.get(v.0 as usize).copied().flatten();
+    // Whether the lane mask `inst` reads from SGPR `code` on holds the same
+    // bit in every lane by how it was made: no lane, every lane, or a
+    // uniform select (every lane's bit an SCC), both dwords written by one
+    // instruction.
+    let uniform_mask = |inst: &Inst, code: u8| {
+        let Some(lo) = inst.read(Reg::S(code)) else {
+            return false;
+        };
+        let whole = !p.wave64
+            || code
+                .checked_add(1)
+                .and_then(|c| inst.read(Reg::S(c)))
+                .is_some_and(|hi| def(lo).is_some() && def(hi) == def(lo));
+        whole
+            && st.others.get(&lo).is_some_and(|&m| {
+                st.bools.support(m).iter().all(|a| matches!(a, Atom::Uniform(_)))
+            })
+    };
+    // Operand `k` of a vector instruction read lane by lane as a lane mask:
+    // a select's or a carry's (`VICTORY_HOST_WAVE_READS=0`: not looked at).
+    let lane_mask_at = |inst: &Inst, k: usize| {
+        let name = inst.name();
+        reads && k == 2 && (name == "v_cndmask_b32" || name.contains("_co_ci_"))
+    };
+    // A lane mask (or a wave-wide test of one) as operand `k` of a vector
+    // instruction: read as a number, the host wave's lanes; read lane by
+    // lane, a bit that may differ between the lanes.
+    let mask_operand = |inst: &Inst, k: usize, o: &Operand| {
+        let lanes = lane_mask_at(inst, k);
+        match *o {
+            Operand::Scalar { code, dwords } if code != NULL => {
+                (0..dwords).any(|d| {
+                    code.checked_add(d).is_none_or(|c| {
+                        exec(Reg::S(c)) || inst.read(Reg::S(c)).is_some_and(is_mask)
+                    })
+                }) || lanes && !uniform_mask(inst, code)
+            }
+            // vccz, execz, lds_direct; read as a mask, a constant of some
+            // lanes only
+            Operand::Const(c) => matches!(c, 251 | 252 | 254) || lanes && !matches!(c, 128 | 193),
+            Operand::Literal(x) => lanes && x != 0 && (p.wave64 || x != u32::MAX),
+            _ => false,
+        }
+    };
+    // Values every lane holds alike: written, unguarded, by a lane's own
+    // operation that reads nothing but scalars, constants and such values
+    // (see above).
+    let mut alike = vec![false; values];
+    for &b in &order {
+        for (i, inst) in p.blocks[b].insts.iter().enumerate() {
+            let Fields::Valu(v) = &inst.fields else {
+                continue;
+            };
+            let name = inst.name();
+            let lanes = v.dpp.is_some()
+                || ["v_mbcnt", "v_permlane", "v_writelane", "v_interp", "v_movrel", "v_swaprel"]
+                    .iter()
+                    .any(|l| name.starts_with(l));
+            let guarded = st.guards.get(b).and_then(|g| g.get(i)).is_some_and(|g| g.is_some());
+            if lanes || guarded {
+                continue;
+            }
+            let sources = v.src.iter().enumerate().all(|(k, o)| match *o {
+                Operand::Vector { reg, dwords } => (0..dwords).all(|d| {
+                    reg.checked_add(d)
+                        .and_then(|r| inst.read(Reg::V(r)))
+                        .is_some_and(|x| has(&alike, x))
+                }),
+                _ => !mask_operand(inst, k, o),
+            });
+            let beside = if reads {
+                let within = |x: u8, start: u8, count: u8| {
+                    (u16::from(start)..u16::from(start) + u16::from(count)).contains(&u16::from(x))
+                };
+                // A register an operand names (checked above).
+                let named = |r: Reg| {
+                    v.src.iter().any(|o| match (*o, r) {
+                        (Operand::Vector { reg, dwords }, Reg::V(x)) => within(x, reg, dwords),
+                        (Operand::Scalar { code, dwords }, Reg::S(x)) => within(x, code, dwords),
+                        _ => false,
+                    })
+                };
+                // A destination VGPR written whole: its old value is not read.
+                let whole = |x: u8| {
+                    !reads_destination(name, v)
+                        && matches!(
+                            v.dst,
+                            Some(Operand::Vector { reg, dwords }) if within(x, reg, dwords)
+                        )
+                };
+                inst.reads.iter().all(|&(r, x)| match r {
+                    _ if named(r) => true,
+                    Reg::V(c) => whole(c) || has(&alike, x),
+                    // a lane mask (VCC), by the pair it starts
+                    Reg::S(c) => {
+                        let pair = if p.wave64 { c & !1 } else { c };
+                        exec(r) || has(&alike, x) || uniform_mask(inst, pair)
+                    }
+                    Reg::Scc => true,
+                })
+            } else {
+                // 1952aaf: a partial write keeps the rest of the old value,
+                // which must be alike too.
+                let partial = v.sdwa.is_some() || v.opsel & 8 != 0 || name.contains("16");
+                !partial
+                    || inst
+                        .reads
+                        .iter()
+                        .filter(|r| {
+                            matches!(r.0, Reg::V(_)) && inst.writes.iter().any(|w| w.0 == r.0)
+                        })
+                        .all(|r| has(&alike, r.1))
+            };
+            if sources && beside {
+                // Lane masks too (a compare's, a carry's): each lane's bit.
+                for w in inst.writes.iter().filter(|w| reads || matches!(w.0, Reg::V(_))) {
+                    if let Some(a) = alike.get_mut(w.1.0 as usize) {
+                        *a = true;
+                    }
+                }
+            }
+        }
+    }
+    // Whether what `inst` writes may differ between the host waves, with
+    // `masks_apart` the lane masks they may hold apart.
+    let apart = |inst: &Inst, varying: &[bool], masks_apart: &[bool]| -> bool {
+        let name = inst.name();
+        // the hardware's state, each wave its own
+        if matches!(
+            name,
+            "s_getreg_b32" | "s_memtime" | "s_memrealtime" | "s_get_waveid_in_workgroup"
+        ) || name.starts_with("s_sendmsg") && name.ends_with("_rtn")
+        {
+            return true;
+        }
+        match &inst.fields {
+            // a lane read of a value the lanes may hold apart: each host
+            // wave reads a lane of its own
+            Fields::Valu(v) if matches!(name, "v_readfirstlane_b32" | "v_readlane_b32") => {
+                let from = match v.src.first() {
+                    Some(&Operand::Vector { reg, .. }) => inst.read(Reg::V(reg)),
+                    _ => None,
+                };
+                if !from.is_some_and(|x| has(&alike, x)) {
+                    return true;
+                }
+            }
+            // a lane mask read as a number: the lanes of one host wave
+            Fields::Sop { .. } if inst.reads.iter().any(|&(r, x)| exec(r) || is_mask(x)) => {
+                return true;
+            }
+            Fields::Valu(v) if v.src.iter().enumerate().any(|(k, o)| mask_operand(inst, k, o)) => {
+                return true;
+            }
+            // a lane mask read lane by lane beside the operands
+            // (`v_div_fmas_f32`'s VCC) that the host waves may hold apart
+            Fields::Valu(_) if inst.reads.iter().any(|&(r, x)| !exec(r) && has(masks_apart, x)) => {
+                return true;
+            }
+            _ => {}
+        }
+        inst.reads.iter().any(|&(r, x)| !exec(r) && has(varying, x))
+    };
+    let mut varying = vec![false; values];
+    // Lane masks the host waves may hold apart, though alike in the lanes
+    // of each: set in a region, joined where it ends, or made of what is
+    // apart (`VICTORY_HOST_WAVE_READS=0`: none).
+    let mut masks_apart = vec![false; values];
+    let mut count = 0;
+    loop {
+        let before = count;
+        // The regions of lane branches and of branches on what is apart so
+        // far, and the blocks their lanes leave them to.
+        let mut inside = vec![false; n];
+        let mut joined = vec![false; n];
+        for (d, r) in super::lower::lane_regions(st, g, &|v| has(&varying, v), true) {
+            for b in (0..n).filter(|&b| r[b] || b == d) {
+                inside[b] |= r[b];
+                for &t in g.succ[b].iter().filter(|&&t| t < n) {
+                    joined[t] |= !r[t];
+                }
+            }
+        }
+        let mut put = |v: Value, set: &mut [bool]| match set.get_mut(v.0 as usize) {
+            Some(x) if !*x => {
+                *x = true;
+                count += 1;
+                true
+            }
+            _ => false,
+        };
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &b in order.iter().filter(|&&b| b < n) {
+                let block = &p.blocks[b];
+                for phi in &block.phis {
+                    if exec(phi.reg) {
+                        continue;
+                    }
+                    let edge = inside[b] || joined[b];
+                    if !is_mask(phi.value) {
+                        if edge || phi.args.iter().any(|&a| has(&varying, a)) {
+                            changed |= put(phi.value, &mut varying);
+                        }
+                    } else if reads && (edge || phi.args.iter().any(|&a| has(&masks_apart, a))) {
+                        changed |= put(phi.value, &mut masks_apart);
+                    }
+                }
+                for (i, inst) in block.insts.iter().enumerate() {
+                    let loaded = written.contains(&(b, i));
+                    if inside[b] || loaded || apart(inst, &varying, &masks_apart) {
+                        for &(r, w) in &inst.writes {
+                            if exec(r) {
+                                continue;
+                            }
+                            if !is_mask(w) {
+                                changed |= put(w, &mut varying);
+                            } else if reads {
+                                changed |= put(w, &mut masks_apart);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if count == before {
+            return varying;
+        }
+    }
+}
+
+/// Scalar loads (by block and instruction) of memory the dispatch itself
+/// may write while it runs, which the two host waves of a console wave run
+/// as local waves may read apart ([`host_wave_varying`]): on the console
+/// the wave loads once, here each host wave loads on its own, and another
+/// group or the other host wave can land a write between the two. Every
+/// load with `glc` or `dlc` (asking past the scalar cache for what was
+/// written since) and every one other than `s_load_*` and `s_buffer_load_*`;
+/// in a program that stores to memory or adds to it (beside LDS and the
+/// lanes' own scratch), every one of a view the program's resources do not
+/// name a constant buffer or shader resource view
+/// ([`super::lower::used_entry`]): an unordered-access view, a descriptor
+/// of the heap or one the code makes, a root view of no given kind; not the
+/// descriptors of a table or a heap, nor the constants after the code.
+/// `VICTORY_HOST_WAVE_READS=0`: none.
+/// shortcut: a constant buffer or shader resource view is not written while
+/// a dispatch reads it, through another view either (D3D12 keeps a resource
+/// in a read state apart from unordered access).
+pub(crate) fn loads_of_written_memory(
+    native: &NativeProgram,
+    p: &Program,
+    res: &Resources,
+) -> HashSet<(usize, usize)> {
+    let mut out = HashSet::new();
+    if !super::Switch::HostWaveReads.on() {
+        return out;
+    }
+    let sites = || {
+        p.blocks.iter().enumerate().flat_map(|(b, block)| {
+            block.insts.iter().enumerate().map(move |(i, inst)| ((b, i), inst))
+        })
+    };
+    // Stores and atomics on memory: not on LDS (or GDS), not on the lanes'
+    // own scratch.
+    let writes = sites().any(|(_, inst)| {
+        let name = inst.name();
+        !matches!(inst.fields, Fields::Ds { .. } | Fields::Exp { .. })
+            && !name.starts_with("scratch_")
+            && (name.contains("_store") || name.contains("_atomic"))
+    });
+    let scalar: HashMap<Site, Address> = res.scalar.iter().copied().collect();
+    // A view the program's resources name a constant buffer or a shader
+    // resource view.
+    let read_only = |u: Option<&UsedResource>| {
+        u.is_some_and(|u| matches!(u.kind, ResourceType::Cbv | ResourceType::Srv))
+    };
+    for (site, inst) in sites() {
+        let Fields::Smem { cache, .. } = &inst.fields else {
+            continue;
+        };
+        let name = inst.name();
+        if !name.contains("_load_") {
+            continue; // stores, cache controls, the hardware's state
+        }
+        let plain = name.starts_with("s_load_") || name.starts_with("s_buffer_load_");
+        let unwritten = if name.starts_with("s_buffer_load_") {
+            // Through a descriptor: every source it may come from.
+            let leaves: Vec<&Source> = res
+                .descriptors
+                .iter()
+                .filter(|d| d.site == site && d.role == Role::Resource)
+                .flat_map(|d| d.source.leaves())
+                .collect();
+            !leaves.is_empty()
+                && leaves.iter().all(|s| match s {
+                    Source::Built { address, .. } if address.param == CODE => true,
+                    s => read_only(super::lower::used_entry(native, &scalar, s)),
+                })
+        } else {
+            // By address: a table's or a heap's descriptors, the code's
+            // constants, a root view.
+            scalar.get(&site).is_some_and(|a| {
+                let root = native.layout.get(a.param).map(|rp| rp.root);
+                a.param == CODE
+                    || matches!(
+                        root,
+                        Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap)
+                    )
+                    || root == Some(RootType::Descriptor)
+                        && read_only(super::lower::root_view_entry(native, a.param))
+            })
+        };
+        if cache.glc || cache.dlc || !plain || writes && !unwritten {
+            out.insert(site);
+        }
+    }
+    out
 }

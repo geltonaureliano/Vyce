@@ -223,3 +223,98 @@ fn only_unclear_heap_descriptors_ask_the_stride_table() {
     // Hosts with one kind of buffer descriptor: no difference.
     assert!(!emit_for(&picked(false), super::Target::ANY).unwrap().stride_table);
 }
+
+/// A 16-bit typed store of `value` to element 0 of the typed UAV at table
+/// slot 1 (`buffer_store_format_d16_x`), its load back
+/// (`buffer_load_format_d16_x`), and the loaded dword stored to the raw UAV at
+/// slot 0.
+fn d16_typed(value: u32) -> NativeProgram {
+    let words = [
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0 (raw UAV)
+        0xF408_0302,
+        0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20 (typed UAV)
+        0x7E00_0280, // v_mov_b32 v0, 0
+        0x7E02_02FF,
+        value,       // v_mov_b32 v1, value
+        0xE210_2000,
+        0x8003_0100, // buffer_store_format_d16_x v1, v0, s[12:15], 0 idxen
+        0xE200_2000,
+        0x8003_0200, // buffer_load_format_d16_x v2, v0, s[12:15], 0 idxen
+        0xE070_1000,
+        0x8002_0200, // buffer_store_dword v2, v0, s[8:11], 0 offen
+        S_ENDPGM,
+    ];
+    let mut p = compute(&words, false);
+    p.layout = vec![param(RootType::Table, 0)];
+    let used = |table_offset_dwords| UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    };
+    p.used = vec![used(0), used(8)];
+    p.io = StageIo::Cs(ComputeIo { rsrc2: 1 << 1, threads: [1, 1, 1] });
+    p
+}
+
+/// 16-bit typed accesses through views of integer formats pass the 16-bit
+/// integer (sign-extended for a store to a signed format, which the host
+/// would clamp otherwise), as the host's table of strides marks them; float
+/// views keep halves. With `VICTORY_D16_INTEGER=0` an integer view's bits
+/// go through f16 as before. (After VIctory-7900XTX 9a6c829.)
+#[test]
+fn d16_data_of_integer_views_keeps_its_bits() {
+    use super::{VIEW_INTEGER, VIEW_SIGNED};
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    let Ok(names) = adapters() else {
+        eprintln!("no DXGI; skipped");
+        return;
+    };
+    // (format, table word, value stored, the view's low 16 bits, loaded)
+    let cases = [
+        (DXGI_FORMAT_R16_UINT, 2 | VIEW_INTEGER, 0x8001u32, 0x8001u32, 0x8001u32),
+        (DXGI_FORMAT_R16_SINT, 2 | VIEW_INTEGER | VIEW_SIGNED, 0x8001, 0x8001, 0x8001),
+        (DXGI_FORMAT_R16_UINT, 2 | VIEW_INTEGER, 0x1234, 0x1234, 0x1234),
+        (DXGI_FORMAT_R16_FLOAT, 2, 0x3C00, 0x3C00, 0x3C00),
+    ];
+    for name in names {
+        let Ok(host) = Host::on(&name) else {
+            continue;
+        };
+        for (n, &(format, word, value, stored, loaded)) in cases.iter().enumerate() {
+            let target = exact(&host);
+            let cs = emit_for(&d16_typed(value), target).unwrap();
+            assert!(cs.stride_table, "the table says what the view is");
+            let (root, pso) = host.compute_pipeline(&cs).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let views = [View::RawUav(4), View::FormatUav(format, 2, 2)];
+            let data = vec![0; (cs.user_data_dwords() as usize).max(1)];
+            let roots = vec![(0, Root::Constants(data)), (1, Root::View { srv: true, data: vec![4, word] })];
+            let out = host
+                .dispatch(&root, &pso, &Dispatch { roots, views: &views, samplers: &[], groups: [1, 1, 1] })
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(out[1][0] & 0xFFFF, stored, "{name}: case {n}, stored");
+            assert_eq!(out[0][0], loaded, "{name}: case {n}, loaded");
+        }
+        // The switch off: through f16, which saturates the store.
+        let cs = super::with_switch(super::Switch::D16Integer, false, || emit_for(&d16_typed(0x8001), exact(&host)))
+            .unwrap();
+        let (root, pso) = host.compute_pipeline(&cs).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let views = [View::RawUav(4), View::FormatUav(DXGI_FORMAT_R16_UINT, 2, 2)];
+        let data = vec![0; (cs.user_data_dwords() as usize).max(1)];
+        let mut roots = vec![(0, Root::Constants(data))];
+        if cs.stride_table {
+            roots.push((1, Root::View { srv: true, data: vec![4, 2 | VIEW_INTEGER] }));
+        }
+        let out = host
+            .dispatch(&root, &pso, &Dispatch { roots, views: &views, samplers: &[], groups: [1, 1, 1] })
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_ne!(out[1][0] & 0xFFFF, 0x8001, "{name}: the old form stores a float");
+    }
+}

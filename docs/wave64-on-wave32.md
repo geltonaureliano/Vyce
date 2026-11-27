@@ -141,6 +141,104 @@ of its own: wave sums and prefix sums, as fxceless/victory-mix found) run as
 local waves (`emit::local_waves`), tried where the per-lane form is
 refused.
 
+A group of one console wave that uses LDS runs as local waves too when its
+wave operations are only the allocation idiom (`VICTORY_LDS_LOCAL=0` turns
+it off): the console compiler left out the barriers between the wave's LDS
+accesses, so the two host waves meet (a group barrier) before each LDS
+access in a block every lane runs, and before and after each lane-branch
+region with LDS accesses (`lower::lds_meetings`, after VIctory-7900XTX). A
+region with both an LDS read and an LDS write cannot be ordered so and keeps
+the console flow. The culls (CS_Tree_BatchCull) reach it only without their
+early-out, which keeps the body out of the blocks every lane runs. On the
+RTX 2070 SUPER the shared-LDS and idiom patterns give the console flow's
+results (`split_tests::local_waves_of_one_wave_groups_keep_their_lds_order`),
+the idiom's slots in another order.
+
+A group barrier must be met as often by every thread, or the threads that
+reach it wait for good (a hang, then a reset of the card). The blocks where
+the waves meet are therefore the ones both host waves run as often, which
+the fork's rule did not quite give (`VICTORY_LOCAL_MEET_CHECKS=0` brings it
+back):
+
+- A loop that lanes leave after different numbers of turns is a region of
+  its own, its exit test included: a lane branch's region never held the
+  branch's block, so the latch of such a loop met the other host wave once
+  a turn, a different number of times in each thread. The waves now meet
+  before the loop and after it.
+- A uniform branch can still part the two host waves: each reserves slots of
+  its own with the first-lane atomic of the allocation idiom, and a lane
+  read (`v_readfirstlane_b32`, `v_readlane_b32`) of a value the lanes hold
+  apart reads a lane of its own host wave. Such scalars, what is made of
+  them, lane masks read as numbers and what a lane branch's region leaves
+  behind (`local_waves::host_wave_varying`) make a branch on them a region
+  too. A value counts as held alike in the lanes only if everything its
+  instruction reads is (`VICTORY_HOST_WAVE_READS=0` brings back 1952aaf's
+  rule, which looked at the operands and a partial write only): beside the
+  operands, the old value of a destination it accumulates into
+  (`v_fmac_f32`, `v_mac_f32`, `v_fmac_legacy_f32`, `v_dot4c_i32_i8`, the
+  16-bit and packed forms), swaps or writes in part, any other VGPR, and
+  `v_div_fmas_f32`'s VCC; only the old value under a whole write is not
+  read. A lane mask read lane by lane (a select's, a carry-in, that VCC)
+  must hold one bit in every lane: a compare or carry of alike values that
+  no region left behind, no lane or every lane, or a uniform select (every
+  lane's bit an SCC); a constant of some lanes, or one loaded or built from
+  scalars, does not.
+- So does a scalar load of memory the dispatch itself may write while it
+  runs (`local_waves::loads_of_written_memory`): every one with `glc` or
+  `dlc`, and in a program that stores to memory or adds to it, every one
+  of a view its resources do not name a constant buffer or shader resource
+  view (an unordered-access view, a heap descriptor, a root view of no
+  given kind). Another group, or the other host wave, can land a write
+  between the two host waves' loads, which on the console are one load.
+  A constant buffer or shader resource view is taken not to be written
+  while a dispatch reads it, through another view either (D3D12 keeps a
+  resource in a read state apart from unordered access); a table's
+  descriptors and the code's constants never are.
+- A program that reaches memory by address returns at its entry in the
+  threads of the last group past the dispatch, each alone: no meetings
+  (the shared-wave and lockstep forms knew it).
+
+The translation of these cases (a loop, a branch on the reserved base, on a
+lane read of an accumulator or of a constant mask's select, on a flag
+loaded with `glc` or through the view the program stores to) is checked on
+the module (no barrier between a loop's header and its back edge, as many
+barriers on every way to the end; 1952aaf's analysis met inside the last
+four branches), then run on the card, against the console flow where it
+takes them (it has no lane read of a constant mask's select)
+(`split_tests::local_waves_meet_only_where_both_host_waves_run_as_often`,
+`local_waves_of_loops_and_reserved_branches_match_the_console`). What is
+alike and what is apart, accumulators, swaps, carries, divisions after a
+loop and the kinds of loaded views included, is checked case by case
+(`host_waves_hold_lane_reads_and_reserved_slots_apart`,
+`host_waves_may_load_written_memory_apart`).
+
+### Forms without early-outs or skips
+
+A wave64 compute program that the 32-lane forms refuse is tried again
+without its early-outs (`s_cbranch_execz` to a block that only ends the
+program) and then without the skips the code after them cannot see
+(`ir::without_early_outs`, `ir::without_skips`, from VIctory-7900XTX;
+`VICTORY_WAVE_FORMS=0` turns this off). The lanes outside EXEC walk the body
+masked, as the console's wave does when no lane is left, and each form is
+lowered by the same rules (`lockstep::fits`, `Local`), so only exact forms
+are taken. The fork's further forms (wave-wide branches, local waves of
+other programs) are approximate and are not taken. An early-out on a loop
+stays (`VICTORY_LOOP_EARLY_OUTS=0` leaves it out as the fork did): it may be
+the loop's only way out, and lanes walking on with EXEC clear would go round
+until the loop limit stopped them a million turns later.
+
+CS_ShadowUnifiedClearRaster and CS_SortRayTiles stay refused, measured on
+the transformed programs: the four console waves of a ShadowUnifiedClearRaster
+group branch apart for real (each wave asks whether any of its lanes passed,
+`s_bcnt1` of VCC, before a whole-wave minimum and maximum, and tests VCC made
+of EXEC and a uniform value), and SortRayTiles loops while any lane of the
+wave has work left (`s_andn2_b64` of EXEC into an exit mask, `s_cbranch_scc1`)
+between LDS atomics and barriers. The fork's 'without skips' output of the
+first puts group barriers where its waves have branched apart. An exact form
+needs the two halves of one console wave to meet without the rest of the
+group, or a rule for loops whose finished waves may go round again with no
+lane left.
+
 ### Lanes of 2-D groups on NVIDIA
 
 Measured on an RTX 2070 SUPER (Turing, driver 621.40, `lanes.rs` in the
@@ -204,7 +302,7 @@ takes `WaveSize(64)`, the NVIDIA reports 32-32).
 6. ~~Multi-wave groups: in step where their waves branch alike; local
    waves where lanes only meet within 32.~~ Left: CS_DefragHeap,
    CS_ShadowUnifiedClearRaster (branches on lanes that differ per wave) and
-   CS_SortRayTiles.
+   CS_SortRayTiles (see "Forms without early-outs or skips").
 
 ## Credit
 

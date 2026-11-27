@@ -231,6 +231,96 @@ impl Module {
         Ty(t)
     }
 
+    /// Tests: the calls of function `name` (a group barrier) inside loops,
+    /// in a block from a loop's header to one of its back edges, and the
+    /// numbers of calls met on the ways from the entry to each return
+    /// other than `skip` (an abort), back edges left out. Every thread
+    /// meets a barrier as often as every other where there are none of the
+    /// first and one number of the second.
+    #[cfg(test)]
+    pub(crate) fn calls_on_paths(&self, name: &str, skip: Option<usize>) -> (usize, Vec<usize>) {
+        let n = self.blocks.len();
+        let f = self.func_ids.get(name).copied();
+        let calls: Vec<usize> = self
+            .blocks
+            .iter()
+            .map(|b| {
+                b.body
+                    .iter()
+                    .filter(|&&i| matches!(self.insts[i as usize].op, Op::Call(c, _) if Some(c) == f))
+                    .count()
+            })
+            .collect();
+        // Reverse postorder from the entry: a back edge goes to a block at
+        // or before its own (the program's loops are reducible).
+        let succs = |b: usize| successors(self.blocks[b].term);
+        let mut seen = vec![false; n];
+        let mut post = Vec::new();
+        let mut stack = vec![(0usize, 0usize)];
+        seen[0] = true;
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            top.1 += 1;
+            match succs(b).get(k) {
+                Some(&s) if !seen[s] => {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+                Some(_) => {}
+                None => {
+                    post.push(b);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
+        let mut pos = vec![usize::MAX; n];
+        for (k, &b) in post.iter().enumerate() {
+            pos[b] = k;
+        }
+        let mut preds = vec![Vec::new(); n];
+        for &b in &post {
+            for &s in succs(b).iter() {
+                preds[s].push(b);
+            }
+        }
+        let mut in_loop = vec![false; n];
+        for &t in &post {
+            for &h in succs(t).iter().filter(|&&h| pos[h] <= pos[t]) {
+                // The loop's body: its header and what reaches the back
+                // edge without passing it.
+                let mut body = vec![false; n];
+                body[h] = true;
+                let mut stack = vec![t];
+                while let Some(b) = stack.pop() {
+                    if !std::mem::replace(&mut body[b], true) {
+                        stack.extend(preds[b].iter().copied());
+                    }
+                }
+                for (b, inside) in body.into_iter().enumerate() {
+                    in_loop[b] |= inside;
+                }
+            }
+        }
+        let looped = (0..n).filter(|&b| in_loop[b]).map(|b| calls[b]).sum();
+        // The numbers of calls met on the way to each block, forward edges only.
+        let mut met: Vec<std::collections::BTreeSet<usize>> = vec![Default::default(); n];
+        met[0].insert(calls[0]);
+        for &b in &post {
+            let here: Vec<usize> = met[b].iter().copied().collect();
+            for &s in succs(b).iter().filter(|&&s| pos[s] > pos[b]) {
+                met[s].extend(here.iter().map(|c| c + calls[s]));
+            }
+        }
+        let mut ends = std::collections::BTreeSet::new();
+        for &b in &post {
+            if matches!(self.blocks[b].term, Some(Term::Ret)) && Some(b) != skip {
+                ends.extend(met[b].iter().copied());
+            }
+        }
+        (looped, ends.into_iter().collect())
+    }
+
     #[cfg(test)]
     pub(crate) fn uses_of(&self, target: V) -> usize {
         let mut n = 0;

@@ -238,6 +238,19 @@ launcher):
 | VICTORY_WRITE_SKIP=0 | Toda vista de escrita é tratada como escrita, mesmo de shaders que não escrevem em buffers |
 | VICTORY_HAIR=1, VICTORY_RAY_RESOLVES=1 | Rodam os fios de cabelo e os resolves de raios, deixados de fora (os resolves não têm o que resolver sem raios e custam de 10 a 30 s de compilação cada) |
 | VICTORY_HOIST_CLAMPS=7 | Os limites dos argumentos indiretos rodam um após o outro, como antes (o padrão agora é 1) |
+| VICTORY_EXACT_NORM=0 | Códigos normalizados (UNORM/SNORM) de buffers voltam a ser divididos pela GPU, que erra o último bit em 126 dos 256 códigos de 8 bits nesta placa (materiais trocados) |
+| VICTORY_D16_INTEGER=0 | Dados de 16 bits de vistas de formato inteiro voltam a passar por f16 (viravam ruído) |
+| VICTORY_WAVE_FORMS=0 | Programas wave64 recusados não são tentados de novo sem os saltos de saída antecipada |
+| VICTORY_LDS_LOCAL=0 | Grupos de uma onda com memória compartilhada voltam ao fluxo do console (com uma barreira em cada troca) em vez de duas ondas locais de 32 |
+| VICTORY_LOCAL_MEET_CHECKS=0 | As duas ondas locais voltam a se encontrar onde o fork as punha: também dentro de laços que cada thread deixa numa volta diferente, dentro de desvios em valores que as duas ondas podem ter diferentes (leitura de uma lane, inclusive de um acumulador como `v_fmac_f32` ou de uma seleção por máscara constante, e leitura escalar de memória que o próprio dispatch escreve) e em programas que acessam memória por endereço. Só para comparação: pode travar a GPU |
+| VICTORY_LOOP_EARLY_OUTS=0 | As formas sem saída antecipada voltam a tirar também a saída de dentro de um laço, mesmo quando é a única saída dele (as threads giram até o limite de voltas). Só para comparação: pode travar a GPU |
+| VICTORY_HOST_WAVE_READS=0 | Com as checagens acima ligadas, a análise das duas ondas locais volta a ser a de 1952aaf: um valor conta como igual em todas as lanes mesmo quando a instrução lê algo além dos operandos (o valor antigo de um acumulador como `v_fmac_f32`, `v_mac_f32` ou `v_dot4c_i32_i8`, o de uma troca, o VCC de `v_div_fmas_f32`) ou seleciona por uma máscara constante de algumas lanes, e uma leitura escalar conta como igual nas duas ondas mesmo de memória que o próprio dispatch escreve. Só para comparação: pode travar a GPU |
+| VICTORY_STRIDE_ONCE=0 | A tabela de passos volta a ser lida a cada uso, não uma vez por vista e bloco |
+| VICTORY_INTERP_F16_MODS=0 | Interpolações de 16 bits voltam a escrever só a metade baixa, sem multiplicador nem saturação |
+| VICTORY_F16_NEAREST=1 | Resultados de 16 bits arredondados ao mais próximo, como no console (a Turing arredonda para zero); desligado por padrão, custa uma dúzia de instruções por resultado |
+
+Cada uma dessas chaves do tradutor muda a chave do cache de shaders: com
+uma delas trocada, todos os shaders são traduzidos de novo (o log avisa).
 
 Chaves de comparação do trabalho da CPU (todas ligadas por padrão; o valor
 0 volta ao comportamento de antes, no processo que chama o launcher):

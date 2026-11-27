@@ -2952,4 +2952,55 @@ pub(crate) mod tests {
             "{err:?}"
         );
     }
+
+    /// Lanes failing `v_cmp_gt_u32` clear EXEC and take `s_cbranch_execz`
+    /// straight to the join, past the code that makes the immediate sampler
+    /// `s[8:11]`: only the lanes of the other way run the join's sample. A
+    /// tracer that prunes the joins' dead edges by the lanes that reach the
+    /// access must count the access's own guard among them, else the edge
+    /// with the registers' former use stays and the program is refused
+    /// (github.com/codec-d/cool_fox f4b48ad, GPL-3.0-or-later: the transmission
+    /// prefilter CS_AlphTransmissionPrefilterMip_610a2fad was dropped under the
+    /// wave64 form without early-outs, and transparent things went black).
+    /// This tracer prunes no edges by lanes: the edge without a descriptor
+    /// is the registers' former use beside one that has it, as any join of
+    /// them (`Tracer::phi`), in every form.
+    #[test]
+    fn a_guarded_access_excludes_dead_lane_edges_at_a_join() {
+        let words = [
+            0xBE84_0300u32, // s_mov_b32 s4, s0
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x877E_6A7E, // s_and_b32 exec_lo, exec_lo, vcc_lo
+            0xBF88_0004, // s_cbranch_execz join
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0xF09C_0F08,
+            0x0043_0C02, // join: image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let lanes = crate::structure::structure(&p).expect("structured form");
+        let join = p.blocks.len() - 1;
+        assert!(lanes.guards[join][0].is_some(), "the join's access is guarded by EXEC");
+        let r = track(&p, &[param(Table, 0, 1)], HwStage::Cs).unwrap();
+        assert!(
+            r.descriptors
+                .iter()
+                .any(|d| d.role == Role::Sampler && d.source == Source::Constant(vec![0; 4])),
+            "the immediate sampler of the live way: {:?}",
+            r.descriptors
+        );
+        // (The skip is no pure one: the join sees the sampler's registers
+        // the region changed, so no form leaves it out.)
+        assert!(crate::ir::without_skips(&p, false, false).is_none());
+    }
 }
