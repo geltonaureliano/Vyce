@@ -986,7 +986,9 @@ desligado primeiro.
   (b_dry_decl_overlap) e páginas que o jogo escreveu sob uma faixa pendente
   desde a última cópia (o diário de escrita; NOT_WATCHED conta como escrita).
   Precisa de um anel de listas Early (4), um anel da lista "antes" do card (3),
-  PAIRS 8 para 16, até 3 voos e um piso de descritores dinâmicos livres.
+  PAIRS 8 para 16, até 3 voos e um piso de descritores dinâmicos livres, e de
+  que uma gravação com texturas copiadas de volta não rode de novo antes de a
+  submissão anterior dela pousar (um só buffer de leitura por gravação).
 - Passo 4, cópias do jogo sem dreno (se b_flush_copy for alto): primeiro uma
   forma só de CPU, fazer a cópia na hora quando nem a origem nem o destino
   tocam o que o pouso no ar escreve, o destino não é memória usada no lugar e
@@ -996,3 +998,239 @@ desligado primeiro.
   lugar, `CopyBufferRegion` numa lista na frente da submissão por um buffer
   intermediário, com transições explícitas, e os destinos avisados ao vigia de
   escrita no pouso.
+
+## Fase 2 (build C)
+
+A build C é a build B (vyce/2070s 5c99db2) com as quatro partes da fase 2
+juntadas por merge, nesta ordem, cada uma num merge próprio:
+
+1. vyce/wt-minors (de83c7a): as pendências menores da fase 1 (em "Fase 2:
+   pendências menores da fase 1", acima).
+2. vyce/wt-texback (e5fcb7e): as texturas da água que os shaders escrevem
+   voltam para a memória do jogo no pouso (em "Fase 2: texturas de volta").
+3. vyce/wt-pairs (9f662b9): os programas wave64 de compute que nenhuma
+   forma de 32 lanes aceitava rodam em pares de lanes (em "Fase 2: programas
+   wave64 em pares de lanes").
+4. vyce/wt-stageb (b827148, e 39a3ca8 com as correções da revisão): o dreno
+   no fim, passo 1 da etapa B dos voos (em "Fase 2: dreno no fim").
+
+Nenhuma parte ficou de fora: as revisões de minors, texback e pairs
+aprovaram; a do dreno no fim pediu três correções antes, e as três estão em
+39a3ca8.
+
+Os conflitos foram resolvidos mantendo os dois lados:
+
+- As chaves do tradutor (`emit::Switch`): minors e pairs acrescentaram as
+  suas no fim da lista. Ficam as três, com VICTORY_WAVE_PAIRS por último.
+- O pouso (`host::finish`) recebe agora as duas coisas: as texturas a copiar
+  de volta (texback) e o valor de fence das faixas que ele abre (dreno no
+  fim). As texturas das listas que rodam saem do `Prep`, que o dreno no fim
+  pôs no lugar do laço das listas.
+- Este arquivo.
+
+Costura nova nesta build: as marcas de um voo (o que o pouso dele escreve na
+memória do jogo, que decide o que espera esse pouso no preparo seguinte)
+incluem a memória inteira de cada textura que ele copia de volta. Sem isso,
+uma submissão preparada com o voo ainda no ar atualizaria uma cópia dessa
+memória antes do pouso, e os shaders dela leriam a textura de antes do voo.
+Não tem chave própria, porque faz parte de o dreno no fim estar certo:
+VYCE_TAIL_DRAIN=0 volta ao dreno antigo, onde isso não acontece, e
+VICTORY_TEXTURE_BACK=0 tira a cópia de volta. O teste
+`texback::tests::a_refresh_of_a_texture_copied_back_waits_for_its_landing`
+roda no WARP e na placa. Um passe escreve metade de uma textura atrás de uma
+porta fechada, e a submissão seguinte, preparada sob ele, atualiza uma cópia
+da memória da textura: a atualização espera o pouso e a cópia sai com os
+texels do passe. Com a regra desligada no teste (`Mutation::Textures`), a
+atualização é feita na hora e a cópia fica com os bytes de antes.
+
+### Cache
+
+O tradutor mudou de novo. A impressão dele passou de
+d291d9a04367aead5a126f9532c6da45 (build B) para
+03fe4dfc2ab8371c7d3702402046ff82. Os caches do dono foram preparados com o
+jogo fechado, como na build B, pelo heavy.sh: com a release feita pelo
+launcher (scripts\vyce.ps1 -Action Build, que agora é offline), o ambiente
+que o launcher dá ao jogo e a mesma lista de 960 programas de compute (não
+houve sessão nova desde a build B).
+
+~~~powershell
+victory warm D:\torrent\Vyce-data\lab\shaders\host --pipelines <lista> --jobs 8
+~~~
+
+O warm levou 218 s:
+
+- 11.212 contêineres traduzidos para o cache de shaders, todos novos (na
+  build B foram 11.199).
+- 59 recusados (na build B, 72). Saíram os 13 que os pares de lanes agora
+  traduzem. Ficam 52 de compute com endereço num SGPR, 2 wave64 que nunca
+  foram ligados nas sessões e 5 de malha.
+- 635 pipelines de compute na biblioteca: 631 já estavam lá (de shaders
+  cujo DXIL não mudou) e 4 foram compilados agora, os quatro dos pares de
+  lanes. Nenhum foi recusado pela placa.
+- Dos 960 programas da lista, 35 não traduzem (endereço num SGPR) e 290
+  ficam de fora pelas regras de antes.
+
+O alvo veio da placa, como no jogo (views=1000000, lanes_min=32
+lanes_max=32 exact_views=true). Um segundo warm, em outro processo, achou no
+cache os 54 contêineres que testou (os 50 da build B e os quatro novos). A
+lista dos pipelines que começam cedo ficou com as mesmas 2.042 entradas.
+
+Como na build B, ficam para a primeira sessão:
+
+- os 177 shaders de desenho que não estão em lab\shaders\host, traduzidos
+  em jogo;
+- os pipelines de desenho que mudaram desde a build A (no máximo perto de
+  280), compilados em jogo começando pelo carregamento. A build B nunca
+  rodou, então eles ainda não foram montados.
+
+### Para jogar
+
+Em PowerShell na raiz do Vyce:
+
+~~~powershell
+.\scripts\vyce.ps1 -Action Run
+~~~
+
+A build B ficou ao lado da nova, como
+Vyce-data\target\release\victory-5c99db2.exe (e o .pdb). O cache dela
+continua no mesmo lugar: o warm só acrescentou entradas.
+
+### O que mudou e como voltar
+
+As chaves valem no processo que chama o launcher, por exemplo
+`$env:VYCE_TAIL_DRAIN = '0'` antes do Run. As do tradutor fazem outro cache
+de shaders: com uma delas trocada, a primeira sessão traduz tudo de novo, a
+menos que o warm rode antes com a mesma chave.
+
+| O que mudou (ligado por padrão) | Para voltar ao de antes |
+| --- | --- |
+| Compilação do launcher offline | -Online |
+| Só a falta do arquivo conta como lista vazia de pipelines que começam cedo | Sem chave |
+| Leituras escalares de vistas que podem ser escritas contam como diferentes entre as duas ondas locais (tradutor) | VICTORY_VIEW_LOADS_APART=0, só para comparar: pode travar a GPU |
+| Um desvio que só uma leitura de lane separa vai para o fluxo do console (tradutor) | VICTORY_LANE_READ_BRANCHES=0 |
+| O limite das buscas de descritores que falham é de cada heap | VICTORY_WALKS_PER_HEAP=0 |
+| As texturas dos quatro tipos da água voltam para a memória do jogo | VICTORY_TEXTURE_BACK=0 (ou uma lista de tipos, por exemplo 256x256f41,64x64f16) |
+| Programas wave64 recusados rodam em pares de lanes (tradutor) | VICTORY_WAVE_PAIRS=0 |
+| Dreno no fim: o preparo corre com a submissão anterior na GPU | VYCE_TAIL_DRAIN=0 (com VYCE_RETAKE_GAPS=0 também, o dreno e as cópias de referência ficam exatamente como na build B) |
+| A pré-atualização fica de fora com o dreno no fim | VYCE_TAIL_PREWARM=1 |
+| A referência de uma cópia não esparsa retoma os vãos declarados (nos dois drenos) | VYCE_RETAKE_GAPS=0 |
+| As marcas do voo incluem as texturas copiadas de volta | Sem chave (VYCE_TAIL_DRAIN=0 ou VICTORY_TEXTURE_BACK=0) |
+
+Duas chaves de diagnóstico ficam desligadas por padrão:
+
+- VYCE_TAIL_DRAIN_STRICT=1: toda atualização espera o fim. Se uma imagem
+  errada fica certa com ela, faltou uma escrita do pouso, uma memória usada
+  no lugar ou uma vista.
+- VYCE_TAIL_DRAIN_DRY=0: desliga a contagem a seco, que só conta com
+  VYCE_TAIL_DRAIN=0 e a telemetria ligada.
+
+O dreno no fim desliga sozinho, com uma linha no log, com
+VICTORY_ASYNC_SUBMIT=0, VYCE_LATE_SIGNAL=0, VYCE_ONE_ECL=0, VYCE_ONE_PASS=0,
+VICTORY_SWEEP_TILES diferente de 0 e, na build diag, VICTORY_GPU_TIMING.
+
+### O que ler na próxima sessão
+
+O Run com o painel liga a telemetria (VYCE_TELEMETRY): uma linha por
+amostra no arquivo de erros, com os campos por quadro. Os campos que o
+painel não conhece aparecem com o nome de origem em Copiar resumo.
+
+Dreno no fim (o padrão, b_mode=1):
+
+- gpu_idle_ms era 131 ms na mediana da sessão de 27/11 e deve cair.
+- wait_execute_ms vai a quase 0. A espera que sobra aparece em wait_tail_ms
+  e wait_flush_ms; drains_tail e drains_flush, somados, ficam perto de
+  b_prepared_under.
+- b_prepared_under deve ficar perto das submissões do jogo por quadro (15 a
+  18 das ~23), com b_old_list e b_old_card pequenos.
+- b_overlap_ms é o preparo que correu com a GPU trabalhando (até ~40 ms).
+- Os pontos de dreno são b_flush_copy, b_flush_run, b_flush_dense e
+  b_flush_slots (este perto de 1 por quadro), e o preparo depois deles é
+  b_after_flush_ms. Se b_flush_copy ficar perto de b_prepared_under com
+  b_after_flush_ms grande, as cópias do jogo vêm cedo e comem o ganho: o
+  próximo passo é então o 4.
+- b_late_parts e b_late_mb devem ficar em alguns MB, b_late_views perto de 0
+  se não há vistas repetidas, b_queued_ms em 1 a 2 ms e prewarm_ms perto de
+  0.
+
+A estimativa do juiz, com poucos pontos de dreno, é de 190 a 200 ms por
+quadro, 5,0 a 5,3 FPS (eram 3,7 na mediana).
+
+Contagem a seco: os b_dry_* ficam em 0 no padrão. Para vê-los, rode uma
+sessão no mesmo lugar com `$env:VYCE_TAIL_DRAIN = '0'`.
+
+- b_dry_prepared deve ficar perto das submissões do jogo por quadro.
+- b_dry_saved_ms é, por baixo, o tempo de GPU parada que o dreno no fim
+  tira. Compare com a queda de gpu_idle_ms entre as duas sessões.
+- b_dry_overlap_ms e b_dry_wait_ms mostram o preparo que correria junto com
+  a GPU e a espera antes do preparo.
+- b_dry_flush_copy, b_dry_flush_run, b_dry_flush_dense, b_dry_flush_slots e
+  b_dry_after_flush_ms dizem o mesmo que os b_flush_* reais.
+- b_dry_late_parts, b_dry_late_mb, b_dry_late_views, b_dry_queued e
+  b_dry_queued_ms são o que esperaria o fim.
+- b_dry_lw_inplace e b_dry_decl_overlap decidem o passo 3.
+
+Texturas de volta:
+
+- textures_back: texturas copiadas por quadro.
+- textures_back_kb: KB escritos na memória do jogo.
+- textures_back_read_kb: KB lidos da placa, cerca de 1.700 com as quatro da
+  água escritas.
+
+O tempo e os bytes escritos também entram em copy_back_ms e guest_write_mb.
+No log aparecem "the
+first texture copied back landed" na primeira vez, "a texture copied back
+did not land" (com o motivo) se alguma não pousa e, uma vez só, a recusa de
+uma textura dos tipos (sem os mips maiores, layout com XOR, outra forma no
+host, mais de 16 MiB). Se a água está na tela e textures_back fica em 0, a
+água escreve por slots indexados direto, que não estão cobertos.
+
+Pares de lanes: os descartados por quadro (dropped_per_frame, ~83 na
+sessão de 27/11) devem cair, porque os quatro programas deixam de ser
+descartados. A GPU ocupada pode subir um pouco, com passes que não rodavam.
+
+Vale uma sessão curta para cada comparação abaixo, no mesmo save e lugar:
+
+- VICTORY_TEXTURE_BACK=0 na praia e na missão do barco: com a cópia de
+  volta o barco deve boiar; se os objetos levantados descem para o chão sem
+  ela, eram estas texturas.
+- VYCE_TAIL_DRAIN=0, para ver o ganho do dreno no fim e os b_dry_*.
+- VICTORY_WAVE_PAIRS=0, para ver as sombras em blocos e a imagem escura.
+  É outro cache: sem um warm com a mesma chave, essa sessão traduz tudo de
+  novo no carregamento.
+
+### Testes
+
+Pelo heavy.sh, na vyce/2070s depois dos quatro merges:
+
+- victory-gpu na placa: 225 passando e 9 ignorados com o dreno no fim, e o
+  mesmo com VYCE_TAIL_DRAIN=0. Na build B eram 196; vieram 18 do dreno no
+  fim, 8 da cópia de volta, 2 das pendências e 1 da costura.
+- victory-shader: 322 passando e as 4 valu_tests que já falhavam na NVIDIA.
+  Com VICTORY_DXIL, as 28 split_tests e os 10 paired_tests passam. O teste
+  de integração do tradutor também passa.
+- victory-hle: 99 passando e os 5 testes de xmem que já falhavam. O teste
+  de integração passa.
+- victory-loader: todos passam menos o load_probe (falta a delayimp.lib no
+  toolchain do laboratório), e os lugares do código conferem no executável
+  1.0.2.1.
+- victory-core e o app passam.
+- A release compila, só com os avisos de antes.
+
+Ainda não foi medida em jogo.
+
+Ficam abertas as notas menores das revisões; nenhuma bloqueia:
+
+- Tradutor, leituras de lane: a isenção das leituras de valores iguais em
+  toda lane é semeada em vez de propagada, e não olha a guarda da própria
+  leitura.
+- Tradutor, pares de lanes: um programa com waterfall classificado daria às
+  lanes de cima o descritor da lane de baixo, e com VICTORY_RAYS=1 os pares
+  de lanes vêm antes da forma com endereços.
+- Cópia de volta: barreiras de aliasing e recursos posicionados sobre um
+  tíquete não são vistos, as recusas não são lembradas, e cópias do jogo
+  para a textura antes do primeiro uso dela como UAV não voltam.
+- Lista dos pipelines que começam cedo: ilegível a sessão inteira, ela faz
+  cada salvamento regravar a biblioteca.
+
+A camada de depuração do D3D12 e a validação na GPU não rodaram, nem um
+teste de remoção do dispositivo.
