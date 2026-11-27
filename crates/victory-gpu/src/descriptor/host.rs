@@ -3961,7 +3961,10 @@ void main() {
         let left = take(&heap, 2).unwrap();
         let right = take(&heap, 2).unwrap();
         let rest = take(&heap, slots - 5).unwrap();
-        assert_eq!([first, left, right, rest].map(|r| at(&heap, Some(r))), [0, 1, 3, 5].map(Some));
+        assert_eq!(
+            [first, left, right, rest].map(|r| at(&heap, Some(r))),
+            [0, 1, 3, 5].map(Some)
+        );
         // Taking the left pair again puts the cursor between the pairs.
         heap.release(left.first, 2);
         assert_eq!(at(&heap, take(&heap, 2)), Some(1));
@@ -3981,7 +3984,10 @@ void main() {
         let most = take(&heap, slots - 4).unwrap();
         let low = take(&heap, 2).unwrap();
         let high = take(&heap, 2).unwrap();
-        assert_eq!([most, low, high].map(|r| at(&heap, Some(r))), [0, slots - 4, slots - 2].map(Some));
+        assert_eq!(
+            [most, low, high].map(|r| at(&heap, Some(r))),
+            [0, slots - 4, slots - 2].map(Some)
+        );
         heap.release(low.first, 2);
         assert_eq!(at(&heap, take(&heap, 2)), Some(slots - 4));
         heap.release(low.first, 2);
