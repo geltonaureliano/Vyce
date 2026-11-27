@@ -300,3 +300,84 @@ host guardam).
 
 Para abrir o painel de uma sessão já em execução sem reiniciar o jogo,
 execute scripts\vyce-monitor.ps1 e passe -GamePid, -StdoutLog e -StderrLog.
+
+## Fase 1 (build A)
+
+A build A é a vyce/2070s (antes em ea4e486) com as duas partes prontas da
+fase 1, juntadas por merge nesta ordem, e uma correção pequena:
+
+1. vyce/wt-upstream (16afc3d): a linha antiga do Belobug (luz ambiente que
+   segue o céu, plano de descritores que uma escrita sozinha não refaz,
+   saves mais tolerantes, mips das texturas posicionadas, o programa dos
+   raios das sondas de tela de fora), o tamanho da imagem e a escala da
+   cena no código do jogo, a checagem do pool de back buffers pulada em
+   qualquer tamanho e o vigia das compilações com piso de memória, que
+   nunca põe um pipeline bom na lista dos travados.
+2. vyce/wt-slots (ace4e94): os descritores dinâmicos das tabelas voltam
+   quando a submissão da lista termina, os devolvidos ficam emprestados e
+   são tomados por último, uma lista que perdeu os seus roda inteira sem os
+   comandos até o jogo reiniciá-la, uma espera curta quando faltam e a
+   proteção da queda da missão do barco.
+3. A busca de descritores dinâmicos livres acha uma faixa livre que passa
+   pelo ponto onde a busca começa. Antes ela não achava essa faixa, nem
+   entre os livres não emprestados nem entre quaisquer livres, e ainda
+   anotava que não havia faixa daquele tamanho: tabelas desse tamanho ou
+   maiores deixavam de ser feitas até algum descritor voltar.
+
+A correção de shaders (vyce/wt-shader) ainda não entrou. O tradutor é o
+mesmo: a impressão dele continua 5d536b05afbcb18a491c46fd06fd99a3 (as
+passadas de limpeza ficam desligadas), então o cache de shaders já
+aquecido vale para a build A e a primeira sessão não traduz nada de novo.
+
+Para jogar, em PowerShell na raiz do Vyce:
+
+~~~powershell
+.\scripts\vyce.ps1 -Action Run
+~~~
+
+Sem opções, o launcher põe VICTORY_OUTPUT=1920x1080 (o código do jogo
+monta a imagem em 1920x1080 e a cena em 1280x720) e escreve 1920x1080 no
+settings.xml do jogo. Na build intermediária (só a vyce/wt-upstream, log
+2026-11-27_00-19-39) isso deu GPU ocupada 141 ms por quadro na mediana
+(antes 233), GPU parada 131 ms, 3,7 FPS na mediana e 2.045 acertos de 2.050
+no cache de shaders. As mudanças da vyce/wt-slots e a correção da busca
+ainda não foram medidas em jogo.
+
+Cada mudança tem a sua chave para voltar ao de antes. As variáveis valem
+no processo que chama o launcher, por exemplo:
+
+~~~powershell
+$env:VICTORY_FREE_TABLES_AT_LANDING = '0'
+.\scripts\vyce.ps1 -Action Run
+~~~
+
+| O que mudou | Para voltar ao de antes |
+| --- | --- |
+| Tamanho da imagem 1920x1080 no código do jogo em vez de 3840x2160 (cena 1280x720), com cada lugar comparado byte a byte antes e tudo ou nada; o pulo da checagem do pool de back buffers vem junto | -NoTitlePatch (só o settings.xml muda), -OutputSize keep (nem o arquivo nem o código) ou VICTORY_OUTPUT=off |
+| Escala da cena no upscaler do jogo | Só com -RenderScale 0.5 a 1.0 (VICTORY_RENDER_SCALE); sem ela ficam os 2/3 do jogo |
+| Upscaler do próprio jogo no Series S (o launcher põe VICTORY_UPSCALER=6 com -ConsoleProfile series-s) | -NoTitlePatch ou VICTORY_UPSCALER=off |
+| Luz ambiente que segue o céu dos reflexos | VICTORY_AMBIENT_SKY=off (VICTORY_AMBIENT=nível escala qualquer das duas luzes) |
+| CS_ScreenProbes_ActivateRays deixado de fora enquanto não há raios | VICTORY_PROBE_RAYS=1 |
+| Um slot que só escreve outra faixa não refaz o plano de descritores | VICTORY_PLAN_WRITES=1 |
+| A vista de uma textura posicionada com nível mínimo de detalhe vai sem os mips abaixo dele | VICTORY_LOD_CLAMP=0 |
+| Uma versão de save que não pode ser apagada não impede a leitura do container, e a atualização seguinte vai para um v<N>.<k>.new livre | VICTORY_SAVE_STRICT=1 |
+| Vigia das compilações: 60 s e 8 GiB de crescimento, ou 300 s, põem o pipeline na lista; com menos de 2 GiB livres na máquina, uma compilação de mais de 20 s que fez o processo crescer 1 GiB para só nesta sessão | VICTORY_COMPILE_HOLD=20,150,3,0 |
+| Passadas de limpeza dos shaders traduzidos: vieram desligadas | VICTORY_SHADER_OPT=all liga (o cache muda e a primeira sessão traduz tudo de novo) |
+| Build diag: shaders dos pipelines recusados salvos e contagem das texturas posicionadas a cada 30 s | Só na build diag, os shaders com VICTORY_SHADER_DUMP=pasta |
+| Os descritores dinâmicos de uma lista voltam quando a GPU termina a última submissão dela, emprestados enquanto o jogo pode enviá-la de novo; uma lista reenviada que perdeu os seus roda sem os comandos até reiniciar | VICTORY_FREE_TABLES_AT_LANDING=0 |
+| Uma tabela sem descritores livres espera até 100 ms a submissão mais antiga em voo terminar e tenta de novo uma vez (no máximo 1 s de espera por quadro) | VICTORY_TABLE_RETRY_MS=0 |
+| A busca de descritores dinâmicos livres segue até n - 1 descritores depois do ponto onde começou, nunca além do último | VICTORY_SLOTS_ACROSS_CURSOR=0 |
+| Uma cópia da página nula pedida à memcpy do VCRUNTIME140 pelo código do jogo (a queda da missão do barco) dá zeros no destino | VICTORY_NULL_COPY=0 |
+
+No launcher, -OutputSize agora também muda o código do jogo, e há duas
+opções novas, -RenderScale e -NoTitlePatch (em Opções do jogo, acima).
+Campos novos de VYCE_TELEMETRY: slots_freed_at_landing, table_retries,
+table_retry_ms, tables_lost e lent_taken (em Painel de diagnóstico, acima).
+
+Testada com todas as suítes pelo heavy.sh: victory-gpu na placa com 194
+testes passando e 9 ignorados (também com VICTORY_FREE_TABLES_AT_LANDING=0
+e VICTORY_SLOTS_ACROSS_CURSOR=0), victory-shader com 293 passando e as 4
+valu_tests que já falhavam na NVIDIA, victory-hle com 99 passando e os 5
+testes de xmem que já falhavam, victory-loader com todos passando menos um
+do load_probe (falta a delayimp.lib no toolchain do laboratório) e os quatro
+lugares do código conferidos no executável 1.0.2.1, victory-core e o app.
