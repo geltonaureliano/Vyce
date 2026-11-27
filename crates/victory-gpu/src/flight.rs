@@ -15,10 +15,13 @@
 //! title's CPU still sees a value or a fence only once the flight has
 //! landed.
 //!
-//! The CPU's part of a submission (the title's copies, refreshes of what
-//! shaders may be writing, snapshots) still begins only when every flight
-//! before it has landed (`Host::execute_title`): snapshots and the ranges
-//! shaders write are kept per host copy, not per submission.
+//! The CPU's part of a title submission (the title's copies, refreshes of
+//! what shaders may be writing, snapshots) begins while the flight before
+//! it is still in the air, and waits for it to land just before its own
+//! lists go to the host queue (`crate::tail`): what each flight's landing
+//! writes in title memory is told by its [`Marks`]. With
+//! `VYCE_TAIL_DRAIN=0` it begins only when every flight before it has
+//! landed (`Host::execute_title`).
 //!
 //! Flights land as soon as the host GPU has run them, on a thread of their
 //! own, or on a thread that needs it sooner: one that is about to prepare a
@@ -28,8 +31,9 @@
 //!
 //! The rule for signals and waits is that of `late_signal` and `late_met` in
 //! github.com/DexNom/VIctory and github.com/fxceless/victory-fork (their
-//! host.rs), written anew: here the queues have timelines, nothing is
-//! prepared under a flight, and no switch of theirs is needed.
+//! host.rs), written anew: here the queues have timelines, a submission is
+//! sent only once the flights before it have landed (`crate::tail`), and
+//! no switch of theirs is needed.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -75,6 +79,79 @@ impl After {
             After::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
         }
     }
+
+    /// The memory it writes.
+    fn range(&self) -> (usize, usize) {
+        match self {
+            After::Signal(fence, _) => (fence.address(), fence.address() + 8),
+            After::Write(at, _, bytes) => (*at, at + bytes),
+        }
+    }
+}
+
+/// What a flight's landing writes in title memory, for a submission
+/// prepared while it is in the air (`crate::tail`), and the copies that are
+/// not sparse its shaders write.
+#[derive(Default)]
+pub(crate) struct Marks {
+    /// The flight's fence value.
+    pub(crate) fence: u64,
+    /// Title memory its landing writes: the ranges its shaders wrote in
+    /// copies, its read-backs, its bottom-of-pipe writes. Sorted, joined.
+    writes: Vec<(usize, usize)>,
+    /// Copies that are not sparse its shaders write (their addresses).
+    dense: Vec<usize>,
+    /// Title memory its shaders may write in copies without copying it back:
+    /// the unordered access ranges of the directly indexed heaps it uses
+    /// with shaders that may write (`crate::descriptor::host::BindlessPlan`).
+    /// A refresh there waits for it as for its landing, so the copy is
+    /// brought up to date after those writes, as before. Sorted, joined.
+    unlisted: Vec<(usize, usize)>,
+    /// What was put behind it since it was sent ([`Line::after`]).
+    after: Mutex<Vec<(usize, usize)>>,
+}
+
+impl Marks {
+    pub(crate) fn new(
+        fence: u64,
+        mut writes: Vec<(usize, usize)>,
+        mut dense: Vec<usize>,
+        mut unlisted: Vec<(usize, usize)>,
+    ) -> Marks {
+        crate::shadow::pass::join(&mut writes);
+        crate::shadow::pass::join(&mut unlisted);
+        dense.sort_unstable();
+        dense.dedup();
+        Marks { fence, writes, dense, unlisted, after: Mutex::default() }
+    }
+
+    /// Whether the landing writes in `[from, to)`, or the flight's shaders
+    /// may write the copies' bytes of it unlisted.
+    pub(crate) fn meets(&self, from: usize, to: usize) -> bool {
+        let meets = |ranges: &[(usize, usize)]| {
+            let i = ranges.partition_point(|w| w.1 <= from);
+            ranges.get(i).is_some_and(|w| w.0 < to)
+        };
+        if meets(&self.writes) || meets(&self.unlisted) {
+            return true;
+        }
+        let after = self.after.lock().unwrap_or_else(|e| e.into_inner());
+        after.iter().any(|&(a, b)| a < to && from < b)
+    }
+
+    /// Whether its shaders write the copy at `copy` (one that is not sparse).
+    pub(crate) fn holds(&self, copy: usize) -> bool {
+        self.dense.binary_search(&copy).is_ok()
+    }
+
+    /// Whether the landing writes memory the host GPU uses in place.
+    pub(crate) fn lands_in_place(&self) -> bool {
+        self.writes.iter().any(|&(a, b)| crate::shadow::meets_in_place(a, b))
+    }
+
+    fn note(&self, what: &After) {
+        self.after.lock().unwrap_or_else(|e| e.into_inner()).push(what.range());
+    }
 }
 
 /// A submission in flight.
@@ -94,6 +171,8 @@ pub(crate) struct Flight {
     pub(crate) sent: Instant,
     /// What its commands use besides.
     pub(crate) _used: Box<dyn std::any::Any>,
+    /// What its landing writes in title memory.
+    pub(crate) marks: Arc<Marks>,
     after: Vec<After>,
 }
 
@@ -112,6 +191,7 @@ impl Flight {
             timed: None,
             sent: Instant::now(),
             _used: Box::new(()),
+            marks: Arc::default(),
             after: Vec::new(),
         }
     }
@@ -121,6 +201,7 @@ impl Flight {
 struct Landing {
     fence: u64,
     writes: Vec<Write>,
+    marks: Arc<Marks>,
     after: Vec<After>,
 }
 
@@ -149,6 +230,9 @@ pub(crate) struct Line {
     /// The host GPU's time around submissions, when asked for.
     pub(crate) clock: OnceLock<Option<crate::telemetry::Clock>>,
     lander: std::sync::Once,
+    /// Preparations of title submissions that came to wait for the flights
+    /// before them (tests open the gate in front of a flight on it).
+    reached: AtomicU64,
 }
 
 // SAFETY: D3D12 devices, queues and fences are free-threaded.
@@ -175,7 +259,20 @@ impl Line {
             landed: AtomicU64::new(0),
             clock: OnceLock::new(),
             lander: std::sync::Once::new(),
+            reached: AtomicU64::new(0),
         })
+    }
+
+    /// A title submission's preparation is about to wait for the flights
+    /// before it.
+    pub(crate) fn about_to_wait(&self) {
+        self.reached.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// How many preparations came to wait so far.
+    #[cfg(test)]
+    pub(crate) fn waits_begun(&self) -> u64 {
+        self.reached.load(Ordering::Acquire)
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -223,11 +320,25 @@ impl Line {
         let mut s = self.state();
         let State { flights, landing, .. } = &mut *s;
         match (flights.back_mut(), landing) {
-            (Some(flight), _) => flight.after.push(what),
-            (None, Some(landing)) => landing.after.push(what),
+            (Some(flight), _) => {
+                flight.marks.note(&what);
+                flight.after.push(what);
+            }
+            (None, Some(landing)) => {
+                landing.marks.note(&what);
+                landing.after.push(what);
+            }
             (None, None) => return Err(what),
         }
         Ok(())
+    }
+
+    /// What the flights in the air and the one being landed will still
+    /// write, oldest first (`crate::tail`).
+    pub(crate) fn air(&self) -> Vec<Arc<Marks>> {
+        let s = self.state();
+        let landing = s.landing.iter().map(|l| l.marks.clone());
+        landing.chain(s.flights.iter().map(|f| f.marks.clone())).collect()
     }
 
     /// Whether `fence` reaches `value` once everything in flight has landed.
@@ -443,6 +554,7 @@ impl Line {
                 s.landing = Some(Landing {
                     fence: flight.fence,
                     writes: flight.writes.clone(),
+                    marks: flight.marks.clone(),
                     after: std::mem::take(&mut flight.after),
                 });
                 // Behind the one before, and no longer than since then.
@@ -458,7 +570,7 @@ impl Line {
                 clock.ran(pair);
             }
             crate::host::ran(runs.len(), took);
-            crate::host::finish(&self.queue, &runs, &flight.back, &flight.writes);
+            crate::host::finish(&self.queue, &runs, &flight.back, &flight.writes, flight.fence);
             // The dynamic descriptor slots of lists no other submission
             // runs come back, before the title is told.
             for list in &runs {

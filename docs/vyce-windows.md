@@ -286,10 +286,12 @@ Chaves de comparação do trabalho da CPU (todas ligadas por padrão; o valor
 | VICTORY_TABLE_RETRY_MS=0 | Uma tabela sem descritores dinâmicos livres é descartada na hora (hoje espera até 100 ms a submissão mais antiga em voo terminar e tenta de novo uma vez; outro número muda essa espera, no máximo 2000) |
 | VICTORY_SLOTS_ACROSS_CURSOR=0 | A busca de descritores dinâmicos livres para no ponto onde começou, como antes, e não acha uma faixa livre que passa por esse ponto; aí também anota que não há faixa daquele tamanho, e tabelas desse tamanho ou maiores deixam de ser feitas até algum descritor voltar (hoje a busca segue até n - 1 descritores depois desse ponto, nunca além do último, nas duas passadas: a dos livres não emprestados e a de quaisquer livres) |
 | VICTORY_NULL_COPY=0 | Uma cópia pedida pelo jogo à memcpy do VCRUNTIME140 a partir da página nula volta a encerrar o processo (hoje, só nesse caso estreito, o destino recebe zeros e a chamada volta; é a queda da missão do barco, aviso "a copy from the null page read as zeros") |
+| VYCE_TAIL_DRAIN=0 | Cada submissão do jogo volta a esperar a anterior terminar antes de ser preparada, exatamente como antes (hoje é preparada com a anterior ainda na GPU e espera só antes de entregar as listas; ver Fase 2, abaixo) |
 
 Campos de VYCE_TELEMETRY desse trabalho (por quadro): gpu_idle_ms (GPU
 parada entre submissões), wait_*_ms e drains_* (tempo e número de esperas
-pela GPU por motivo: execute, signal, work, held, present, fence, list),
+pela GPU por motivo: execute, signal, work, held, present, fence, list,
+e da fase 2 tail e flush),
 late_signals, late_waits, landed e landed_here (submissões encerradas, e
 as encerradas por quem precisou antes da thread própria), ecl_calls,
 host_lists, watch_asks, watch_ms e watch_ahead (perguntas ao kernel e
@@ -500,3 +502,171 @@ passando e os 5 testes de xmem que já falhavam, victory-loader com todos
 passando menos um do load_probe (falta a delayimp.lib no toolchain do
 laboratório) e os lugares do código conferidos no executável 1.0.2.1,
 victory-core e o app. Ainda não foi medida em jogo.
+
+## Fase 2: dreno no fim (etapa B dos voos, passo 1)
+
+Na sessão da build intermediária a GPU ficou parada 131 ms por quadro (mediana)
+porque cada submissão do jogo esperava a anterior terminar antes de ser
+preparada (`execute_inner` chamava `line.drain` logo no começo): os ~44 ms de
+preparo de cada quadro, em ~23 submissões, aconteciam com a placa sem trabalho.
+Agora a submissão é preparada com a anterior ainda na GPU, e a espera vai para
+o fim do preparo, logo antes de `keep_before` e de `ExecuteCommandLists`. No
+máximo uma submissão do jogo fica no ar durante um preparo, e ela pousa antes
+da entrega das listas da próxima: os limites de descritores, cópias de
+referência, pares de tempo, a lista Early e as listas do card ficam como eram.
+É o passo 1 do plano do juiz da fase 2 (lab\fase2-desenho.json, chave
+"judge:stage-b"); o código está em `crates/victory-gpu/src/tail.rs`.
+
+Cada passo do preparo é de um de três tipos:
+
+- feito na hora, como antes: atualização de cópias de memória que nenhum
+  pouso no ar escreve, faixas entregues aos shaders, slots de descritores
+  feitos (o jogo só reescreve slots que nada em voo lê, como no console);
+- deixado para depois da espera, na ordem em que vinha: atualização de cópias
+  de memória que o pouso no ar escreve (o que os shaders dele escreveram nas
+  cópias, as leituras de volta, as escritas de fim de lista e o que outras
+  filas puseram atrás dele), de memória usada no lugar pela GPU (as escritas
+  dela ali não são conhecidas) ou do que os shaders dele escrevem pelos slots
+  de acesso desordenado das pilhas indexadas direto (isso fica na cópia, não
+  volta); e todo passo que lê a memória do jogo para memória nossa ou escreve
+  o que o voo ainda pode ler: preenchimentos, o trabalho do runtime, texturas
+  e os seus envios, prelúdios, os rebotes de constantes e as cópias de
+  referência de cópias que não são esparsas;
+- uma espera onde está (ponto de dreno): cópias de buffers do jogo
+  (`CopyBufferRegion`, `CopyResource`), `CopyMemoryToMemoryX`, e a declaração
+  de escrita de shaders numa cópia não esparsa que o voo no ar também
+  escreve. Dali em diante o preparo é o de antes.
+
+Uma atualização deixada para depois contorna as faixas que a submissão já
+tinha entregue aos shaders no passo dela, e só essas: depois do dreno antigo
+eram as únicas fechadas. As faixas que os shaders escrevem levam agora o
+valor de fence da submissão, e um pouso abre só as suas (antes eram tiradas
+por valor, e o pouso da anterior abria a mesma faixa declarada pela
+seguinte). As cópias de referência de blocos de uma cópia esparsa voltam ao
+pool por voo, as que nada mais pendente toca (antes só quando nada estava
+pendente; com o preparo sob o voo isso nunca aconteceria). A pré-atualização
+de antes (prewarm) continua igual.
+
+Ficam no dreno antigo, contados: submissões com uma lista ainda no ar
+(reenviada pelo jogo) e as com shaders que escrevem buffers na VRAM (essas
+esperam a GPU de qualquer jeito). O dreno no fim desliga sozinho, com uma
+linha no log, com VICTORY_ASYNC_SUBMIT=0, VYCE_LATE_SIGNAL=0, VYCE_ONE_ECL=0,
+VYCE_ONE_PASS=0, VICTORY_SWEEP_TILES diferente de 0 e, na build diag,
+VICTORY_GPU_TIMING.
+
+| Variável | Efeito |
+| --- | --- |
+| VYCE_TAIL_DRAIN=0 | Volta ao dreno antigo, exatamente: cada submissão espera tudo em voo antes de ser preparada |
+| VYCE_TAIL_DRAIN_STRICT=1 | Modo paranoico: toda atualização de cópia espera o fim, não só as que o pouso escreve. Se uma imagem errada com o dreno no fim fica certa com este modo, faltou alguma escrita na lista do pouso ou da memória usada no lugar |
+| VYCE_TAIL_DRAIN_DRY=0 | Com o dreno antigo e a telemetria ligada, não conta o que o dreno no fim (o normal, não o estrito) faria (os campos b_dry_* abaixo) |
+
+O que não está coberto e continua como sempre esteve (só a ordem no tempo
+pode mudar): escritas de shaders em cópias que ninguém declara (shaders que
+escrevem por ponteiro; slots de acesso desordenado maiores que 8 MiB, ou
+feitos desde que o plano de descritores foi montado inteiro pela última
+vez) correm com a atualização da submissão seguinte quando o jogo escreve a
+mesma página de 64 KiB; com o dreno antigo essas escritas sumiam sempre, agora
+podem ficar. VYCE_TAIL_DRAIN_STRICT=1 devolve a ordem antiga para isso também.
+Slots de descritores que o jogo reescreve enquanto um voo ainda os lê passam a
+valer para esse voo (no console também valeriam); com o dreno antigo, não.
+
+Campos novos de VYCE_TELEMETRY, por quadro:
+
+| Campo | Significado |
+| --- | --- |
+| b_mode | 0 dreno antigo, 1 dreno no fim, 2 estrito (o maior da amostra) |
+| b_prepared_under | Submissões do jogo preparadas com outra no ar |
+| b_overlap_ms | Preparo feito antes da primeira espera: o tempo que a GPU deixou de ficar parada (no máximo) |
+| wait_tail_ms, drains_tail | Espera no fim do preparo (a que sobra) e quantas esperaram de fato |
+| wait_flush_ms, drains_flush | O mesmo nos pontos de dreno no meio do preparo |
+| b_flush_copy, b_flush_run, b_flush_dense | Pontos de dreno por motivo: cópia do jogo, CopyMemoryToMemoryX, cópia não esparsa que o voo também escreve |
+| b_after_flush_ms | Preparo depois da primeira espera (volta a ser tempo de GPU parada) |
+| b_late_parts, b_late_mb | Atualizações de cópias deixadas para depois da espera, e os seus bytes |
+| b_queued, b_queued_ms | Outros passos deixados para depois, e o tempo deles |
+| b_old_list, b_old_card | Submissões que ficaram no dreno antigo: lista ainda no ar, shaders que escrevem buffers na VRAM |
+| b_dry_prepared | (Dreno antigo) submissões que teriam sido preparadas sob o voo |
+| b_dry_flush_copy, b_dry_flush_run, b_dry_flush_dense | (Dreno antigo) onde o dreno no fim teria esperado primeiro, por motivo (no máximo um por submissão) |
+| b_dry_late_parts, b_dry_late_mb | (Dreno antigo) atualizações que teriam esperado o fim |
+| b_dry_queued, b_dry_queued_ms | (Dreno antigo) outros passos que teriam esperado o fim, e o tempo deles |
+| b_dry_overlap_ms | (Dreno antigo) preparo antes do primeiro ponto de dreno, sem o que esperaria o fim: o que teria corrido junto com a GPU |
+| b_dry_after_flush_ms | (Dreno antigo) preparo depois do primeiro ponto de dreno |
+| b_dry_wait_ms | (Dreno antigo) a espera de antes do preparo (pré-atualização e dreno) |
+| b_dry_saved_ms | (Dreno antigo) por submissão, o menor entre a espera e o preparo que correria junto: a estimativa do tempo de GPU parada que o dreno no fim tira |
+| b_dry_lw_inplace | (Dreno antigo) voos no ar cujo pouso escreve memória usada no lugar (decide o passo 3) |
+| b_dry_decl_overlap | (Dreno antigo) declarações de escrita que o pouso no ar também escreve (decide o passo 3) |
+
+Como ler: com o dreno no fim, gpu_idle_ms deve cair e wait_execute_ms ir a
+quase zero (sobram só as submissões do dreno antigo); a espera que sobra
+aparece em wait_tail_ms e wait_flush_ms. Se b_flush_copy for perto de
+b_prepared_under e b_after_flush_ms grande, as cópias do jogo vêm cedo nas
+submissões e quase todo o preparo volta para a GPU parada: aí o próximo passo
+é o 4 (cópias sem dreno, abaixo). cpu_prepare_ms continua contando só o
+trabalho da CPU (as esperas do preparo vão para gpu_wait_ms). Com o dreno no
+fim ligado (o padrão) os b_dry_* ficam em 0; para vê-los numa sessão, rode
+com VYCE_TAIL_DRAIN=0 e a telemetria ligada. Ali b_dry_prepared perto do
+número de submissões do jogo por quadro e b_dry_saved_ms perto de
+cpu_prepare_ms dizem que quase todo o preparo correria com a GPU
+trabalhando (é uma conta por baixo: não conta que o jogo, liberado antes,
+grava a submissão seguinte mais cedo); b_dry_flush_copy alto e
+b_dry_after_flush_ms grande dizem que as cópias do jogo comem o ganho.
+
+Testado pelo heavy.sh: victory-gpu na placa com 205 passando e 9 ignorados
+(196 e 9 em 5c99db2), com o dreno no fim, com VYCE_TAIL_DRAIN=0, com
+VYCE_TAIL_DRAIN=0 e VYCE_TELEMETRY=1 (a contagem a seco em todo teste do
+dreno antigo) e com VYCE_TAIL_DRAIN_STRICT=1 (os 9 testes novos estão em
+tail/tests.rs), e a build release. O teste principal
+roda 2.500 casos aleatórios no WARP e 500 na RTX 2070 SUPER (VYCE_TAIL_SEEDS
+muda o número): de 2 a 6 submissões com atualizações, escritas e leituras de
+shaders numa cópia esparsa e numa não esparsa da mesma memória, memória usada
+no lugar, preenchimentos, trabalho do runtime, cópias do jogo,
+CopyMemoryToMemoryX, leituras de volta, escritas de fim de lista, listas
+reenviadas e escritas da CPU do jogo entre as submissões, com a GPU fazendo o
+seu trabalho quando a submissão é enviada ou só quando a seguinte vai
+esperar por ela (o pior caso), ou depois de um tempo ao acaso. A memória do
+jogo e tudo o que os shaders leram saem idênticos byte a byte com o dreno
+antigo, com o dreno no fim e com o estrito. As duas cópias também, byte a
+byte, nos casos em que nenhuma porta abre por tempo; nos outros, os bytes
+das cópias que nenhum passo pede dependem, já com o dreno antigo, de o voo
+anterior ter pousado ou não antes da pré-atualização (que só roda com um voo
+no ar e junta pedaços a menos de 4 KiB): o mesmo caso, só com o dreno
+antigo, deixou um desses bytes com dois valores em 400 rodadas na placa. Em
+todo caso, atualizadas no fim, as cópias são a memória do jogo. Num caso de
+cada dois o dreno antigo roda com a contagem a seco ligada, sem mudar nada,
+e onde nenhuma porta abre por tempo ela prevê exatamente o que o dreno no fim
+faz: que submissões vão sob o voo, que atualizações esperam o fim e onde
+fica a primeira espera. Com cada regra desligada (as atualizações, os passos
+deixados para depois, as cópias do jogo, as cópias não esparsas, as marcas de
+fence) algum caso de no máximo 500 sai diferente. Testes à parte: rebotes de
+constantes, escritas pelos slots de acesso desordenado, a devolução das
+cópias de referência, as marcas e a espera no fim de fato depois do preparo.
+Ainda não foi medido em jogo.
+
+### Próximos passos (só desenho, não feitos)
+
+Os números da próxima sessão dizem a ordem. Cada um com chave própria,
+desligado primeiro.
+
+- Passo 2, cópias de referência antes da espera (VYCE_TAIL_DRAIN_SNAP): dividir
+  `keep_before` em dois. As vistas cujos blocos nenhum pendente do voo no ar
+  toca e que não estão entre as atualizações deixadas para depois são copiadas
+  antes da espera; o resto depois. Depende da devolução por voo (feita) e de o
+  voo só escrever as faixas que declarou. Tira até ~20 ms de cópias de
+  referência por quadro do caminho parado (snapshot_ms).
+- Passo 3, entrega sem esperar o pouso: a Line ganha uma fence "pousado" que o
+  pouso sinaliza da CPU logo depois de `finish`; a próxima submissão espera na
+  fila (`queue.Wait`) por ela só se o pouso no ar escreve memória usada no
+  lugar (b_dry_lw_inplace) e espera o pouso na CPU só para as atualizações
+  tardias, as declarações que se cruzam com pendentes do voo
+  (b_dry_decl_overlap) e páginas que o jogo escreveu sob uma faixa pendente
+  desde a última cópia (o diário de escrita; NOT_WATCHED conta como escrita).
+  Precisa de um anel de listas Early (4), um anel da lista "antes" do card (3),
+  PAIRS 8 para 16, até 3 voos e um piso de descritores dinâmicos livres.
+- Passo 4, cópias do jogo sem dreno (se b_flush_copy for alto): primeiro uma
+  forma só de CPU, fazer a cópia na hora quando nem a origem nem o destino
+  tocam o que o pouso no ar escreve, o destino não é memória usada no lugar e
+  nenhuma atualização deixada para depois nem passo na fila lê o destino; e
+  daí em diante deixar para depois toda atualização que toca o destino (o voo
+  pode estar lendo a cópia dele). Depois, para as que tocam memória usada no
+  lugar, `CopyBufferRegion` numa lista na frente da submissão por um buffer
+  intermediário, com transições explícitas, e os destinos avisados ao vigia de
+  escrita no pouso.

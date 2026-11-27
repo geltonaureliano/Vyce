@@ -39,9 +39,11 @@ pub(crate) struct Shadow {
     copied: Mutex<Vec<u64>>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
-    /// Ranges shaders of a submission not yet copied back may be writing:
-    /// title memory there is older than the copy.
-    pending: Mutex<Vec<(usize, usize)>>,
+    /// Ranges shaders of a submission not yet copied back may be writing
+    /// (from, to, and the submission's fence value): title memory there is
+    /// older than the copy. A landing opens only its own (`crate::tail`: the
+    /// next submission may have declared the same range meanwhile).
+    pending: Mutex<Vec<(usize, usize, u64)>>,
     /// The copy's bytes before the submission ran, from an offset on,
     /// covering the ranges its shaders write: what the GPU wrote differs.
     before: Mutex<Before>,
@@ -93,7 +95,12 @@ impl UnchangedPages {
 
     fn differs(&mut self, address: usize, current: &[u8], before: &[u8]) -> bool {
         let page = address / PAGE;
-        let unchanged = &mut self.pages[page - self.start / PAGE];
+        // Outside the pages begun with (a snapshot grown since by another
+        // submission, which `crate::tail` keeps from happening): compared.
+        let at = page.checked_sub(self.start / PAGE);
+        let Some(unchanged) = at.and_then(|i| self.pages.get_mut(i)) else {
+            return current != before;
+        };
         if *unchanged {
             return false;
         }
@@ -392,10 +399,12 @@ impl Shadow {
         written
     }
 
-    pub(crate) fn finish_card_pending(&self, declared: &[(usize, usize)]) {
+    /// The submission with fence value `fence` is done with its `declared`
+    /// ranges of a card copy.
+    pub(crate) fn finish_card_pending(&self, declared: &[(usize, usize)], fence: u64) {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         for &(address, len) in declared {
-            pending.retain(|&r| r != (address, address + len));
+            pending.retain(|&(a, b, f)| !(a == address && b == address + len && ours(f, fence)));
         }
     }
 
@@ -430,6 +439,51 @@ impl Shadow {
     #[cfg(test)]
     pub(crate) fn copy_for_test(&self, from: usize, to: usize) -> usize {
         self.copy(from, to)
+    }
+
+    /// Tests': where the copy keeps the title's byte at `address` (in a
+    /// sparse copy, in a tile mapped for it).
+    #[cfg(test)]
+    pub(crate) fn view_for_test(&self, address: usize) -> *mut u8 {
+        if let Some((root, s)) = self.sparse_root() {
+            let tile = root.tile(s, address).expect("a mapped tile");
+            return (tile + address % PAGE) as *mut u8;
+        }
+        // SAFETY: inside the mapping.
+        unsafe { self.data.add(address - self.start as usize) }
+    }
+
+    /// Tests': the ranges shaders may be writing (its sparse root's).
+    #[cfg(test)]
+    pub(crate) fn pending_for_test(&self) -> Vec<(usize, usize, u64)> {
+        match self.sparse_root() {
+            Some((root, _)) => root.pending.lock().unwrap().clone(),
+            None => self.pending.lock().unwrap().clone(),
+        }
+    }
+
+    /// Tests': the tile snapshots a sparse copy keeps.
+    #[cfg(test)]
+    pub(crate) fn kept_for_test(&self) -> usize {
+        self.sparse_root().map_or(0, |(_, s)| s.before.lock().unwrap().len())
+    }
+
+    /// Tests': a sparse copy as if new, with nothing pending (its tiles
+    /// hold zeros and nothing counts as copied); nothing may be in flight.
+    #[cfg(test)]
+    pub(crate) fn reset_for_test(&self) {
+        let Some((root, s)) = self.sparse_root() else { return };
+        root.pending.lock().unwrap().clear();
+        give_back_tiles(s.before.lock().unwrap().drain().map(|(_, kept)| kept));
+        root.copied.lock().unwrap().iter_mut().for_each(|c| *c = 0);
+        s.looks.lock().unwrap().clear();
+        s.kept.lock().unwrap().clear();
+        root.unwatched.lock().unwrap().clear();
+        root.clean_spans.lock().unwrap().clear();
+        for tile in s.tiles.lock().unwrap().values() {
+            // SAFETY: the tile's mapping; nothing runs.
+            unsafe { std::ptr::write_bytes(tile.data as *mut u8, 0, PAGE) };
+        }
     }
 
     /// Whether the buffer is the title's memory itself.
@@ -503,12 +557,13 @@ impl Shadow {
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
-    /// write this range. Its bytes are kept to tell later what the GPU wrote:
-    /// one snapshot per copy and submission, grown to cover every range the
-    /// submission declares (the world declares overlapping views of its
-    /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
-    /// ~2.3 million page faults per world frame).
-    pub(crate) fn writing(&self, address: usize, len: usize) {
+    /// write this range (for the submission with fence value `fence`). Its
+    /// bytes are kept to tell later what the GPU wrote: one snapshot per
+    /// copy and submission, grown to cover every range the submission
+    /// declares (the world declares overlapping views of its 174 MB heap
+    /// dozens of times), in reused memory (fresh snapshots cost ~2.3 million
+    /// page faults per world frame).
+    pub(crate) fn writing(&self, address: usize, len: usize, fence: u64) {
         if self.direct.is_some() {
             return;
         }
@@ -516,16 +571,34 @@ impl Shadow {
             self.pending
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push((address, address + len));
+                .push((address, address + len, fence));
             return;
         }
         if let Some((root, s)) = self.sparse_root() {
-            return root.sparse_writing(s, address, len);
+            return root.sparse_writing(s, address, len, fence);
         }
+        self.close(address, len, fence);
+        self.keep_dense(address, len);
+    }
+
+    /// [`Shadow::writing`] of a copy that is neither sparse nor a card's,
+    /// without the snapshot ([`Shadow::keep_dense`], taken later by a
+    /// submission prepared under a flight): no refresh touches the range
+    /// from here on.
+    pub(crate) fn close(&self, address: usize, len: usize, fence: u64) {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push((address, address + len));
+            .push((address, address + len, fence));
+    }
+
+    /// [`Shadow::writing`]'s snapshot of a copy that is neither sparse nor a
+    /// card's. Taken later than the range was closed, it is the same: no
+    /// refresh touched the range since, and the flight before has landed.
+    pub(crate) fn keep_dense(&self, address: usize, len: usize) {
+        if self.direct.is_some() || self.card.is_some() || self.sparse.is_some() {
+            return;
+        }
         let (from, to) = self.inside(address, len);
         // SAFETY: inside the mapping.
         let host =
@@ -573,14 +646,15 @@ impl Shadow {
     /// title's threads write the same buffers while the GPU runs (its
     /// command memory shares the big GPU heap with what shaders write), and
     /// putting back the copy's older bytes there broke the title's own
-    /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
+    /// records (a fence list read as -1, title+0x4e9b54a). `fence`: the
+    /// submission's fence value, whose range this is. Returns the bytes
     /// written.
-    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+    pub(crate) fn copy_back(&self, address: usize, len: usize, fence: u64) -> usize {
         if self.direct.is_some() || self.card.is_some() {
             return 0;
         }
         if let Some((root, s)) = self.sparse_root() {
-            return root.sparse_back(s, address, len);
+            return root.sparse_back(s, address, len, fence);
         }
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let Before {
@@ -661,10 +735,12 @@ impl Shadow {
                 }
             }
         }
-        // Every submitted step that declared the range is done with it (one
-        // submission runs at a time), and the snapshot with the last range.
+        // Every step of the submission that declared the range is done with
+        // it, and the snapshot with the last range. (Another submission's
+        // ranges of the copy are not in it: `crate::tail` waits before such
+        // a declaration.)
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|&r| r != (address, address + len));
+        pending.retain(|&(a, b, f)| !(a == address && b == address + len && ours(f, fence)));
         if pending.is_empty()
             && let Some((_, bytes)) = snapshot.take()
         {
@@ -713,14 +789,93 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        let busy: Vec<(usize, usize)> = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|&&(a, e, _)| a < to && e > from)
+            .map(|&(a, e, _)| (a, e))
+            .collect();
+        self.update_gaps(from, to, lazy, busy)
+    }
+
+    /// [`Shadow::update_lazily`] of a refresh done after the wait for the
+    /// flights before its submission (`crate::tail`): around `around`, the
+    /// ranges the submission (fence value `fence`) had given its shaders by
+    /// the refresh's own step, as the refresh then went around those; and
+    /// around any other submission's still, though none is left in the air.
+    pub(crate) fn update_around(
+        &self,
+        address: usize,
+        len: usize,
+        lazy: bool,
+        around: &[(usize, usize)],
+        fence: u64,
+    ) -> usize {
+        if self.direct.is_some() {
+            return 0;
+        }
+        if let Some(root) = self.sparse.as_ref().and_then(|s| s.of.as_ref()) {
+            return root.update_around(address, len, lazy, around, fence);
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        if from >= to {
+            return 0;
+        }
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
+            .filter(|&&(a, e, f)| a < to && e > from && !ours(f, fence))
+            .map(|&(a, e, _)| (a, e))
             .collect();
+        busy.extend(around.iter().copied().filter(|&(a, e)| a < to && e > from));
+        self.update_gaps(from, to, lazy, busy)
+    }
+
+    /// The ranges of `[address, address + len)` the submission with fence
+    /// value `fence` gave its shaders so far, in this copy's memory (its
+    /// sparse root's).
+    pub(crate) fn own_pending(
+        &self,
+        address: usize,
+        len: usize,
+        fence: u64,
+    ) -> Vec<(usize, usize)> {
+        if let Some(root) = self.sparse.as_ref().and_then(|s| s.of.as_ref()) {
+            return root.own_pending(address, len, fence);
+        }
+        let end = address.saturating_add(len);
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|&&(a, e, f)| a < end && e > address && f == fence)
+            .map(|&(a, e, _)| (a, e))
+            .collect()
+    }
+
+    /// Whether shaders of a submission other than the one with fence value
+    /// `fence` write this copy (its sparse root).
+    pub(crate) fn has_other_pending(&self, fence: u64) -> bool {
+        if let Some(root) = self.sparse.as_ref().and_then(|s| s.of.as_ref()) {
+            return root.has_other_pending(fence);
+        }
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(.., f)| f != fence)
+    }
+
+    /// [`Shadow::update_lazily`] of `[from, to)` (inside the buffer) around
+    /// `busy`, ranges shaders write.
+    fn update_gaps(
+        &self,
+        from: usize,
+        to: usize,
+        lazy: bool,
+        mut busy: Vec<(usize, usize)>,
+    ) -> usize {
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -1186,6 +1341,28 @@ fn run_of(from: u64, to: u64) -> Option<(u64, u64)> {
     }
     (start <= from && end >= to).then_some((start, end))
 }
+
+/// Whether any of `[from, to)` lies in a window made already: memory the
+/// host GPU reads and writes in place, whose writes are known nowhere.
+pub(crate) fn meets_in_place(from: usize, to: usize) -> bool {
+    #[cfg(test)]
+    {
+        let ranges = IN_PLACE_FOR_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        if ranges.iter().any(|&(a, b)| a < to && from < b) {
+            return true;
+        }
+    }
+    if from >= to {
+        return false;
+    }
+    let (from, to) = (from as u64, to as u64);
+    // (A few dozen windows at most.)
+    windows_of_memory().range(..to).any(|(_, s)| s.start + s.len > from)
+}
+
+/// Tests': memory taken for used in place ([`meets_in_place`]).
+#[cfg(test)]
+pub(crate) static IN_PLACE_FOR_TEST: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
 /// Whether `[address, end)` lies in a window made already.
 pub(crate) fn in_place(address: u64, end: u64) -> bool {
@@ -1746,6 +1923,12 @@ fn sweeps() -> u8 {
     })
 }
 
+/// Whether tiles are given back at presents (`VICTORY_SWEEP_TILES`), which
+/// work in flight may still read.
+pub(crate) fn sweeping() -> bool {
+    sweeps() != 0 && !cfg!(test)
+}
+
 /// Gives back the tiles nothing has asked about for some frames: what
 /// viewed them is gone. At the present of `frame`.
 pub(crate) fn sweep(frame: u64) {
@@ -1976,6 +2159,12 @@ fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow
     })
 }
 
+/// Tests': a sparse copy of `[start, start + len)`, on the process's host.
+#[cfg(test)]
+pub(crate) fn sparse_for_test(start: u64, len: u64) -> Option<Arc<Shadow>> {
+    sparse_buffer(start, len, None).map(Arc::new)
+}
+
 /// The sparse copy `[address, end)` lies in.
 fn sparse(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if cfg!(test) || (end - 1) / CHUNK != address / CHUNK {
@@ -2171,12 +2360,12 @@ impl Shadow {
     /// [`Shadow::writing`] of a sparse copy. A range inside one already
     /// declared for this submission has its tiles' snapshots taken; new
     /// snapshots are copied on several threads (hundreds of MB a frame).
-    fn sparse_writing(&self, s: &Sparse, address: usize, len: usize) {
+    fn sparse_writing(&self, s: &Sparse, address: usize, len: usize, fence: u64) {
         let end = address + len;
         let covered = {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            let covered = pending.iter().any(|&(a, b)| a <= address && end <= b);
-            pending.push((address, end));
+            let covered = pending.iter().any(|&(a, b, f)| a <= address && end <= b && f == fence);
+            pending.push((address, end, fence));
             covered
         };
         #[cfg(feature = "diagnostics")]
@@ -2216,7 +2405,7 @@ impl Shadow {
     }
 
     /// [`Shadow::copy_back`] of a sparse copy, its tiles on several threads.
-    fn sparse_back(&self, s: &Sparse, address: usize, len: usize) -> usize {
+    fn sparse_back(&self, s: &Sparse, address: usize, len: usize, fence: u64) -> usize {
         let views = self.tiles_of(s, address, address + len);
         let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
         let start = self.start as usize;
@@ -2269,12 +2458,69 @@ impl Shadow {
         });
         let written = written.into_inner();
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|&r| r != (address, address + len));
-        if pending.is_empty() {
-            give_back_tiles(before.drain().map(|(_, buf)| buf));
-        }
+        pending.retain(|&(a, b, f)| !(a == address && b == address + len && ours(f, fence)));
+        self.give_back_kept(&mut before, &pending, &[(address, address + len)]);
         written
     }
+
+    /// After a landing (its pending ranges gone): the tile snapshots of its
+    /// `ranges` (sorted, joined) that no range still `pending` touches go
+    /// back to their pool, all of them once nothing is pending. A submission
+    /// prepared under the flight keeps its pending ranges open meanwhile,
+    /// and without this the snapshots of a sparse copy never went back.
+    fn give_back_kept(
+        &self,
+        before: &mut std::collections::HashMap<u32, Vec<u8>, Mix>,
+        pending: &[(usize, usize, u64)],
+        ranges: &[(usize, usize)],
+    ) {
+        if pending.is_empty() {
+            give_back_tiles(before.drain().map(|(_, buf)| buf));
+            return;
+        }
+        #[cfg(test)]
+        if crate::tail::KEEP_TILES.load(Ordering::Relaxed) {
+            return;
+        }
+        let start = self.start as usize;
+        let tile = |at: usize| (at.saturating_sub(start) / PAGE) as u32;
+        // The tiles still pending, as sorted, joined spans of tile numbers.
+        let mut busy: Vec<(u32, u32)> = pending
+            .iter()
+            .filter(|p| p.0 < p.1)
+            .map(|&(a, b, _)| (tile(a), tile(b - 1) + 1))
+            .collect();
+        busy.sort_unstable();
+        busy.dedup_by(|next, last| {
+            let joins = next.0 <= last.1;
+            if joins {
+                last.1 = last.1.max(next.1);
+            }
+            joins
+        });
+        let touched = |t: u32| {
+            let i = busy.partition_point(|b| b.1 <= t);
+            busy.get(i).is_some_and(|b| b.0 <= t)
+        };
+        let mut free = Vec::new();
+        for &(from, to) in ranges.iter().filter(|r| r.0 < r.1) {
+            for t in tile(from)..=tile(to - 1) {
+                if !touched(t)
+                    && let Some(kept) = before.remove(&t)
+                {
+                    free.push(kept);
+                }
+            }
+        }
+        give_back_tiles(free.into_iter());
+    }
+}
+
+/// Whether a pending range tagged `f` is the submission's with fence value
+/// `fence` (in tests also one whose tag was taken off,
+/// `crate::tail::Mutation::Tags`, as before the tags).
+fn ours(f: u64, fence: u64) -> bool {
+    f == fence || cfg!(test) && f == 0
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2902,7 +3148,7 @@ mod tests {
         let shadow = Shadow::new(buffer, data, gpu, BASE as u64, SIZE as u64, None);
         // SAFETY: the test has sole access to the mapped buffer.
         unsafe { data.write_bytes(7, SIZE) };
-        shadow.writing(BASE + PAGE, PAGE);
+        shadow.writing(BASE + PAGE, PAGE, 1);
 
         // Make spare capacity deterministic even if another test used the pool.
         let snapshot_ptr = {
@@ -2919,7 +3165,7 @@ mod tests {
             data.add(PAGE).write_bytes(99, PAGE);
             data.add(2 * PAGE).write_bytes(11, PAGE);
         }
-        shadow.writing(BASE + 2 * PAGE, PAGE);
+        shadow.writing(BASE + 2 * PAGE, PAGE, 1);
         {
             let before = shadow.before.lock().unwrap();
             let (_, bytes) = before.snapshot.as_ref().unwrap();
@@ -2931,9 +3177,9 @@ mod tests {
         for page in 3..PAGES {
             // SAFETY: this page is inside the test's host buffer.
             unsafe { data.add(page * PAGE).write_bytes(page as u8, PAGE) };
-            shadow.writing(BASE + page * PAGE, PAGE);
+            shadow.writing(BASE + page * PAGE, PAGE, 1);
         }
-        shadow.writing(BASE + PAGE, 2 * PAGE);
+        shadow.writing(BASE + PAGE, 2 * PAGE, 1);
         {
             let before = shadow.before.lock().unwrap();
             let (at, bytes) = before.snapshot.as_ref().unwrap();
@@ -2949,7 +3195,7 @@ mod tests {
         // The old growth path must preserve the baseline when it prepends.
         // SAFETY: the first page of the test's host buffer.
         unsafe { data.write_bytes(5, PAGE) };
-        shadow.writing(BASE, PAGE);
+        shadow.writing(BASE, PAGE, 1);
         let before = shadow.before.lock().unwrap();
         let (at, bytes) = before.snapshot.as_ref().unwrap();
         assert_eq!((*at, bytes.len()), (0, SIZE));
@@ -2971,8 +3217,8 @@ mod tests {
         let shadow = Shadow::new(buffer, data, gpu, address as u64, PAGE as u64, None);
         shadow.watched.store(NOT_WATCHED, Ordering::Relaxed);
         unsafe { data.write_bytes(7, PAGE) };
-        shadow.writing(address, 48);
-        shadow.writing(address + 8, 72);
+        shadow.writing(address, 48, 1);
+        shadow.writing(address + 8, 72, 1);
 
         title[offset + 10] = 2;
         // SAFETY: the test models two GPU writes to its own mapped buffer.
@@ -2980,14 +3226,14 @@ mod tests {
             data.add(20).write(17);
             data.add(64).write(23);
         }
-        assert_eq!(shadow.copy_back(address, 48), 1);
+        assert_eq!(shadow.copy_back(address, 48, 1), 1);
         assert_eq!((title[offset + 10], title[offset + 20], title[offset + 64]), (2, 17, 7));
 
         // The CPU writes to the overlap after the first copy-back. The
         // remaining GPU byte must land without reverting either CPU byte.
         title[offset + 10] = 3;
         title[offset + 20] = 9;
-        assert_eq!(shadow.copy_back(address + 8, 72), 1);
+        assert_eq!(shadow.copy_back(address + 8, 72, 1), 1);
         assert_eq!((title[offset + 10], title[offset + 20], title[offset + 64]), (3, 9, 23));
         let before = shadow.before.lock().unwrap();
         assert!(before.snapshot.is_none());
@@ -3031,7 +3277,7 @@ mod tests {
         }
         let begin = base as usize + 3;
         let length = SIZE - 9;
-        shadow.writing(begin, length);
+        shadow.writing(begin, length, 1);
         assert_eq!(sparse.before.lock().unwrap().len(), TILES);
         for tile in 0..TILES {
             let address = base as usize + tile * PAGE;
@@ -3043,7 +3289,7 @@ mod tests {
                 (address as *mut u8).add(33).write(29);
             }
         }
-        assert_eq!(shadow.copy_back(begin, length), TILES);
+        assert_eq!(shadow.copy_back(begin, length, 1), TILES);
         assert!(sparse.before.lock().unwrap().is_empty());
         for tile in 0..TILES {
             // SAFETY: the reservation is still alive and the test owns it.

@@ -367,9 +367,10 @@ impl CardPlan {
         self.total_pieces > 0
     }
 
-    pub(crate) fn clear_pending(self) {
+    /// The submission with fence value `fence` is done with the ranges.
+    pub(crate) fn clear_pending(self, fence: u64) {
         for entry in &self.entries {
-            entry.shadow.finish_card_pending(&entry.declared);
+            entry.shadow.finish_card_pending(&entry.declared, fence);
         }
     }
 }
@@ -640,7 +641,8 @@ impl CardEngine {
             return (None, plan);
         }
 
-        // SAFETY: allocator & list are idle under `Host::submitted`.
+        // SAFETY: allocator & list are idle under `Host::submitted`: recorded
+        // once every submission before has landed (`crate::tail` waits first).
         let list = unsafe {
             if self.before_alloc.Reset().is_err()
                 || self.before_list.Reset(&self.before_alloc, None).is_err()
@@ -825,11 +827,13 @@ impl CardEngine {
     /// Reads the `differs` results after the submission fence completes, fetches
     /// ONLY the 64 KiB pages the GPU actually modified, and merges them into
     /// title memory + `staging`. Returns total bytes written to title memory.
+    /// `fence`: the fence value the submission's ranges carry.
     pub(crate) fn finish_back(
         &mut self,
         host: &Host,
         plan: CardPlan,
         submitted: &mut u64,
+        fence: u64,
     ) -> usize {
         if plan.entries.is_empty() {
             return 0;
@@ -946,7 +950,7 @@ impl CardEngine {
 
         // Clear all declared pending ranges on each card shadow.
         for entry in &plan.entries {
-            entry.shadow.finish_card_pending(&entry.declared);
+            entry.shadow.finish_card_pending(&entry.declared, fence);
         }
         written
     }
@@ -1173,7 +1177,7 @@ mod tests {
 
         // Phase 1: Initial CPU copy -> upload to VRAM + Wave64 hash, no GPU writes.
         shadow.copy_for_test(base, base + size as usize);
-        shadow.writing(base, size as usize);
+        shadow.writing(base, size as usize, 1);
         let (before, plan) = engine.record_before(&host, &[(shadow.clone(), base, size as usize)]);
         assert!(before.is_some(), "initial upload + hash must emit before list");
         assert_eq!(plan.total_pieces, pages as u32);
@@ -1185,7 +1189,7 @@ mod tests {
             std::slice::from_raw_parts(engine.differs_rb.1 as *const u32, pages).to_vec()
         };
         assert_eq!(differs_1, vec![0, 0, 0, 0]);
-        let written_1 = engine.finish_back(&host, plan, &mut submitted);
+        let written_1 = engine.finish_back(&host, plan, &mut submitted, 1);
         assert_eq!(written_1, 0);
 
         // Phase 2: GPU writes 4 bytes on page 2 while CPU concurrently writes
@@ -1212,7 +1216,7 @@ mod tests {
             list.Close().expect("close");
             let cmd: ID3D12CommandList = list.cast().expect("cast");
             // Execute immediately after record_before while alloc stays alive.
-            shadow.writing(base, size as usize);
+            shadow.writing(base, size as usize, 1);
             let (before2, plan2) =
                 engine.record_before(&host, &[(shadow.clone(), base, size as usize)]);
             assert!(before2.is_none(), "no CPU dirty uploads expected in phase 2");
@@ -1226,14 +1230,14 @@ mod tests {
             let differs_2 =
                 std::slice::from_raw_parts(engine.differs_rb.1 as *const u32, pages).to_vec();
             assert_eq!(differs_2, vec![0, 0, 1, 0], "only page 2 should differ");
-            let written_2 = engine.finish_back(&host, plan2, &mut submitted);
+            let written_2 = engine.finish_back(&host, plan2, &mut submitted, 1);
             assert_eq!(written_2, 4, "tight dirty span should write exactly 4 GPU bytes");
             assert_eq!(&title[2 * PAGE + 128..2 * PAGE + 132], &gpu_bytes);
             assert_eq!(&title[2 * PAGE + 256..2 * PAGE + 260], &[0x11, 0x22, 0x33, 0x44]);
 
             // Phase 3: Next submission uploads merged concurrent CPU write on page 2
             // back to VRAM and re-hashes page 2 so subsequent compare reports 0 diffs.
-            shadow.writing(base, size as usize);
+            shadow.writing(base, size as usize, 1);
             let (before3, plan3) =
                 engine.record_before(&host, &[(shadow.clone(), base, size as usize)]);
             assert!(
@@ -1243,7 +1247,7 @@ mod tests {
             let after3 = engine.record_after(&host, &plan3).expect("after3");
             host.execute_and_wait_locked(before3.unwrap(), &mut submitted);
             host.execute_and_wait_locked(after3, &mut submitted);
-            let written_3 = engine.finish_back(&host, plan3, &mut submitted);
+            let written_3 = engine.finish_back(&host, plan3, &mut submitted, 1);
             assert_eq!(written_3, 0, "after re-upload + re-hash, 0 bytes should differ");
 
             // Read back page 2 directly from VRAM and verify both GPU and CPU writes exist there.

@@ -152,9 +152,64 @@ pub(crate) enum Count {
     /// other free slots fitted them
     /// (`crate::descriptor::host::HostHeap::give_back`).
     LentTaken,
+    /// The tail drain (`crate::tail`): waits for the flights before a title
+    /// submission at its tail, and at a flush point before it, with how
+    /// many of each had to wait.
+    WaitTail,
+    WaitFlush,
+    DrainsTail,
+    DrainsFlush,
+    /// Title submissions prepared while a flight was in the air, and their
+    /// preparation before their first wait (what the host GPU no longer
+    /// stands idle for) ...
+    TailPrepared,
+    TailOverlap,
+    /// ... the flush points they waited at, by why: a title copy, work that
+    /// may write title memory, shaders writing a copy that is not sparse
+    /// which a flight writes too ...
+    TailFlushCopy,
+    TailFlushRun,
+    TailFlushDense,
+    /// ... their preparation after their first wait ...
+    TailAfterFlush,
+    /// ... refreshes left for after the wait, and their bytes ...
+    TailLate,
+    TailLateBytes,
+    /// ... and other steps left for after it, with their time.
+    TailQueued,
+    TailQueuedTime,
+    /// Title submissions that took the old drain with the tail drain on: a
+    /// list still in the air, shaders writing buffers on the card.
+    TailOldList,
+    TailOldCard,
+    /// The dry run, with the old drain (`crate::tail::dry`): the same as
+    /// above for what the tail drain would have done ...
+    DryPrepared,
+    DryOldList,
+    DryOldCard,
+    DryFlushCopy,
+    DryFlushRun,
+    DryFlushDense,
+    DryLate,
+    DryLateBytes,
+    DryQueued,
+    DryQueuedTime,
+    /// ... the preparation before the first flush point, without what would
+    /// have waited for the tail, and after it ...
+    DryOverlap,
+    DryAfterFlush,
+    /// ... the old drain's wait, and of it what the overlap would have saved
+    /// ...
+    DryWait,
+    DrySaved,
+    /// ... flights in the air whose landing writes memory used in place,
+    /// and declarations of shader writes a landing in the air writes too
+    /// (for the plan's step 3).
+    DryLandsInPlace,
+    DryDeclaredOver,
 }
 
-const COUNTS: usize = Count::LentTaken as usize + 1;
+const COUNTS: usize = Count::DryDeclaredOver as usize + 1;
 
 /// The count of waits of the kind a wait's time is counted as.
 pub(crate) fn drains_of(why: Count) -> Option<Count> {
@@ -166,6 +221,8 @@ pub(crate) fn drains_of(why: Count) -> Option<Count> {
         Count::WaitPresent => Count::DrainsPresent,
         Count::WaitFence => Count::DrainsFence,
         Count::WaitList => Count::DrainsList,
+        Count::WaitTail => Count::DrainsTail,
+        Count::WaitFlush => Count::DrainsFlush,
         _ => return None,
     })
 }
@@ -180,9 +237,12 @@ pub(crate) enum Gauge {
     Slots,
     /// Submissions in flight at once.
     Flights,
+    /// How title submissions met the flights before them
+    /// (`crate::tail::Mode`): 0 the old drain, 1 the tail drain, 2 strict.
+    TailMode,
 }
 
-const GAUGES: usize = Gauge::Flights as usize + 1;
+const GAUGES: usize = Gauge::TailMode as usize + 1;
 static HIGHEST: [AtomicU64; GAUGES] = [const { AtomicU64::new(0) }; GAUGES];
 
 /// The counts the panel does not draw, by their name in the sample, with
@@ -248,12 +308,45 @@ const MORE: &[(&str, Count, f64)] = &[
     ("table_retry_ms", Count::TableRetryTime, 1e3),
     ("tables_lost", Count::TablesLost, 1.0),
     ("lent_taken", Count::LentTaken, 1.0),
+    ("wait_tail_ms", Count::WaitTail, 1e3),
+    ("wait_flush_ms", Count::WaitFlush, 1e3),
+    ("drains_tail", Count::DrainsTail, 1.0),
+    ("drains_flush", Count::DrainsFlush, 1.0),
+    ("b_prepared_under", Count::TailPrepared, 1.0),
+    ("b_overlap_ms", Count::TailOverlap, 1e3),
+    ("b_flush_copy", Count::TailFlushCopy, 1.0),
+    ("b_flush_run", Count::TailFlushRun, 1.0),
+    ("b_flush_dense", Count::TailFlushDense, 1.0),
+    ("b_after_flush_ms", Count::TailAfterFlush, 1e3),
+    ("b_late_parts", Count::TailLate, 1.0),
+    ("b_late_mb", Count::TailLateBytes, 1e6),
+    ("b_queued", Count::TailQueued, 1.0),
+    ("b_queued_ms", Count::TailQueuedTime, 1e3),
+    ("b_old_list", Count::TailOldList, 1.0),
+    ("b_old_card", Count::TailOldCard, 1.0),
+    ("b_dry_prepared", Count::DryPrepared, 1.0),
+    ("b_dry_old_list", Count::DryOldList, 1.0),
+    ("b_dry_old_card", Count::DryOldCard, 1.0),
+    ("b_dry_flush_copy", Count::DryFlushCopy, 1.0),
+    ("b_dry_flush_run", Count::DryFlushRun, 1.0),
+    ("b_dry_flush_dense", Count::DryFlushDense, 1.0),
+    ("b_dry_late_parts", Count::DryLate, 1.0),
+    ("b_dry_late_mb", Count::DryLateBytes, 1e6),
+    ("b_dry_queued", Count::DryQueued, 1.0),
+    ("b_dry_queued_ms", Count::DryQueuedTime, 1e3),
+    ("b_dry_overlap_ms", Count::DryOverlap, 1e3),
+    ("b_dry_after_flush_ms", Count::DryAfterFlush, 1e3),
+    ("b_dry_wait_ms", Count::DryWait, 1e3),
+    ("b_dry_saved_ms", Count::DrySaved, 1e3),
+    ("b_dry_lw_inplace", Count::DryLandsInPlace, 1.0),
+    ("b_dry_decl_overlap", Count::DryDeclaredOver, 1.0),
 ];
 
 const MORE_GAUGES: [(&str, Gauge); GAUGES] = [
     ("pins_max", Gauge::Pins),
     ("slots_max", Gauge::Slots),
     ("flights_max", Gauge::Flights),
+    ("b_mode", Gauge::TailMode),
 ];
 
 pub(crate) fn add(what: Count, n: u64) {

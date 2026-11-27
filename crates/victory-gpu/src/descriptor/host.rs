@@ -492,29 +492,68 @@ unsafe impl Send for BindlessPlan {}
 unsafe impl Sync for BindlessPlan {}
 
 impl BindlessPlan {
-    /// Copies the misaligned constant buffers into their bounce slices.
+    /// Which misaligned constant buffers are to be copied into their bounce
+    /// slices ([`BindlessPlan::copy_slices`], which the caller does before
+    /// any list of the submission runs, after the flights before have landed
+    /// if it is prepared under them: the slices are the slots', which they
+    /// may read, `crate::tail`): those of the whole plan (`Some(true)`) or the
+    /// new ones (`Some(false)`).
     ///
     /// shortcut: all of them once a frame, else only for a plan not copied
     /// yet: the title writes constants before it points a slot at them.
-    /// Returns the title memory to bring up to date, by the same rule, in two
-    /// lists, and whether it is all of it (and may be looked at less often
-    /// where it does not change) rather than what is new.
-    pub(crate) fn copy_constants(&self) -> ([&[(Arc<crate::shadow::Shadow>, usize, usize)]; 2], bool) {
+    /// Returns besides the title memory to bring up to date, by the same
+    /// rule, in two lists, and whether it is all of it (and may be looked at
+    /// less often where it does not change) rather than what is new.
+    pub(crate) fn constants_due(
+        &self,
+    ) -> ([&[(Arc<crate::shadow::Shadow>, usize, usize)]; 2], bool, Option<bool>) {
         let frame = crate::queue::presented() + 1;
         // Counted for all plans: each is the one before with a few changes.
         static FRAME: AtomicU64 = AtomicU64::new(0);
         let all = FRAME.swap(frame, Ordering::AcqRel) != frame;
         let fresh = self.copied_in.swap(frame, Ordering::AcqRel) == 0;
         if all || in_test() {
-            let (planned, extra) = self.all_bounces();
-            copy_lists(&[&planned, extra]);
-            return ([&self.reads, &self.extra_reads], all);
+            return ([&self.reads, &self.extra_reads], all, Some(true));
         }
         if fresh {
-            copy_lists(&[&self.fresh]);
-            return ([&self.fresh_reads, &[]], false);
+            return ([&self.fresh_reads, &[]], false, Some(false));
         }
-        ([&[], &[]], false)
+        ([&[], &[]], false, None)
+    }
+
+    /// Tests': a plan of only misaligned constant buffers (bounce slice,
+    /// title address, bytes) and unordered access ranges, which the heap's
+    /// submissions then take.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        heap: &HostHeap,
+        bounces: Vec<(usize, u64, u32)>,
+        writes: Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
+    ) {
+        let plan = Arc::new(BindlessPlan {
+            reads: Arc::default(),
+            writes: Arc::new(writes),
+            bounces: Arc::new(bounces),
+            fresh: Vec::new(),
+            fresh_reads: Vec::new(),
+            extra_reads: Arc::default(),
+            extra_bounces: Arc::default(),
+            copied_in: AtomicU64::new(0),
+            _retained: Arc::default(),
+            _extra: Vec::new(),
+        });
+        heap.bindless.lock().unwrap().plan = Some(plan);
+    }
+
+    /// Copies the misaligned constant buffers of the whole plan (`whole`) or
+    /// the new ones into their bounce slices.
+    pub(crate) fn copy_slices(&self, whole: bool) {
+        if whole {
+            let (planned, extra) = self.all_bounces();
+            copy_lists(&[&planned, extra]);
+        } else {
+            copy_lists(&[&self.fresh]);
+        }
     }
 
     /// The misaligned constant buffers of all slots: the whole plan's, but
@@ -745,6 +784,19 @@ fn in_test() -> bool {
     return !AS_IN_GAME.get();
     #[cfg(not(test))]
     false
+}
+
+/// Tests': this thread's plans are made as the game's are (`on`), and what
+/// shaders write through their unordered access slots is not copied back.
+#[cfg(test)]
+pub(crate) fn as_in_game(on: bool) {
+    AS_IN_GAME.set(on);
+}
+
+/// Whether what shaders write through a plan's unordered access slots goes
+/// back to title memory: in tests only, unless as in the game.
+pub(crate) fn plan_writes_back() -> bool {
+    cfg!(test) && in_test()
 }
 
 /// A plan built some frames ago may read memory no slot views any more:
