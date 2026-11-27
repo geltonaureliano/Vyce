@@ -476,6 +476,67 @@ pub(crate) const MANY_VIEWS: usize = 64;
 struct Views {
     by_addr: BTreeMap<usize, (usize, usize, u64)>,
     pages: std::collections::HashMap<(usize, u64), Vec<usize>>,
+    /// The blocks whose page is shown at 2 to [`MANY_VIEWS`] addresses:
+    /// those whose views are guarded together ([`other_views`]).
+    shared: BTreeSet<usize>,
+}
+
+/// Title memory some block of which is shown at another address too, one
+/// bit for every 2 MiB of the first TiB, as [`TOUCHED`]: set before the
+/// block is noted shared, never cleared. Where no bit is set,
+/// [`other_views`] does not look at the views.
+static SHOWN_TWICE: [AtomicU64; TOUCHED_WORDS] = [const { AtomicU64::new(0) }; TOUCHED_WORDS];
+
+/// Notes the block at `at` shared.
+fn note_shared(shared: &mut BTreeSet<usize>, at: usize) {
+    let bit = (at >> TOUCHED_SHIFT).min(TOUCHED_WORDS * 64 - 1);
+    let (word, bit) = (&SHOWN_TWICE[bit / 64], 1u64 << (bit % 64));
+    if word.load(Ordering::Relaxed) & bit == 0 {
+        word.fetch_or(bit, Ordering::Release);
+    }
+    shared.insert(at);
+}
+
+/// Whether a block of `[at, at + len)` (`len` not 0) may be shared.
+fn maybe_shared(at: usize, len: usize) -> bool {
+    let (first, last) = (at >> TOUCHED_SHIFT, (at + len - 1) >> TOUCHED_SHIFT);
+    last >= TOUCHED_WORDS * 64
+        || (first..=last).any(|bit| SHOWN_TWICE[bit / 64].load(Ordering::Acquire) >> (bit % 64) & 1 != 0)
+}
+
+/// The same bytes as `[from, to)` at the other addresses their pages are
+/// shown at, where those views are guarded together (a page shown at 2 to
+/// [`MANY_VIEWS`] addresses): what our writes there change too, and what
+/// [`opening`] opens with them. Sorted and joined; empty for memory that is
+/// no view, or whose pages are shown once (most of it). A submission
+/// prepared under a flight waits for its landing before it brings a copy of
+/// such bytes up to date (`crate::tail`).
+pub(crate) fn other_views(from: usize, to: usize) -> Vec<(usize, usize)> {
+    if from >= to || !maybe_shared(from, to - from) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    {
+        let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(views) = views.as_ref() else { return Vec::new() };
+        for &block in views.shared.range(from - from % BLOCK..to) {
+            let (a, b) = (from.max(block), to.min(block + BLOCK));
+            for &other in views.shown(block) {
+                if other != block {
+                    out.push((other + (a - block), other + (b - block)));
+                }
+            }
+        }
+    }
+    out.sort_unstable();
+    let mut joined: Vec<(usize, usize)> = Vec::with_capacity(out.len());
+    for (a, b) in out {
+        match joined.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => joined.push((a, b)),
+        }
+    }
+    joined
 }
 
 static VIEWS: Mutex<Option<Views>> = Mutex::new(None);
@@ -575,8 +636,22 @@ impl Views {
             };
             for k in 0..n / BLOCK {
                 let key = (section, offset / BLOCK as u64 + k as u64);
+                let gone = a + k * BLOCK;
                 if let Some(shown) = self.pages.get_mut(&key) {
-                    shown.retain(|&x| x != a + k * BLOCK);
+                    shown.retain(|&x| x != gone);
+                    self.shared.remove(&gone);
+                    // Shown once now, or no longer at too many places.
+                    match shown.len() {
+                        1 => {
+                            self.shared.remove(&shown[0]);
+                        }
+                        MANY_VIEWS => {
+                            for &x in shown.iter() {
+                                note_shared(&mut self.shared, x);
+                            }
+                        }
+                        _ => {}
+                    }
                     if shown.is_empty() {
                         self.pages.remove(&key);
                     }
@@ -620,12 +695,30 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
         let views = views.get_or_insert_with(Views::default);
         views.forget(at, len);
         views.by_addr.insert(at, (len, section, offset));
+        let Views { pages, shared, .. } = views;
         for k in 0..len / BLOCK {
-            let shown = views.pages.entry((section, offset / BLOCK as u64 + k as u64)).or_default();
+            let shown = pages.entry((section, offset / BLOCK as u64 + k as u64)).or_default();
             if shown.len() < MANY_VIEWS {
                 others.extend_from_slice(shown);
             }
             shown.push(at + k * BLOCK);
+            // Its views are guarded together from two on, and apart past
+            // too many.
+            match shown.len() {
+                1 => {}
+                2 => {
+                    for &x in shown.iter() {
+                        note_shared(shared, x);
+                    }
+                }
+                n if n <= MANY_VIEWS => note_shared(shared, at + k * BLOCK),
+                n if n == MANY_VIEWS + 1 => {
+                    for x in shown.iter() {
+                        shared.remove(x);
+                    }
+                }
+                _ => {}
+            }
         }
     }
     if !others.is_empty() {
@@ -1606,5 +1699,71 @@ mod tests {
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    /// A range's bytes at the other views of its pages, joined; none for
+    /// memory that is no view, nor once the views are gone.
+    #[test]
+    fn other_views_are_the_same_bytes_elsewhere() {
+        let (one, two) = two_views();
+        assert_eq!(other_views(one + 100, one + 200), [(two + 100, two + 200)]);
+        assert_eq!(other_views(two + 5, two + 6), [(one + 5, one + 6)]);
+        // Across the two blocks: one piece, the views follow each other.
+        let across = other_views(one + BLOCK - 10, one + BLOCK + 10);
+        assert_eq!(across, [(two + BLOCK - 10, two + BLOCK + 10)]);
+        let private = vec![0u8; 64];
+        let at = private.as_ptr() as usize;
+        assert!(other_views(at, at + 64).is_empty());
+        assert!(other_views(one + 100, one + 100).is_empty());
+        drop_views(&[one, two]);
+        assert!(other_views(one + 100, one + 200).is_empty());
+    }
+
+    /// A page shown at more than `MANY_VIEWS` addresses has its views
+    /// guarded apart, so none of them counts as another view of it; with one
+    /// view less they all do again, and with one view left none does.
+    #[test]
+    fn past_many_views_a_page_has_no_other_views() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of one block, mapped read-write again
+        // and again.
+        let mut views: Vec<usize> = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                BLOCK as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            (0..=MANY_VIEWS)
+                .map(|_| {
+                    let at = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK).Value as usize;
+                    assert_ne!(at, 0);
+                    title_memory_view(at, BLOCK, section as usize, 0);
+                    at
+                })
+                .collect()
+        };
+        let gone = |view: usize| {
+            title_memory_remapped(view, BLOCK);
+            title_memory_view_gone(view, BLOCK);
+            // SAFETY: our view.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+        };
+        let first = views[0];
+        assert!(other_views(first, first + 8).is_empty(), "shown at too many places");
+        gone(views.pop().unwrap());
+        let others = other_views(first, first + 8);
+        assert_eq!(others.len(), MANY_VIEWS - 1);
+        assert!(others.contains(&(views[1], views[1] + 8)) && !others.contains(&(first, first + 8)));
+        while views.len() > 1 {
+            gone(views.pop().unwrap());
+        }
+        assert!(other_views(first, first + 8).is_empty(), "shown once");
+        gone(first);
     }
 }

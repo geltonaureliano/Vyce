@@ -17,7 +17,8 @@
 //!
 //! - done at once, as before: what neither reads what a landing in the air
 //!   writes nor writes what the flight still uses (refreshes of memory no
-//!   landing writes, ranges given to shaders, bindless slots made);
+//!   landing writes, ranges given to shaders, bindless slots the title wrote
+//!   since the plan before);
 //! - left for after the wait, in the order the steps came (late): the
 //!   refreshes of memory a landing in the air writes, that is used in place
 //!   by the host GPU, or that the flight's shaders write through directly
@@ -27,18 +28,31 @@
 //!   preludes, bounces of constant buffers, snapshots of copies that are not
 //!   sparse);
 //! - a wait where it stands (a flush point): title copies and work that may
-//!   write title memory, and a declaration of shader writes on a copy that
-//!   is not sparse which a flight in the air writes too (the copy has one
-//!   snapshot). From there on the preparation is the old one.
+//!   write title memory, a declaration of shader writes on a copy that is
+//!   not sparse which a flight in the air writes too (the copy has one
+//!   snapshot), and slots of a directly indexed heap the title did not write
+//!   since the plan before (those that plan left unmade over its time
+//!   budget, and those the plan's look finds): the flight may read them, and
+//!   a descriptor is not to change while the host GPU may read it. From
+//!   there on the preparation is the old one.
+//!
+//! What a landing writes is known by address, and the title shows one
+//! physical page at several addresses (views of xmem's sections): a refresh
+//! of the same bytes at another view, of a page whose views are guarded
+//! together, waits for the landing too ([`crate::watch::other_views`]), as
+//! does one of another view of memory used in place. The old drain saw those
+//! writes through the guards: our writes into title memory open every view
+//! of the page ([`crate::watch::opening`]), and the refresh came after them.
 //!
 //! A refresh left for later goes around the ranges the submission had given
 //! its shaders by its own step, and no others: the old drain had landed the
 //! flight before it, so those were all a refresh found closed then. Ranges
 //! shaders write carry the fence value of their submission, so a landing
 //! opens only its own ([`crate::shadow::Shadow::copy_back`]). The prewarm
-//! runs before the preparation, as with the old drain. A submission with a
-//! list still in the air, or with shaders writing buffers on the card,
-//! takes the old drain.
+//! (the same refreshes done early while the flight before runs) is left
+//! out: the preparation itself runs under the flight now
+//! (`VYCE_TAIL_PREWARM=1` keeps it). A submission with a list still in the
+//! air, or with shaders writing buffers on the card, takes the old drain.
 //!
 //! shortcut: shader writes nobody declares (through pointers; through
 //! unordered access slots over their plan's cap or made since it was built
@@ -77,6 +91,9 @@ thread_local! {
     /// Tests': whether their dry run is on.
     #[cfg(test)]
     static DRY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Tests': whether those prepared under a flight are prewarmed.
+    #[cfg(test)]
+    static PREWARM: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// The mode the switches ask for (`VYCE_TAIL_DRAIN`, on unless 0;
@@ -127,6 +144,28 @@ pub(crate) fn force_dry(on: Option<bool>) {
     DRY.set(on);
 }
 
+/// Whether a title submission prepared under a flight is prewarmed first,
+/// as with the old drain (`VYCE_TAIL_PREWARM=1`; by default not: the
+/// prewarm brings the copies its steps ask for up to date while the flight
+/// before runs, which the preparation under the flight does itself, so it
+/// was the same refreshes twice, some 6 ms a world frame on the title's
+/// submitting thread).
+pub(crate) fn prewarm() -> bool {
+    #[cfg(test)]
+    if let Some(on) = PREWARM.get() {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VYCE_TAIL_PREWARM").is_some_and(|v| v == "1"))
+}
+
+/// Tests': the submissions this thread prepares under a flight are
+/// prewarmed (`None`: as the switch says).
+#[cfg(test)]
+pub(crate) fn force_prewarm(on: Option<bool>) {
+    PREWARM.set(on);
+}
+
 /// Why a preparation waits for the flights before its tail.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Why {
@@ -137,6 +176,10 @@ pub(crate) enum Why {
     /// Shaders write a copy that is not sparse, which a flight in the air
     /// writes too: its one snapshot would be theirs both.
     Dense,
+    /// Slots of a directly indexed heap the title did not write since the
+    /// plan before, which the flight in the air may read
+    /// (`crate::descriptor::host::HostHeap::bindless_plan_with`).
+    Slots,
     /// Its lists go to the host queue.
     Tail,
 }
@@ -192,6 +235,11 @@ impl Air {
         from < to && self.up().any(|m| m.meets(from, to))
     }
 
+    /// [`Air::meets`] of `[from, to)` or of the same bytes at another view.
+    pub(crate) fn meets_here_or_shown(&self, from: usize, to: usize) -> bool {
+        self.meets(from, to) || shown(from, to, |a, b| self.meets(a, b))
+    }
+
     /// Whether a flight still to land has shaders writing the copy at
     /// `copy` (one that is not sparse).
     pub(crate) fn holds(&self, copy: usize) -> bool {
@@ -206,9 +254,31 @@ impl Air {
 
 /// Whether a refresh of `[from, to)` waits for the tail: a landing in the
 /// air writes there, or the host GPU uses it in place (its writes are known
-/// nowhere), or `strict`.
+/// nowhere), there or at another view of its pages; or `strict`.
 pub(crate) fn late(air: &Air, strict: bool, from: usize, to: usize) -> bool {
-    strict || air.meets(from, to) || crate::shadow::meets_in_place(from, to)
+    if strict {
+        return true;
+    }
+    let meets = |a: usize, b: usize| air.meets(a, b) || crate::shadow::meets_in_place(a, b);
+    if meets(from, to) {
+        return true;
+    }
+    if !shown(from, to, meets) {
+        return false;
+    }
+    count(if air.dry { Count::DryLateViews } else { Count::TailLateViews }, 1);
+    true
+}
+
+/// Whether `f` holds for the same bytes as `[from, to)` at another address
+/// their pages are shown at, where those views are guarded together
+/// ([`crate::watch::other_views`]).
+pub(crate) fn shown(from: usize, to: usize, f: impl Fn(usize, usize) -> bool) -> bool {
+    #[cfg(test)]
+    if mutated(Mutation::Views) {
+        return false;
+    }
+    crate::watch::other_views(from, to).into_iter().any(|(a, b)| f(a, b))
 }
 
 /// A refresh left for after the wait.
@@ -298,6 +368,7 @@ impl Deferring {
             Why::Copy => Some(Count::TailFlushCopy),
             Why::Run => Some(Count::TailFlushRun),
             Why::Dense => Some(Count::TailFlushDense),
+            Why::Slots => Some(Count::TailFlushSlots),
             Why::Tail => None,
         };
         if let Some(flush) = flush {
@@ -410,15 +481,17 @@ impl Dry {
             Why::Copy => Count::DryFlushCopy,
             Why::Run => Count::DryFlushRun,
             Why::Dense => Count::DryFlushDense,
+            Why::Slots => Count::DryFlushSlots,
             Why::Tail => return,
         };
         count(what, 1);
     }
 
     /// Shaders of the submission write `[address, address + len)`: whether a
-    /// flight in the air writes there too (step 3 of the plan waits there).
+    /// flight in the air writes there too, or at another view of the same
+    /// pages (step 3 of the plan waits there).
     pub(crate) fn declared(&self, address: usize, len: usize) {
-        if self.under() && self.air.meets(address, address.saturating_add(len)) {
+        if self.under() && self.air.meets_here_or_shown(address, address.saturating_add(len)) {
             count(Count::DryDeclaredOver, 1);
         }
     }
@@ -490,6 +563,12 @@ pub(crate) enum Mutation {
     /// What shaders write unlisted (through directly indexed heaps) is not
     /// waited for.
     Unlisted,
+    /// A refresh of the same bytes at another view of their pages is done
+    /// at once (the rule looks at its own addresses only).
+    Views,
+    /// Slots the title did not write since the plan before are made under
+    /// the flight.
+    Slots,
 }
 
 #[cfg(test)]

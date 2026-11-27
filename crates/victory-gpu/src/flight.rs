@@ -91,7 +91,9 @@ impl After {
 
 /// What a flight's landing writes in title memory, for a submission
 /// prepared while it is in the air (`crate::tail`), and the copies that are
-/// not sparse its shaders write.
+/// not sparse its shaders write. By address: the same bytes at other views
+/// of their pages are asked about when a refresh is (`crate::tail::late`),
+/// with the views as they are then.
 #[derive(Default)]
 pub(crate) struct Marks {
     /// The flight's fence value.
@@ -144,9 +146,11 @@ impl Marks {
         self.dense.binary_search(&copy).is_ok()
     }
 
-    /// Whether the landing writes memory the host GPU uses in place.
+    /// Whether the landing writes memory the host GPU uses in place, there
+    /// or at another view of the same pages.
     pub(crate) fn lands_in_place(&self) -> bool {
-        self.writes.iter().any(|&(a, b)| crate::shadow::meets_in_place(a, b))
+        let in_place = crate::shadow::meets_in_place;
+        self.writes.iter().any(|&(a, b)| in_place(a, b) || crate::tail::shown(a, b, in_place))
     }
 
     fn note(&self, what: &After) {

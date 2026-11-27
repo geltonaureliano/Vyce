@@ -1852,10 +1852,10 @@ impl Host {
     ///
     /// Such a submission is finished (its shaders' writes put back, its
     /// read-backs and bottom-of-pipe writes done) once the host GPU has run
-    /// it (`crate::flight`), at the latest before the next submission's own
-    /// preparation. Meanwhile the next submission's buffer copies are
-    /// brought up to date, so the processor and the card work at the same
-    /// time for that long.
+    /// it (`crate::flight`), at the latest before the next submission's
+    /// lists go to the host queue (`crate::tail`; with `VYCE_TAIL_DRAIN=0`
+    /// before its preparation). Meanwhile the next submission is prepared,
+    /// so the processor and the card work at the same time for that long.
     pub(crate) fn execute_title(&self, runs: &[std::sync::Arc<HostList>]) {
         let lists: Vec<&HostList> = runs.iter().map(|l| &**l).collect();
         self.execute_inner(&lists, Some(runs));
@@ -1865,8 +1865,9 @@ impl Host {
     /// submission before still runs: the same refreshes as the lists'
     /// steps make, early. The ranges that submission's shaders write are
     /// left alone (`Shadow::update` goes around them), and the steps in
-    /// their order do it all again (after the wait for it, or those its
-    /// landing writes after it, `crate::tail`), finding little left.
+    /// their order do it all again after the wait for it, finding little
+    /// left. A submission prepared under the flight (`crate::tail`) does
+    /// without, unless `VYCE_TAIL_PREWARM=1`.
     fn prewarm(&self, runs: &[&HostList]) {
         let started = std::time::Instant::now();
         let mut batch = Batch::default();
@@ -2011,9 +2012,9 @@ impl Host {
         let draining = std::time::Instant::now();
         // The GPU ran in parallel with the title's CPU command-list
         // recording, and runs on while this submission's buffer copies are
-        // refreshed (as before also under the tail drain: what it brings up
-        // to date between the steps' ranges, they leave as it was).
-        if keep.is_some() && self.line.busy() {
+        // refreshed. Under the tail drain the preparation does that itself
+        // (`VYCE_TAIL_PREWARM=1`: the prewarm too, as before).
+        if keep.is_some() && self.line.busy() && (under.is_none() || crate::tail::prewarm()) {
             self.prewarm(runs);
         }
         if under.is_none() {
@@ -4377,17 +4378,31 @@ impl<'a> Prep<'a> {
     /// draws use it. What they read is refreshed (unchanged pages cost only
     /// the write-watch's answer); their unordered access ranges are kept
     /// for copy-back only when a shader that may write memory uses the heap.
-    /// Under a flight, the slots are made now (the title rewrites only
-    /// slots nothing in flight reads, as on the console), what a landing in
-    /// the air writes is refreshed after the wait, and the bounces are
-    /// copied after it (their slices are the slots', which the flight
-    /// reads).
+    /// Under a flight, the slots the title wrote since the plan before are
+    /// made now (the title rewrites only slots nothing in flight reads, as
+    /// on the console); the plan waits for the flight first where it makes
+    /// others, which the flight may read (a flush point,
+    /// [`crate::descriptor::host::HostHeap::bindless_plan_with`]). What a
+    /// landing in the air writes is refreshed after the wait, and the
+    /// bounces are copied after it (their slices are the slots', which the
+    /// flight reads).
     fn prepare_bindless(&mut self) {
         self.batch.flush();
         for (heap, writes) in std::mem::take(&mut self.batch.bindless) {
-            let started = std::time::Instant::now();
-            let plan = heap.bindless_plan();
-            BINDLESS_US[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            #[cfg(test)]
+            let wait = !crate::tail::mutated(crate::tail::Mutation::Slots);
+            #[cfg(not(test))]
+            let wait = true;
+            let waited = |prep: &Self| prep.batch.deferring.as_ref().map_or(std::time::Duration::ZERO, |d| d.waited);
+            let (started, before) = (std::time::Instant::now(), waited(self));
+            let plan = heap.bindless_plan_with(&mut || {
+                if wait {
+                    self.flush_point(crate::tail::Why::Slots);
+                }
+            });
+            // The plan's time, without a wait for the flights in it.
+            let took = started.elapsed().saturating_sub(waited(self) - before);
+            BINDLESS_US[0].fetch_add(took.as_micros() as u64, Ordering::Relaxed);
             let Some(plan) = plan else {
                 continue;
             };

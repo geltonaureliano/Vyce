@@ -166,15 +166,20 @@ pub(crate) enum Count {
     TailOverlap,
     /// ... the flush points they waited at, by why: a title copy, work that
     /// may write title memory, shaders writing a copy that is not sparse
-    /// which a flight writes too ...
+    /// which a flight writes too, slots of a directly indexed heap the title
+    /// did not write since the plan before ...
     TailFlushCopy,
     TailFlushRun,
     TailFlushDense,
+    TailFlushSlots,
     /// ... their preparation after their first wait ...
     TailAfterFlush,
-    /// ... refreshes left for after the wait, and their bytes ...
+    /// ... refreshes left for after the wait, their bytes, and of them those
+    /// left for another view of the same pages (a landing writes there, or
+    /// the host GPU uses it in place) ...
     TailLate,
     TailLateBytes,
+    TailLateViews,
     /// ... and other steps left for after it, with their time.
     TailQueued,
     TailQueuedTime,
@@ -190,8 +195,10 @@ pub(crate) enum Count {
     DryFlushCopy,
     DryFlushRun,
     DryFlushDense,
+    DryFlushSlots,
     DryLate,
     DryLateBytes,
+    DryLateViews,
     DryQueued,
     DryQueuedTime,
     /// ... the preparation before the first flush point, without what would
@@ -317,9 +324,11 @@ const MORE: &[(&str, Count, f64)] = &[
     ("b_flush_copy", Count::TailFlushCopy, 1.0),
     ("b_flush_run", Count::TailFlushRun, 1.0),
     ("b_flush_dense", Count::TailFlushDense, 1.0),
+    ("b_flush_slots", Count::TailFlushSlots, 1.0),
     ("b_after_flush_ms", Count::TailAfterFlush, 1e3),
     ("b_late_parts", Count::TailLate, 1.0),
     ("b_late_mb", Count::TailLateBytes, 1e6),
+    ("b_late_views", Count::TailLateViews, 1.0),
     ("b_queued", Count::TailQueued, 1.0),
     ("b_queued_ms", Count::TailQueuedTime, 1e3),
     ("b_old_list", Count::TailOldList, 1.0),
@@ -330,8 +339,10 @@ const MORE: &[(&str, Count, f64)] = &[
     ("b_dry_flush_copy", Count::DryFlushCopy, 1.0),
     ("b_dry_flush_run", Count::DryFlushRun, 1.0),
     ("b_dry_flush_dense", Count::DryFlushDense, 1.0),
+    ("b_dry_flush_slots", Count::DryFlushSlots, 1.0),
     ("b_dry_late_parts", Count::DryLate, 1.0),
     ("b_dry_late_mb", Count::DryLateBytes, 1e6),
+    ("b_dry_late_views", Count::DryLateViews, 1.0),
     ("b_dry_queued", Count::DryQueued, 1.0),
     ("b_dry_queued_ms", Count::DryQueuedTime, 1e3),
     ("b_dry_overlap_ms", Count::DryOverlap, 1e3),

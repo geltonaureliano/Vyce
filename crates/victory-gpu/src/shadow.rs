@@ -74,6 +74,74 @@ struct Direct {
 struct Before {
     snapshot: Option<(usize, Vec<u8>)>,
     unchanged: UnchangedPages,
+    /// The parts of the snapshot (offsets in the copy, sorted, joined) taken
+    /// for ranges the submission declared; the rest was taken as filler
+    /// between them when it grew ([`Shadow::keep_dense`]).
+    declared: Vec<(usize, usize)>,
+}
+
+/// Whether a declaration takes its own bytes into its copy's snapshot where
+/// the snapshot already reaches but no range declared before took them
+/// (`VYCE_RETAKE_GAPS=0`: they keep what the snapshot took as filler when it
+/// grew over the gap, as before). A refresh between the two declarations
+/// changes the copy there and not the snapshot, and the copy-back then took
+/// what the refresh brought for the GPU's writes, and missed the GPU's
+/// writes of a byte the filler held: a lost write (and a title write made
+/// while the GPU ran, put back over by the older refreshed byte). The old
+/// drain's prewarm hid it where it ran: it brought the whole span up to
+/// date before the first declaration.
+fn retake_gaps() -> bool {
+    #[cfg(test)]
+    if let Some(on) = RETAKE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VYCE_RETAKE_GAPS").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static RETAKE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests': this thread's declarations retake the gaps (`None`: as the switch
+/// says).
+#[cfg(test)]
+pub(crate) fn force_retake(on: Option<bool>) {
+    RETAKE.set(on);
+}
+
+/// The parts of `[from, to)` outside `ranges` (sorted, joined).
+fn outside(ranges: &[(usize, usize)], from: usize, to: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut at = from;
+    let first = ranges.partition_point(|r| r.1 <= from);
+    for &(a, b) in &ranges[first..] {
+        if a >= to {
+            break;
+        }
+        if a > at {
+            out.push((at, a));
+        }
+        at = at.max(b);
+    }
+    if at < to {
+        out.push((at, to));
+    }
+    out
+}
+
+/// Adds `[from, to)` to `ranges` (sorted, joined), joining what it meets or
+/// touches.
+fn add_range(ranges: &mut Vec<(usize, usize)>, mut from: usize, mut to: usize) {
+    let first = ranges.partition_point(|r| r.1 < from);
+    let mut last = first;
+    while last < ranges.len() && ranges[last].0 <= to {
+        from = from.min(ranges[last].0);
+        to = to.max(ranges[last].1);
+        last += 1;
+    }
+    ranges.splice(first..last, [(from, to)]);
 }
 
 /// Pages already compared in full against this submission's snapshot.
@@ -604,41 +672,58 @@ impl Shadow {
         let host =
             |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let before = &mut before.snapshot;
-        let (start, end) = match &*before {
-            Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
+        let Before { snapshot, declared, .. } = &mut *before;
+        // What the snapshot held before this range.
+        let held = snapshot.as_ref().map(|(at, bytes)| (*at, at + bytes.len()));
+        let (start, end) = match held {
+            Some((at, stop)) => (at.min(from), stop.max(to)),
             None => (from, to),
         };
-        if let Some((at, bytes)) = before.as_mut()
-            && *at == start
-        {
-            let old_end = start + bytes.len();
-            if end > old_end {
-                let needed = end - start;
-                if needed > bytes.capacity() {
-                    // Reserve geometrically for successive extensions, but
-                    // do not reserve beyond this entire shadow.
-                    let capacity = bytes.capacity().saturating_mul(2).max(needed).min(self.len as usize);
-                    bytes.reserve_exact(capacity - bytes.len());
+        match snapshot.as_mut() {
+            Some((at, bytes)) if *at == start => {
+                let old_end = start + bytes.len();
+                if end > old_end {
+                    let needed = end - start;
+                    if needed > bytes.capacity() {
+                        // Reserve geometrically for successive extensions,
+                        // but do not reserve beyond this entire shadow.
+                        let capacity = bytes.capacity().saturating_mul(2).max(needed).min(self.len as usize);
+                        bytes.reserve_exact(capacity - bytes.len());
+                    }
+                    // Keep the old baseline where ranges declared before took
+                    // it (no refresh touched those since). The new suffix is
+                    // taken from the copy.
+                    bytes.extend_from_slice(host(old_end, end));
                 }
-                // Keep the old baseline even if the existing bytes have
-                // changed. Only the new suffix belongs to this recording.
-                bytes.extend_from_slice(host(old_end, end));
             }
-            return;
-        }
-        // Parts newly covered from the copy, the rest as it was taken.
-        let mut grown = pooled(end - start);
-        match before.take() {
-            Some((at, bytes)) => {
-                grown.extend_from_slice(host(start, at));
-                grown.extend_from_slice(&bytes);
-                grown.extend_from_slice(host(at + bytes.len(), end));
-                give_back(bytes);
+            _ => {
+                // Parts newly covered from the copy, the rest as it was taken.
+                let mut grown = pooled(end - start);
+                match snapshot.take() {
+                    Some((at, bytes)) => {
+                        grown.extend_from_slice(host(start, at));
+                        grown.extend_from_slice(&bytes);
+                        grown.extend_from_slice(host(at + bytes.len(), end));
+                        give_back(bytes);
+                    }
+                    None => grown.extend_from_slice(host(start, end)),
+                }
+                *snapshot = Some((start, grown));
             }
-            None => grown.extend_from_slice(host(start, end)),
         }
-        *before = Some((start, grown));
+        // Of what the snapshot held, the range's bytes no range declared
+        // before took (filler of a gap, which a refresh may have changed in
+        // the copy since): taken now.
+        if let Some((a, b)) = held
+            && from.max(a) < to.min(b)
+            && retake_gaps()
+            && let Some((at, bytes)) = snapshot.as_mut()
+        {
+            for (x, y) in outside(declared, from.max(a), to.min(b)) {
+                bytes[x - *at..y - *at].copy_from_slice(host(x, y));
+            }
+        }
+        add_range(declared, from, to);
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -660,6 +745,7 @@ impl Shadow {
         let Before {
             snapshot,
             unchanged,
+            declared,
         } = &mut *before;
         let mut written = 0;
         let (from, to) = self.inside(address, len);
@@ -745,6 +831,7 @@ impl Shadow {
             && let Some((_, bytes)) = snapshot.take()
         {
             unchanged.clear();
+            declared.clear();
             give_back(bytes);
         }
         written
@@ -3238,6 +3325,68 @@ mod tests {
         let before = shadow.before.lock().unwrap();
         assert!(before.snapshot.is_none());
         assert!(before.unchanged.pages.is_empty());
+        assert!(before.declared.is_empty());
+    }
+
+    /// A declaration between two earlier ones, whose bytes a refresh changed
+    /// after the snapshot grew over them, takes them into the snapshot anew:
+    /// the GPU's write of the byte the snapshot had taken as filler goes back
+    /// to title memory. With the filler kept (`VYCE_RETAKE_GAPS=0`, as
+    /// before) the write is lost.
+    #[test]
+    fn a_declaration_retakes_the_gap_a_refresh_changed() {
+        let Some(host) = crate::host::Host::new_warp() else { return };
+        let lost = |retake: bool| {
+            force_retake(Some(retake));
+            let mut title = vec![7u8; 2 * PAGE];
+            let base = title.as_mut_ptr() as usize;
+            let address = base.next_multiple_of(PAGE);
+            let offset = address - base;
+            let (buffer, data) = host.shared_buffer(PAGE as u64).expect("host shadow buffer");
+            // SAFETY: the test owns the live buffer and its PAGE-byte mapping.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let shadow = Shadow::new(buffer, data, gpu, address as u64, PAGE as u64, None);
+            shadow.watched.store(NOT_WATCHED, Ordering::Relaxed);
+            // SAFETY: as above.
+            unsafe { data.write_bytes(7, PAGE) };
+            // Two ranges: the snapshot grows over the gap between them.
+            shadow.writing(address, 16, 1);
+            shadow.writing(address + 1000, 16, 1);
+            // The title writes the gap, a refresh brings it into the copy,
+            // and a third range there is declared.
+            title[offset + 500] = 9;
+            shadow.update(address + 400, 200);
+            shadow.writing(address + 400, 200, 1);
+            // The GPU puts the byte back as it was before the title wrote.
+            // SAFETY: as above.
+            unsafe { data.add(500).write(7) };
+            for at in [0, 1000] {
+                shadow.copy_back(address + at, 16, 1);
+            }
+            shadow.copy_back(address + 400, 200, 1);
+            force_retake(None);
+            assert!(shadow.before.lock().unwrap().declared.is_empty());
+            title[offset + 500] == 9
+        };
+        assert!(!lost(true), "retaken: the GPU's write lands");
+        assert!(lost(false), "kept as filler: the GPU's write is lost");
+    }
+
+    #[test]
+    fn ranges_outside_and_added() {
+        let ranges = vec![(10, 20), (30, 40)];
+        assert_eq!(outside(&ranges, 0, 50), [(0, 10), (20, 30), (40, 50)]);
+        assert_eq!(outside(&ranges, 15, 35), [(20, 30)]);
+        assert!(outside(&ranges, 12, 18).is_empty());
+        assert_eq!(outside(&[], 5, 6), [(5, 6)]);
+        let mut joined = ranges.clone();
+        add_range(&mut joined, 20, 30);
+        assert_eq!(joined, [(10, 40)]);
+        let mut apart = ranges.clone();
+        add_range(&mut apart, 50, 60);
+        add_range(&mut apart, 0, 5);
+        add_range(&mut apart, 15, 32);
+        assert_eq!(apart, [(0, 5), (10, 40), (50, 60)]);
     }
 
     #[test]

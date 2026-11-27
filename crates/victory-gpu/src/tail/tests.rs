@@ -1,8 +1,15 @@
 //! The tail drain against the old drain: the same submissions, the same
 //! writes of the title's CPU and the same work of the host GPU leave the
 //! same title memory and reads either way, and the same copies (all their
-//! bytes where no gate opens after a while, see [`timed`]); brought up to
-//! date at the end, the copies are title memory.
+//! bytes where no gate opens after a while and the prewarm is kept, see
+//! [`timed`]); brought up to date at the end, the copies are title memory.
+//!
+//! The memory is private memory the kernel watches writes to, with a sparse
+//! copy of all of it and a copy that is not sparse of a part, and a section
+//! of physical pages shown at two views, each with a copy that is not
+//! sparse (as xmem's sections are): what a landing writes through one view
+//! changes the other, and a refresh through that one waits for the landing
+//! too (`crate::watch::other_views`).
 //!
 //! The host GPU's part of each title submission is done by the test, on a
 //! thread of its own, when the gate in front of the submission opens: what
@@ -33,6 +40,35 @@ const SIZE: usize = TILES * PAGE;
 const DENSE: (usize, usize) = (2 * PAGE + 4096, 5 * PAGE);
 /// Memory taken for used in place by the host GPU.
 const IN_PLACE: (usize, usize) = (6 * PAGE, 7 * PAGE);
+/// The memory past `SIZE`: a section of two pages shown twice, at the
+/// first view and then at the second (the same bytes).
+const VIEW: usize = 2 * PAGE;
+const VIEW_A: (usize, usize) = (SIZE, SIZE + VIEW);
+const VIEW_B: (usize, usize) = (SIZE + VIEW, SIZE + 2 * VIEW);
+/// Of the first view, memory taken for used in place: at the second view the
+/// same bytes are not, but refreshes of them wait as for it.
+const VIEW_IN_PLACE: (usize, usize) = (SIZE + PAGE, SIZE + VIEW);
+
+/// Where the bytes at `at` are shown at the first view (the private memory
+/// and the first view: there).
+fn same(at: usize) -> usize {
+    if at >= VIEW_B.0 { at - VIEW } else { at }
+}
+
+/// The part of the memory `at` is in.
+fn part_of(at: usize) -> (usize, usize) {
+    match at {
+        a if a < SIZE => (0, SIZE),
+        a if a < VIEW_B.0 => VIEW_A,
+        _ => VIEW_B,
+    }
+}
+
+/// Whether `[at, at + len)` is memory used in place, at either view.
+fn in_place(at: usize, len: usize) -> bool {
+    let (from, to) = (same(at), same(at) + len);
+    [IN_PLACE, VIEW_IN_PLACE].iter().any(|&(a, b)| from < b && a < to)
+}
 
 /// Title memory the kernel watches writes to.
 struct Region(usize);
@@ -61,11 +97,6 @@ impl Region {
         // touch.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), to, bytes.len()) };
     }
-
-    fn bytes(&self, offset: usize, len: usize) -> Vec<u8> {
-        // SAFETY: as above.
-        unsafe { std::slice::from_raw_parts((self.0 + offset) as *const u8, len) }.to_vec()
-    }
 }
 
 impl Drop for Region {
@@ -73,6 +104,99 @@ impl Drop for Region {
         use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
         // SAFETY: our region.
         unsafe { VirtualFree(self.0 as *mut _, 0, MEM_RELEASE) };
+    }
+}
+
+/// A section of physical pages of the test's, two blocks, shown at two
+/// views as the runtime tells of them (`crate::watch::title_memory_view`).
+struct Section {
+    handle: usize,
+    a: usize,
+    b: usize,
+}
+
+impl Section {
+    fn new() -> Section {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE,
+        };
+        // SAFETY: a pagefile section of the test's, mapped read-write twice.
+        unsafe {
+            let handle = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                VIEW as u32,
+                std::ptr::null(),
+            );
+            assert!(!handle.is_null());
+            let a = MapViewOfFile(handle, FILE_MAP_WRITE, 0, 0, VIEW).Value as usize;
+            let b = MapViewOfFile(handle, FILE_MAP_WRITE, 0, 0, VIEW).Value as usize;
+            assert!(a != 0 && b != 0);
+            for at in [a, b] {
+                crate::watch::title_memory_view(at, VIEW, handle as usize, 0);
+                // As the runtime tells of a mapping (another test's memory
+                // may have been there, guarded).
+                crate::watch::title_memory_remapped(at, VIEW);
+            }
+            Section { handle: handle as usize, a, b }
+        }
+    }
+}
+
+impl Drop for Section {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        for at in [self.a, self.b] {
+            crate::watch::title_memory_remapped(at, VIEW);
+            crate::watch::title_memory_view_gone(at, VIEW);
+            // SAFETY: our view, which nothing uses any more.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut _ }) };
+        }
+        // SAFETY: our section.
+        unsafe { CloseHandle(self.handle as _) };
+    }
+}
+
+/// Where the memory's offsets are: the private memory's, then the two
+/// views'.
+#[derive(Clone, Copy)]
+struct Space {
+    base: usize,
+    a: usize,
+    b: usize,
+}
+
+impl Space {
+    fn at(self, offset: usize) -> usize {
+        match offset {
+            o if o < SIZE => self.base + o,
+            o if o < VIEW_B.0 => self.a + (o - VIEW_A.0),
+            o => self.b + (o - VIEW_B.0),
+        }
+    }
+
+    /// Writes `bytes` at `offset` as the title's CPU does (a guarded view
+    /// block opens on the fault).
+    fn write(self, offset: usize, bytes: &[u8]) {
+        assert!(offset + bytes.len() <= part_of(offset).1, "{offset:#x}+{:#x}", bytes.len());
+        // SAFETY: inside one part of the test's memory, which only the test
+        // and what it runs touch.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.at(offset) as *mut u8, bytes.len()) };
+    }
+
+    fn bytes(self, offset: usize, len: usize) -> Vec<u8> {
+        // SAFETY: as above.
+        unsafe { std::slice::from_raw_parts(self.at(offset) as *const u8, len) }.to_vec()
+    }
+
+    /// The title memory: the private memory, then the section's bytes.
+    fn title(self) -> Vec<u8> {
+        let mut all = self.bytes(0, SIZE);
+        all.extend(self.bytes(VIEW_A.0, VIEW));
+        all
     }
 }
 
@@ -100,10 +224,33 @@ impl Drop for Gate {
 enum Which {
     Sparse,
     Dense,
+    /// The copies of the section at its first view and at its second.
+    ViewA,
+    ViewB,
+}
+
+/// The copies of a run.
+#[derive(Clone)]
+struct Copies {
+    sparse: Arc<Shadow>,
+    dense: Arc<Shadow>,
+    view_a: Arc<Shadow>,
+    view_b: Arc<Shadow>,
+}
+
+impl Copies {
+    fn of(&self, which: Which) -> &Arc<Shadow> {
+        match which {
+            Which::Sparse => &self.sparse,
+            Which::Dense => &self.dense,
+            Which::ViewA => &self.view_a,
+            Which::ViewB => &self.view_b,
+        }
+    }
 }
 
 /// A step of a list, with what the host GPU does for it. Ranges are offsets
-/// in the memory and lengths.
+/// in the memory and lengths, each in one part of it.
 #[derive(Clone, Debug)]
 enum Op {
     /// The copy is brought up to date there.
@@ -160,10 +307,14 @@ struct Case {
 #[derive(PartialEq, Eq)]
 struct Outcome {
     reads: Vec<Vec<Vec<u8>>>,
+    /// The private memory, then the section's bytes.
     title: Vec<u8>,
-    /// The copies as left, unless the case is [`timed`] (then empty).
+    /// The copies as left, unless the run did not keep them or the case is
+    /// [`timed`] (then empty).
     sparse: Vec<u8>,
     dense: Vec<u8>,
+    view_a: Vec<u8>,
+    view_b: Vec<u8>,
     /// Where a copy brought up to date at the end is not title memory.
     stale: Option<String>,
 }
@@ -173,7 +324,9 @@ struct Outcome {
 /// then a matter of timing, with either drain, and so is what the prewarm
 /// (which runs only under a flight) brings up to date between the pieces
 /// it joins: bytes of the copies no step asks for. The copies of such a
-/// case are compared brought up to date only.
+/// case are compared brought up to date only. So are those of a run of the
+/// tail drain without the prewarm (its default), which leaves such bytes
+/// as they were.
 fn timed(case: &Case) -> bool {
     case.subs.iter().rev().skip(1).any(|s| s.delay.is_some())
 }
@@ -222,7 +375,26 @@ impl Rng {
     }
 
     fn copy(&mut self) -> (Which, (usize, usize)) {
-        if self.chance(25) { (Which::Dense, DENSE) } else { (Which::Sparse, (0, SIZE)) }
+        match self.below(100) {
+            0..=44 => (Which::Sparse, (0, SIZE)),
+            45..=64 => (Which::Dense, DENSE),
+            65..=82 => (Which::ViewA, VIEW_A),
+            _ => (Which::ViewB, VIEW_B),
+        }
+    }
+
+    /// A part of the memory: the private memory, or one of the views.
+    fn part(&mut self) -> (usize, usize) {
+        match self.below(10) {
+            0..=5 => (0, SIZE),
+            6 | 7 => VIEW_A,
+            _ => VIEW_B,
+        }
+    }
+
+    /// Memory used in place.
+    fn place(&mut self) -> (usize, usize) {
+        if self.chance(50) { IN_PLACE } else { VIEW_IN_PLACE }
     }
 
     /// Steps of a list: a range shaders read or write is brought up to date
@@ -251,38 +423,50 @@ impl Rng {
                 let (at, len) = self.range(within);
                 let len = len.min(4096);
                 ops.push(Op::Refresh(copy, at, len));
-                if at + len <= IN_PLACE.0 || IN_PLACE.1 <= at {
+                if !in_place(at, len) {
                     ops.push(Op::Read(copy, at, len));
                 }
             }
             11 => {
-                let (at, len) = self.range(IN_PLACE);
+                let place = self.place();
+                let (at, len) = self.range(place);
                 ops.push(Op::PlaceWrite(at, len.min(8192), self.next() as u8));
             }
             12 => {
-                let (at, len) = self.range(IN_PLACE);
+                let place = self.place();
+                let (at, len) = self.range(place);
                 ops.push(Op::PlaceRead(at, len.min(4096)));
             }
             13 => {
-                let (at, len) = self.range((0, SIZE));
+                let part = self.part();
+                let (at, len) = self.range(part);
                 ops.push(Op::Fill(at, len.min(8192)));
             }
             14 => {
-                let (at, len) = self.range((0, SIZE));
+                let part = self.part();
+                let (at, len) = self.range(part);
                 ops.push(Op::Host(at, len.min(4096)));
             }
             15 | 16 => {
-                // Two ranges apart.
+                // Two ranges apart (in the same bytes too).
                 let len = 1 + self.below(8192);
-                let (from, to) = (self.below(SIZE - len), self.below(SIZE - len));
-                if from + len <= to || to + len <= from {
+                let (into, out) = (self.part(), self.part());
+                let to = into.0 + self.below(into.1 - into.0 - len);
+                let from = out.0 + self.below(out.1 - out.0 - len);
+                let (t, f) = (same(to), same(from));
+                if t + len <= f || f + len <= t {
                     let copy = self.chance(50);
                     ops.push(if copy { Op::Copy(to, from, len) } else { Op::Run(to, from, len) });
                 }
             }
-            17 => ops.push(Op::Bottom(self.below(SIZE / 8) * 8, self.next() << 7 | 5)),
+            17 => {
+                let part = self.part();
+                let at = part.0 + self.below((part.1 - part.0) / 8) * 8;
+                ops.push(Op::Bottom(at, self.next() << 7 | 5));
+            }
             _ => {
-                let (at, len) = self.range((0, SIZE));
+                let part = self.part();
+                let (at, len) = self.range(part);
                 ops.push(Op::Readback(at, len.min(4096), self.next() as u8));
             }
         }
@@ -291,14 +475,16 @@ impl Rng {
     fn case(&mut self) -> Case {
         let mut subs: Vec<Sub> = Vec::new();
         for _ in 0..2 + self.below(5) {
-            // The title's CPU writes nothing the flight in the air uses: on the
-            // console that is a race with its GPU.
+            // The title's CPU writes nothing the flight in the air uses (at
+            // either view): on the console that is a race with its GPU.
             let busy = subs.last().map(touched).unwrap_or_default();
             let mut title = Vec::new();
             for _ in 0..self.below(4) {
-                let (at, len) = self.range((0, SIZE));
+                let part = self.part();
+                let (at, len) = self.range(part);
                 let len = len.min(2048);
-                if busy.iter().any(|&(a, b)| a < at + len && at < b) {
+                let (a, b) = (same(at), same(at) + len);
+                if busy.iter().any(|&(x, y)| x < b && a < y) {
                     continue;
                 }
                 let byte = self.next() as u8;
@@ -325,7 +511,8 @@ impl Rng {
     }
 }
 
-/// What a submission's host GPU work and landing touch in title memory.
+/// What a submission's host GPU work and landing touch in title memory, as
+/// the bytes at the first view.
 fn touched(sub: &Sub) -> Vec<(usize, usize)> {
     let mut all = Vec::new();
     for op in sub.lists.iter().flatten() {
@@ -334,8 +521,8 @@ fn touched(sub: &Sub) -> Vec<(usize, usize)> {
             | Op::Write(_, at, len, ..)
             | Op::PlaceRead(at, len)
             | Op::PlaceWrite(at, len, _)
-            | Op::Readback(at, len, _) => all.push((at, at + len)),
-            Op::Bottom(at, _) => all.push((at, at + 8)),
+            | Op::Readback(at, len, _) => all.push((same(at), same(at) + len)),
+            Op::Bottom(at, _) => all.push((same(at), same(at) + 8)),
             _ => {}
         }
     }
@@ -347,14 +534,15 @@ fn touched(sub: &Sub) -> Vec<(usize, usize)> {
 struct Bench {
     host: &'static Host,
     region: Region,
+    section: Section,
     sparse: Arc<Shadow>,
     lists: Vec<Arc<HostList>>,
 }
 
 impl Drop for Bench {
     fn drop(&mut self) {
-        let place = (self.region.at(IN_PLACE.0), self.region.at(IN_PLACE.1));
-        crate::shadow::IN_PLACE_FOR_TEST.lock().unwrap().retain(|&r| r != place);
+        let places = self.in_place();
+        crate::shadow::IN_PLACE_FOR_TEST.lock().unwrap().retain(|r| !places.contains(r));
     }
 }
 
@@ -365,8 +553,6 @@ impl Bench {
             eprintln!("no sparse D3D12 buffer; skipped");
             return None;
         };
-        let place = (region.at(IN_PLACE.0), region.at(IN_PLACE.1));
-        crate::shadow::IN_PLACE_FOR_TEST.lock().unwrap().push(place);
         let lists = (0..12)
             .map(|_| {
                 let list = host.new_list().unwrap();
@@ -374,7 +560,19 @@ impl Bench {
                 Arc::new(list)
             })
             .collect();
-        Some(Bench { host, region, sparse, lists })
+        let bench = Bench { host, region, section: Section::new(), sparse, lists };
+        crate::shadow::IN_PLACE_FOR_TEST.lock().unwrap().extend(bench.in_place());
+        Some(bench)
+    }
+
+    fn space(&self) -> Space {
+        Space { base: self.region.0, a: self.section.a, b: self.section.b }
+    }
+
+    /// The memory taken for used in place, by address.
+    fn in_place(&self) -> [(usize, usize); 2] {
+        let space = self.space();
+        [IN_PLACE, VIEW_IN_PLACE].map(|(a, b)| (space.at(a), space.at(a) + (b - a)))
     }
 
     /// Whether nothing is pending in the copies after a run.
@@ -382,26 +580,33 @@ impl Bench {
         self.sparse.pending_for_test().is_empty() && self.sparse.kept_for_test() == 0
     }
 
-    /// Runs `case` in `mode` with `rule` off.
-    fn run(&self, case: &Case, mode: Mode, rule: Option<Mutation>) -> Outcome {
+    /// Runs `case` in `mode` with `rule` off; `raw`: the copies as left are
+    /// compared too, where the case is not [`timed`].
+    fn run(&self, case: &Case, mode: Mode, rule: Option<Mutation>, raw: bool) -> Outcome {
         force(Some(mode));
         mutate(rule);
-        let outcome = self.run_here(case);
+        let outcome = self.run_here(case, raw);
         force(None);
         mutate(None);
         outcome
     }
 
-    fn run_here(&self, case: &Case) -> Outcome {
-        let (host, region) = (self.host, &self.region);
+    fn run_here(&self, case: &Case, raw: bool) -> Outcome {
+        let host = self.host;
+        let space = self.space();
         let line = host.line();
         let initial: Vec<u8> =
-            (0..SIZE).map(|i| case.initial.wrapping_add((i / 61) as u8)).collect();
-        region.write(0, &initial);
+            (0..SIZE + VIEW).map(|i| case.initial.wrapping_add((i / 61) as u8)).collect();
+        space.write(0, &initial[..SIZE]);
+        space.write(VIEW_A.0, &initial[SIZE..]);
         self.sparse.reset_for_test();
-        let (dense, _) = Shadow::for_test(host, region.at(DENSE.0), (DENSE.1 - DENSE.0) as u64);
-        let copy =
-            |which: Which| if which == Which::Sparse { self.sparse.clone() } else { dense.clone() };
+        let fresh = |(from, to): (usize, usize)| Shadow::for_test(host, space.at(from), (to - from) as u64).0;
+        let copies = Copies {
+            sparse: self.sparse.clone(),
+            dense: fresh(DENSE),
+            view_a: fresh(VIEW_A),
+            view_b: fresh(VIEW_B),
+        };
         // What the shaders' work needs of each submission: where fills and
         // the runtime's work put title memory, and where read-backs come
         // from (kept until the end).
@@ -414,17 +619,15 @@ impl Bench {
         type Job = (usize, Gate, Vec<(Op, usize)>, bool, Option<u64>, u64);
         let (jobs, take) = mpsc::channel::<Job>();
         let (done, finished) = mpsc::channel::<usize>();
-        let base = region.0;
         let (mut ops, mut used): (Vec<(Op, usize)>, Vec<Arc<HostList>>) = (Vec::new(), Vec::new());
         let gpu = {
-            let (go, reads, line) = (go.clone(), reads.clone(), line.clone());
-            let (sparse, dense) = (self.sparse.clone(), dense.clone());
+            let (go, reads, line, copies) = (go.clone(), reads.clone(), line.clone(), copies.clone());
             std::thread::spawn(move || {
                 for (k, gate, ops, early, delay, waits) in take {
                     let run = |ops: &[(Op, usize)]| {
                         let mut seen = Vec::new();
                         for (op, at) in ops {
-                            shaders(op, *at, base, &sparse, &dense, &mut seen);
+                            shaders(op, *at, space, &copies, &mut seen);
                         }
                         reads.lock().unwrap()[k].extend(seen);
                     };
@@ -445,7 +648,7 @@ impl Bench {
         };
         for (k, sub) in case.subs.iter().enumerate() {
             for (at, bytes) in &sub.title {
-                region.write(*at, bytes);
+                space.write(*at, bytes);
             }
             let gate = Gate(host.gate());
             if !sub.again {
@@ -455,7 +658,7 @@ impl Bench {
                     let list = &self.lists[2 * k + i];
                     list.reset();
                     for op in steps {
-                        let at = record(list, op, base, &copy, &mut kept);
+                        let at = record(list, op, space, &copies, &mut kept);
                         ops.push((op.clone(), at));
                     }
                     list.count_work();
@@ -473,72 +676,77 @@ impl Bench {
         drop(jobs);
         gpu.join().unwrap();
         line.drain(Count::WaitHeld);
-        let copies = || {
-            let sparse: Vec<u8> = (0..SIZE)
-                .step_by(PAGE)
+        let held = |shadow: &Shadow, (from, to): (usize, usize), step: usize| -> Vec<u8> {
+            (from..to)
+                .step_by(step)
                 .flat_map(|at| {
-                    let tile = self.sparse.view_for_test(base + at);
-                    // SAFETY: a tile of the copy, whole; nothing runs.
-                    unsafe { std::slice::from_raw_parts(tile, PAGE) }.to_vec()
+                    let n = step.min(to - at);
+                    let bytes = shadow.view_for_test(space.at(at));
+                    // SAFETY: the copy's mapping (of a sparse one, a tile,
+                    // whole); nothing runs.
+                    unsafe { std::slice::from_raw_parts(bytes, n) }.to_vec()
                 })
-                .collect();
-            let held = dense.view_for_test(base + DENSE.0);
-            // SAFETY: the copy's mapping; nothing runs.
-            let held = unsafe { std::slice::from_raw_parts(held, DENSE.1 - DENSE.0) }.to_vec();
-            (sparse, held)
+                .collect()
         };
-        let (mut sparse, mut held) = copies();
-        let title = region.bytes(0, SIZE);
+        let all = |copies: &Copies| {
+            (
+                held(&copies.sparse, (0, SIZE), PAGE),
+                held(&copies.dense, DENSE, DENSE.1 - DENSE.0),
+                held(&copies.view_a, VIEW_A, VIEW),
+                held(&copies.view_b, VIEW_B, VIEW),
+            )
+        };
+        let (mut sparse, mut dense, mut view_a, mut view_b) = all(&copies);
+        let title = space.title();
         // Brought up to date, the copies are title memory: no part of them
         // is taken for up to date that is not.
-        self.sparse.update_lazily(base, SIZE, false);
-        dense.update_lazily(base + DENSE.0, DENSE.1 - DENSE.0, false);
-        let (now, now_dense) = copies();
+        copies.sparse.update_lazily(space.at(0), SIZE, false);
+        copies.dense.update_lazily(space.at(DENSE.0), DENSE.1 - DENSE.0, false);
+        copies.view_a.update_lazily(space.at(VIEW_A.0), VIEW, false);
+        copies.view_b.update_lazily(space.at(VIEW_B.0), VIEW, false);
+        let now = all(&copies);
         let first = |x: &[u8], y: &[u8]| x.iter().zip(y).position(|(x, y)| x != y);
-        let stale = match first(&now, &title) {
-            Some(at) => Some(format!(
-                "the sparse copy brought up to date at {at:#x}: {:#x}, title {:#x}",
-                now[at], title[at]
-            )),
-            None => first(&now_dense, &title[DENSE.0..DENSE.1]).map(|at| {
-                let (x, y) = (now_dense[at], title[DENSE.0 + at]);
-                let at = DENSE.0 + at;
-                format!("the dense copy brought up to date at {at:#x}: {x:#x}, title {y:#x}")
-            }),
-        };
-        if timed(case) {
-            (sparse, held) = (Vec::new(), Vec::new());
+        // Each copy against the title memory it holds: where it starts in
+        // the memory, and in `title` (the section's bytes once).
+        let held_now = [
+            ("sparse", &now.0, 0, 0),
+            ("dense", &now.1, DENSE.0, DENSE.0),
+            ("first view's", &now.2, VIEW_A.0, SIZE),
+            ("second view's", &now.3, VIEW_B.0, SIZE),
+        ];
+        let stale = held_now.iter().find_map(|&(name, copy, at, from)| {
+            first(copy, &title[from..from + copy.len()]).map(|i| {
+                let (x, y) = (copy[i], title[from + i]);
+                format!("the {name} copy brought up to date at {:#x}: {x:#x}, title {y:#x}", at + i)
+            })
+        });
+        if !raw || timed(case) {
+            (sparse, dense, view_a, view_b) = Default::default();
         }
         let reads = std::mem::take(&mut *reads.lock().unwrap());
         drop(kept);
-        Outcome { reads, title, sparse, dense: held, stale }
+        Outcome { reads, title, sparse, dense, view_a, view_b, stale }
     }
 }
 
 /// Records `op` into `list`: what the host GPU's work for it needs.
-fn record(
-    list: &HostList,
-    op: &Op,
-    base: usize,
-    copy: &impl Fn(Which) -> Arc<Shadow>,
-    kept: &mut Vec<Box<[u8]>>,
-) -> usize {
+fn record(list: &HostList, op: &Op, space: Space, copies: &Copies, kept: &mut Vec<Box<[u8]>>) -> usize {
     let mut keep = |len: usize| {
         kept.push(vec![0; len].into_boxed_slice());
         kept.last_mut().unwrap().as_mut_ptr() as usize
     };
     match *op {
-        Op::Refresh(which, at, len) => copy(which).refresh(list, (base + at) as u64, len as u64),
+        Op::Refresh(which, at, len) => copies.of(which).refresh(list, space.at(at) as u64, len as u64),
         Op::Write(which, at, len, ..) => {
-            copy(which).gpu_writes(list, (base + at) as u64, len as u64);
+            copies.of(which).gpu_writes(list, space.at(at) as u64, len as u64);
         }
         Op::Fill(at, len) => {
             let (_, to) = list.scratch(len as u64).expect("upload memory");
-            list.defer_fill(to, (base + at) as *const u8, len);
+            list.defer_fill(to, space.at(at) as *const u8, len);
             return to as usize;
         }
         Op::Host(at, len) => {
-            let (to, from) = (keep(len), base + at);
+            let (to, from) = (keep(len), space.at(at));
             // SAFETY: title memory and the test's buffer, which outlives
             // the submission.
             list.defer_host(move || unsafe {
@@ -547,17 +755,18 @@ fn record(
             return to;
         }
         Op::Copy(to, from, len) => {
-            list.defer_copy((base + to) as *mut u8, (base + from) as *const u8, len);
+            list.defer_copy(space.at(to) as *mut u8, space.at(from) as *const u8, len);
         }
         Op::Run(to, from, len) => {
-            let (to, from) = (base + to, base + from);
-            // SAFETY: title memory of the test's, apart.
+            let (to, from) = (space.at(to), space.at(from));
+            // SAFETY: title memory of the test's, apart (in its bytes too); a
+            // guarded view block opens on the fault.
             list.defer(move || unsafe { std::ptr::copy(from as *const u8, to as *mut u8, len) });
         }
-        Op::Bottom(at, value) => list.defer_write((base + at) as *mut u8, Written::Value(value), 8),
+        Op::Bottom(at, value) => list.defer_write(space.at(at) as *mut u8, Written::Value(value), 8),
         Op::Readback(at, len, _) => {
             let from = keep(len);
-            list.defer_readback((base + at) as *mut u8, from as *const u8, len, len, 1, len);
+            list.defer_readback(space.at(at) as *mut u8, from as *const u8, len, len, 1, len);
             return from;
         }
         Op::Read(..) | Op::PlaceWrite(..) | Op::PlaceRead(..) => {}
@@ -567,35 +776,30 @@ fn record(
 
 /// The host GPU's work for `op` (`at`: what [`record`] gave): what it
 /// reads goes into `seen`.
-fn shaders(
-    op: &Op,
-    at: usize,
-    base: usize,
-    sparse: &Arc<Shadow>,
-    dense: &Arc<Shadow>,
-    seen: &mut Vec<Vec<u8>>,
-) {
-    let copy = |which: Which| if which == Which::Sparse { sparse } else { dense };
+fn shaders(op: &Op, at: usize, space: Space, copies: &Copies, seen: &mut Vec<Vec<u8>>) {
     // SAFETY: the copies' mappings, title memory used in place and the
-    // test's buffers, each byte by one side at a time.
+    // test's buffers, each byte by one side at a time; a guarded view block
+    // of memory used in place opens on the fault.
     unsafe {
         match *op {
             Op::Write(which, start, _, (from, to), byte) => {
-                for (i, address) in (base + start + from..base + start + to).enumerate() {
-                    copy(which).view_for_test(address).write_volatile(byte ^ (i as u8));
+                let copy = copies.of(which);
+                for (i, offset) in (start + from..start + to).enumerate() {
+                    copy.view_for_test(space.at(offset)).write_volatile(byte ^ (i as u8));
                 }
             }
             Op::Read(which, start, len) => {
-                let span = base + start..base + start + len;
-                seen.push(span.map(|a| copy(which).view_for_test(a).read_volatile()).collect());
+                let copy = copies.of(which);
+                let span = start..start + len;
+                seen.push(span.map(|o| copy.view_for_test(space.at(o)).read_volatile()).collect());
             }
             Op::PlaceWrite(start, len, byte) => {
                 for i in 0..len {
-                    ((base + start + i) as *mut u8).write_volatile(byte.wrapping_add(i as u8));
+                    (space.at(start + i) as *mut u8).write_volatile(byte.wrapping_add(i as u8));
                 }
             }
             Op::PlaceRead(start, len) => {
-                seen.push(std::slice::from_raw_parts((base + start) as *const u8, len).to_vec());
+                seen.push(std::slice::from_raw_parts(space.at(start) as *const u8, len).to_vec());
             }
             Op::Fill(_, len) | Op::Host(_, len) => {
                 seen.push(std::slice::from_raw_parts(at as *const u8, len).to_vec());
@@ -619,7 +823,8 @@ fn until(what: impl Fn() -> bool) {
     }
 }
 
-/// The case, one line a step, with the steps that touch `near` marked.
+/// The case, one line a step, with the steps that touch `near` (at either
+/// view) marked.
 fn told(case: &Case, near: Option<usize>) -> String {
     let mut text = format!("initial {}\n", case.initial);
     for (k, sub) in case.subs.iter().enumerate() {
@@ -629,21 +834,21 @@ fn told(case: &Case, near: Option<usize>) -> String {
         text += &format!("{k}: early {early} delay {delay:?} again {again} title {titles}\n");
         for (i, list) in sub.lists.iter().enumerate() {
             for op in list {
-                let span = match *op {
+                let spans = match *op {
                     Op::Refresh(_, at, len)
                     | Op::Write(_, at, len, ..)
                     | Op::Read(_, at, len)
                     | Op::PlaceWrite(at, len, _)
                     | Op::PlaceRead(at, len)
                     | Op::Fill(at, len)
-                    | Op::Host(at, len) => (at, at + len),
-                    Op::Copy(to, from, len) | Op::Run(to, from, len) => {
-                        (to.min(from), to.max(from) + len)
-                    }
-                    Op::Bottom(at, _) => (at, at + 8),
-                    Op::Readback(at, len, _) => (at, at + len),
+                    | Op::Host(at, len)
+                    | Op::Readback(at, len, _) => vec![(at, len)],
+                    Op::Copy(to, from, len) | Op::Run(to, from, len) => vec![(to, len), (from, len)],
+                    Op::Bottom(at, _) => vec![(at, 8)],
                 };
-                let near = near.is_some_and(|n| span.0 <= n && n < span.1);
+                let near = near.is_some_and(|n| {
+                    spans.iter().any(|&(at, len)| same(at) <= same(n) && same(n) < same(at) + len)
+                });
                 let mark = if near { "* " } else { "  " };
                 text += &format!("  {mark}{i} {op:x?}\n");
             }
@@ -673,20 +878,19 @@ fn differ(a: &Outcome, b: &Outcome) -> Option<String> {
     if let Some(stale) = &b.stale {
         return Some(stale.clone());
     }
-    if let Some(at) = first(&a.sparse, &b.sparse) {
-        return Some(format!(
-            "the sparse copy at {at:#x}: {:#x} against {:#x} (title {:#x})",
-            a.sparse[at], b.sparse[at], a.title[at]
-        ));
-    }
-    first(&a.dense, &b.dense).map(|at| {
-        format!(
-            "the dense copy at {:#x}: {:#x} against {:#x} (title {:#x})",
-            DENSE.0 + at,
-            a.dense[at],
-            b.dense[at],
-            a.title[DENSE.0 + at]
-        )
+    // Each copy as left: its name, where it starts in the memory and in
+    // `title`.
+    let copies = [
+        ("sparse", &a.sparse, &b.sparse, 0, 0),
+        ("dense", &a.dense, &b.dense, DENSE.0, DENSE.0),
+        ("first view's", &a.view_a, &b.view_a, VIEW_A.0, SIZE),
+        ("second view's", &a.view_b, &b.view_b, VIEW_B.0, SIZE),
+    ];
+    copies.iter().find_map(|&(name, x, y, at, from)| {
+        first(x, y).map(|i| {
+            let title = a.title[from + i];
+            format!("the {name} copy at {:#x}: {:#x} against {:#x} (title {title:#x})", at + i, x[i], y[i])
+        })
     })
 }
 
@@ -717,6 +921,8 @@ fn hosts(hardware: bool) -> Vec<&'static Host> {
 /// The tail drain and the strict one leave what the old drain leaves, over
 /// thousands of random cases (`VYCE_TAIL_SEEDS` for more), and every
 /// submission after the first of a case is prepared under the one before.
+/// The tail drains are prewarmed in a case of three (`VYCE_TAIL_PREWARM=1`),
+/// whose copies as left are compared too where no gate opens after a while.
 /// The old drain's dry run, on every other case, changes nothing, and where
 /// no gate opens after a while it foretells what the tail drain does.
 #[test]
@@ -729,13 +935,16 @@ fn the_tail_drain_leaves_what_the_old_drain_leaves() {
             let case = Rng(seed * 7919 + 17).case();
             let dry = seed % 2 == 0;
             force_dry(Some(dry));
-            let old = bench.run(&case, Mode::Old, None);
+            let old = bench.run(&case, Mode::Old, None, true);
             force_dry(None);
             assert!(bench.settled(), "seed {seed}: left pending by the old drain");
             let by_old = events();
             assert!(!by_old.contains(&Event::Under));
             let mode = if seed % 5 == 4 { Mode::Strict } else { Mode::Tail };
-            let tail = bench.run(&case, mode, None);
+            let warm = seed % 3 == 0;
+            force_prewarm(Some(warm));
+            let tail = bench.run(&case, mode, None, warm);
+            force_prewarm(None);
             assert!(bench.settled(), "seed {seed}: left pending by the tail drain");
             // (A flight whose gate opens after a while may have landed, and
             // lists submitted again take the old drain.)
@@ -776,28 +985,40 @@ fn the_tail_drain_leaves_what_the_old_drain_leaves() {
             }
             if let Some(at) = differ(&old, &tail) {
                 let case = told(&case, offset(&at));
-                panic!("host {h}, seed {seed}, {mode:?}: not as with the old drain: {at}\n{case}");
+                panic!("host {h}, seed {seed}, {mode:?} (prewarm {warm}): not as with the old drain: {at}\n{case}");
             }
         }
     }
 }
 
 /// With any one of its rules off, the tail drain leaves something else than
-/// the old drain for some case: the test above sees each hazard.
+/// the old drain for some case: the test above sees each hazard. (The tail
+/// drain is prewarmed here, so that the copies as left are compared too.)
 #[test]
 fn each_rule_of_the_tail_drain_is_needed() {
     let Some(host) = hosts(false).into_iter().next() else { return };
     let Some(bench) = Bench::new(host) else { return };
-    use Mutation::{Copies, Dense, Late, Queue, Tags};
-    for rule in [Late, Queue, Copies, Dense, Tags] {
+    use Mutation::{Copies, Dense, Late, Queue, Tags, Views};
+    let tail = |case: &Case, rule: Option<Mutation>| {
+        force_prewarm(Some(true));
+        let tail = bench.run(case, Mode::Tail, rule, true);
+        force_prewarm(None);
+        tail
+    };
+    for rule in [Late, Queue, Copies, Dense, Tags, Views] {
         let found = (0..500u64).find(|&seed| {
             let case = Rng(seed * 104_729 + 3).case();
-            let old = bench.run(&case, Mode::Old, None);
-            let tail = bench.run(&case, Mode::Tail, Some(rule));
-            differ(&old, &tail).is_some()
+            let old = bench.run(&case, Mode::Old, None, true);
+            differ(&old, &tail(&case, Some(rule))).is_some()
         });
         assert!(found.is_some(), "{rule:?} off: no case of 500 differs");
-        eprintln!("{rule:?} off: seed {} differs", found.unwrap());
+        let seed = found.unwrap();
+        // The rule's doing: with it on the case is as with the old drain.
+        let case = Rng(seed * 104_729 + 3).case();
+        let old = bench.run(&case, Mode::Old, None, true);
+        let at = differ(&old, &tail(&case, None));
+        assert!(at.is_none(), "{rule:?}: seed {seed} differs with every rule on: {at:?}");
+        eprintln!("{rule:?} off: seed {seed} differs");
     }
     events();
 }
@@ -987,6 +1208,198 @@ fn a_submission_is_prepared_under_the_flight_before() {
     }
 }
 
+/// The section's bytes at `offset` (at the first view) set to `byte`, and
+/// fresh copies of it at its two views.
+fn view_copies(bench: &Bench, offset: usize, len: usize, byte: u8) -> (Arc<Shadow>, Arc<Shadow>) {
+    let space = bench.space();
+    space.write(VIEW_A.0 + offset, &vec![byte; len]);
+    let fresh = |at: usize| Shadow::for_test(bench.host, space.at(at), VIEW as u64).0;
+    let (a, b) = (fresh(VIEW_A.0), fresh(VIEW_B.0));
+    // Copied and guarded, as copies the title's memory has had for a while.
+    a.update(space.at(VIEW_A.0), VIEW);
+    b.update(space.at(VIEW_B.0), VIEW);
+    (a, b)
+}
+
+/// What a landing writes through one view of a section, a submission
+/// prepared under the flight refreshes through the other after the wait for
+/// it, as the old drain did: its shaders read the flight's results. Without
+/// the rule (the refresh looks at its own addresses only) they read what
+/// was there before, until a later submission's refresh.
+#[test]
+fn a_refresh_through_another_view_waits_for_the_landing() {
+    for host in hosts(true) {
+        let Some(bench) = Bench::new(host) else { return };
+        assert_eq!(through_views(&bench, None), (0x77, 0x77));
+        assert_eq!(through_views(&bench, Some(Mutation::Views)), (0x11, 0x77), "the rule is needed");
+    }
+}
+
+/// The second view's copy of what the flight's shaders wrote at the first
+/// view, after the next submission's refresh, and once brought up to date
+/// again, with `rule` off.
+fn through_views(bench: &Bench, rule: Option<Mutation>) -> (u8, u8) {
+    let (host, space, line) = (bench.host, bench.space(), bench.host.line());
+    let at = VIEW_A.0 + PAGE / 2;
+    let (view_a, view_b) = view_copies(bench, PAGE / 2, 64, 0x11);
+    // The flight: its shaders write the first view's copy.
+    let first = &bench.lists[0];
+    first.reset();
+    view_a.refresh(first, space.at(at) as u64, 64);
+    view_a.gpu_writes(first, space.at(at) as u64, 64);
+    first.close();
+    let gate = Gate(host.gate());
+    force(Some(Mode::Tail));
+    host.execute_title(std::slice::from_ref(first));
+    force(None);
+    // SAFETY: the copy's mapping (the flight's shaders').
+    unsafe { view_a.view_for_test(space.at(at) + 8).write_volatile(0x77) };
+    // The next: the same bytes through the second view.
+    let other = at + VIEW;
+    let second = &bench.lists[1];
+    second.reset();
+    view_b.refresh(second, space.at(other) as u64, 64);
+    second.count_work();
+    second.close();
+    let waits = line.waits_begun();
+    let next = second.clone();
+    let sent = std::thread::spawn(move || {
+        force(Some(Mode::Tail));
+        mutate(rule);
+        host.execute_title(std::slice::from_ref(&next));
+        events()
+    });
+    until(|| line.waits_begun() > waits);
+    gate.open();
+    let seen = sent.join().unwrap();
+    let late = if rule.is_none() { vec![Event::Late] } else { Vec::new() };
+    assert_eq!(seen, [vec![Event::Under], late, vec![Event::Waited(Why::Tail)]].concat());
+    line.drain(Count::WaitHeld);
+    events();
+    // SAFETY: the copy's mapping; nothing runs.
+    let held = || unsafe { view_b.view_for_test(space.at(other) + 8).read_volatile() };
+    let read = held();
+    // The landing opened the second view too: the next refresh finds it.
+    view_b.update(space.at(other), 64);
+    (read, held())
+}
+
+/// Memory the host GPU uses in place at one view of a section: a submission
+/// prepared under the flight refreshes the copy of the other view after the
+/// wait for it, as for the memory itself. Without the rule the copy holds
+/// what was there before the flight's shaders wrote.
+#[test]
+fn a_refresh_of_another_view_of_memory_used_in_place_waits() {
+    for host in hosts(true) {
+        let Some(bench) = Bench::new(host) else { return };
+        assert_eq!(in_place_through_views(&bench, None), 0x66);
+        assert_eq!(in_place_through_views(&bench, Some(Mutation::Views)), 0x22, "the rule is needed");
+    }
+}
+
+/// The second view's copy, after the next submission's refresh, of what the
+/// flight's shaders wrote in place at the first view, with `rule` off.
+fn in_place_through_views(bench: &Bench, rule: Option<Mutation>) -> u8 {
+    let (host, space, line) = (bench.host, bench.space(), bench.host.line());
+    let at = VIEW_IN_PLACE.0 + 512;
+    let (_, view_b) = view_copies(bench, at - VIEW_A.0, 64, 0x22);
+    // The flight: its shaders write the memory in place (not a copy).
+    let first = &bench.lists[0];
+    first.reset();
+    first.count_work();
+    first.close();
+    let gate = Gate(host.gate());
+    force(Some(Mode::Tail));
+    host.execute_title(std::slice::from_ref(first));
+    force(None);
+    let other = at + VIEW;
+    let second = &bench.lists[1];
+    second.reset();
+    view_b.refresh(second, space.at(other) as u64, 64);
+    second.count_work();
+    second.close();
+    let waits = line.waits_begun();
+    let next = second.clone();
+    let sent = std::thread::spawn(move || {
+        force(Some(Mode::Tail));
+        mutate(rule);
+        host.execute_title(std::slice::from_ref(&next));
+        events()
+    });
+    until(|| line.waits_begun() > waits);
+    // The flight's shaders write in place, and it lands.
+    // SAFETY: the section's memory, written by the flight's shaders only
+    // (a guarded block opens on the fault).
+    unsafe { (space.at(at + 8) as *mut u8).write_volatile(0x66) };
+    gate.open();
+    let seen = sent.join().unwrap();
+    let late = if rule.is_none() { vec![Event::Late] } else { Vec::new() };
+    assert_eq!(seen, [vec![Event::Under], late, vec![Event::Waited(Why::Tail)]].concat());
+    line.drain(Count::WaitHeld);
+    events();
+    // SAFETY: the copy's mapping; nothing runs.
+    unsafe { view_b.view_for_test(space.at(other) + 8).read_volatile() }
+}
+
+/// Without the switch a submission prepared under a flight is not
+/// prewarmed: bytes between its steps' ranges that no step asks for stay
+/// as they were; with `VYCE_TAIL_PREWARM=1` the prewarm brings them up to
+/// date first, as before.
+#[test]
+fn the_tail_drain_does_without_the_prewarm() {
+    for host in hosts(true) {
+        let Some(bench) = Bench::new(host) else { return };
+        assert_eq!(prewarmed(&bench, Some(false)), 0x31, "not prewarmed");
+        assert_eq!(prewarmed(&bench, Some(true)), 0x42, "prewarmed");
+        // As the switch says (not, unless VYCE_TAIL_PREWARM=1).
+        let switch = if prewarm() { 0x42 } else { 0x31 };
+        assert_eq!(prewarmed(&bench, None), switch);
+    }
+}
+
+/// The dense copy's byte between two refreshes of a submission prepared
+/// under a flight (a declaration of shader writes between them), after the
+/// title wrote it, with the prewarm as `warm` says.
+fn prewarmed(bench: &Bench, warm: Option<bool>) -> u8 {
+    let (host, region, line) = (bench.host, &bench.region, bench.host.line());
+    region.write(DENSE.0, &[0x31; 1024]);
+    let (dense, _) = Shadow::for_test(host, region.at(DENSE.0), (DENSE.1 - DENSE.0) as u64);
+    let first = &bench.lists[0];
+    first.reset();
+    first.count_work();
+    first.close();
+    let gate = Gate(host.gate());
+    force(Some(Mode::Tail));
+    host.execute_title(std::slice::from_ref(first));
+    force(None);
+    region.write(DENSE.0, &[0x42; 1024]);
+    let second = &bench.lists[1];
+    second.reset();
+    let at = |offset: usize| region.at(DENSE.0 + offset) as u64;
+    dense.refresh(second, at(0), 100);
+    dense.gpu_writes(second, at(0), 100);
+    dense.refresh(second, at(200), 100);
+    second.count_work();
+    second.close();
+    let waits = line.waits_begun();
+    let next = second.clone();
+    let sent = std::thread::spawn(move || {
+        force(Some(Mode::Tail));
+        force_prewarm(warm);
+        host.execute_title(std::slice::from_ref(&next));
+        events()
+    });
+    until(|| line.waits_begun() > waits);
+    gate.open();
+    assert_eq!(sent.join().unwrap(), [Event::Under, Event::Waited(Why::Tail)]);
+    line.drain(Count::WaitHeld);
+    events();
+    // SAFETY: the copy's mapping; nothing runs.
+    let held = |offset: usize| unsafe { dense.view_for_test(region.at(DENSE.0 + offset)).read_volatile() };
+    assert_eq!((held(0), held(250)), (0x42, 0x42), "the steps' ranges");
+    held(150)
+}
+
 /// The bounce slices of a directly indexed heap's constant buffers are
 /// rewritten only once the flight that reads them has landed: the flight
 /// reads its constants, the next submission its own, as with the old drain,
@@ -1054,6 +1467,111 @@ fn bounced(
     force(None);
     events();
     (read, first_byte())
+}
+
+/// Slots a directly indexed heap's plan left unmade (over its time budget)
+/// were written for the flight that may read them: a submission prepared
+/// under it waits for it before its plan makes them, and makes them once it
+/// has landed. Without the rule the plan makes them under the flight.
+#[test]
+fn slots_a_plan_left_unmade_wait_for_the_flight() {
+    for host in hosts(true) {
+        let Some(bench) = Bench::new(host) else { return };
+        let Some(heap) = crate::descriptor::host::HostHeap::new(false, 16) else { return };
+        let heap = Arc::new(heap);
+        assert_eq!(carried(&bench, &heap, None), [Event::Under, Event::Waited(Why::Slots)]);
+        let off = carried(&bench, &heap, Some(Mutation::Slots));
+        assert_eq!(off, [Event::Under, Event::Waited(Why::Tail)], "the rule is needed");
+    }
+}
+
+/// What the next submission's preparation did, the plan of the flight before
+/// having left a slot unmade, with `rule` off.
+fn carried(
+    bench: &Bench,
+    heap: &Arc<crate::descriptor::host::HostHeap>,
+    rule: Option<Mutation>,
+) -> Vec<Event> {
+    let (host, line) = (bench.host, bench.host.line());
+    crate::descriptor::host::BindlessPlan::for_test(heap, Vec::new(), Vec::new());
+    let first = &bench.lists[0];
+    first.reset();
+    first.defer_bindless(heap, false);
+    first.close();
+    let gate = Gate(host.gate());
+    force(Some(Mode::Tail));
+    host.execute_title(std::slice::from_ref(first));
+    force(None);
+    assert!(!heap.carried(), "its plan made what was dirty");
+    // As if its plan had run out of time before slot 5.
+    heap.carry_for_test(5);
+    assert!(heap.carried());
+    let second = &bench.lists[1];
+    second.reset();
+    second.defer_bindless(heap, false);
+    second.count_work();
+    second.close();
+    let (waits, plans) = (line.waits_begun(), heap.plans_made());
+    let next = second.clone();
+    let sent = std::thread::spawn(move || {
+        force(Some(Mode::Tail));
+        mutate(rule);
+        host.execute_title(std::slice::from_ref(&next));
+        events()
+    });
+    until(|| line.waits_begun() > waits);
+    // Where the preparation waits, under the flight: with the rule its plan
+    // has made no slot yet.
+    let under = heap.plans_made() - plans;
+    gate.open();
+    let seen = sent.join().unwrap();
+    line.drain(Count::WaitHeld);
+    events();
+    assert_eq!(under, u64::from(rule.is_some()), "slots made under the flight");
+    assert_eq!(heap.plans_made() - plans, 1);
+    assert!(!heap.carried(), "made in the end");
+    seen
+}
+
+/// A slot whose view the title released is made anew (null) by the plan's
+/// look once a frame: a submission prepared under a flight waits for it
+/// first, as for slots left unmade (the flight may still read the slot).
+#[test]
+fn slots_the_look_remakes_wait_for_the_flight() {
+    for host in hosts(true) {
+        let Some(bench) = Bench::new(host) else { return };
+        let Some(heap) = crate::descriptor::host::HostHeap::new(false, 16) else { return };
+        let heap = Arc::new(heap);
+        let (host, line) = (bench.host, host.line());
+        crate::descriptor::host::BindlessPlan::for_test(&heap, Vec::new(), Vec::new());
+        let first = &bench.lists[0];
+        first.reset();
+        first.count_work();
+        first.close();
+        let gate = Gate(host.gate());
+        force(Some(Mode::Tail));
+        host.execute_title(std::slice::from_ref(first));
+        force(None);
+        // The look finds a slot of the heap to make anew.
+        heap.look_for_test(7);
+        let second = &bench.lists[1];
+        second.reset();
+        second.defer_bindless(&heap, false);
+        second.count_work();
+        second.close();
+        let waits = line.waits_begun();
+        let next = second.clone();
+        let sent = std::thread::spawn(move || {
+            force(Some(Mode::Tail));
+            host.execute_title(std::slice::from_ref(&next));
+            events()
+        });
+        until(|| line.waits_begun() > waits);
+        gate.open();
+        assert_eq!(sent.join().unwrap(), [Event::Under, Event::Waited(Why::Slots)]);
+        line.drain(Count::WaitHeld);
+        events();
+    }
 }
 
 /// What shaders write through a directly indexed heap's unordered access
