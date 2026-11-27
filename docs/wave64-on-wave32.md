@@ -1,10 +1,14 @@
 # Console wave64 compute on 32-lane hosts
 
-Status: steps 1, 2, 4 and 5 are in. On NVIDIA, wave64 programs whose lanes
+Status: steps 1, 2 and 4 to 6 are in. On NVIDIA, wave64 programs whose lanes
 read only their own half run as two 32-lane waves. Groups of one console
 wave also run in the console flow: masks read whole, lanes of the other
-half, divergent branches, loops and single-wave LDS. Still open: groups of
-several console waves, whole-wave sections and `ds_permute_b32` scatter.
+half, divergent branches, loops and single-wave LDS. Groups of several
+console waves run in step where their waves branch alike, and in paired
+lanes (one host wave a console wave, two console lanes a thread) where
+nothing else takes them. Still open: `ds_permute_b32` scatter, and in
+paired lanes the lane operations outside whole-wave sections that version
+0 leaves out.
 
 ## The problem
 
@@ -227,9 +231,10 @@ stays (`VICTORY_LOOP_EARLY_OUTS=0` leaves it out as the fork did): it may be
 the loop's only way out, and lanes walking on with EXEC clear would go round
 until the loop limit stopped them a million turns later.
 
-CS_ShadowUnifiedClearRaster and CS_SortRayTiles stay refused, measured on
-the transformed programs: the four console waves of a ShadowUnifiedClearRaster
-group branch apart for real (each wave asks whether any of its lanes passed,
+CS_ShadowUnifiedClearRaster and CS_SortRayTiles stay refused by these forms,
+measured on the transformed programs (paired lanes, below, take them): the
+four console waves of a ShadowUnifiedClearRaster group branch apart for
+real (each wave asks whether any of its lanes passed,
 `s_bcnt1` of VCC, before a whole-wave minimum and maximum, and tests VCC made
 of EXEC and a uniform value), and SortRayTiles loops while any lane of the
 wave has work left (`s_andn2_b64` of EXEC into an exit mask, `s_cbranch_scc1`)
@@ -271,6 +276,106 @@ is exchanged; any group size and LDS are fine. If the console flow cannot
 lower the program, it keeps the per-lane form (`Parts::per_lane_only`), so
 nothing that translated before is refused.
 
+## Paired lanes
+
+The last form (`emit::paired`, `lower::paired`), tried only for a console
+wave64 compute program on a host without 64-lane waves that every form
+above refuses; `VICTORY_WAVE_PAIRS=0` leaves those refused. Of the title's
+captured compute programs these are four: CS_ShadowUnifiedClearRaster
+(0c028454b58543f0), CS_DefragHeap_ComputeRelocations (02384a60fda6f2d0),
+CS_SortRayTiles (a1bf269d5b19f025) and CS_AssembleComputeList
+(b0d5ffa0801b7450). Their console waves branch apart (per-wave "any"
+tests, loops while a lane of the wave has work, lane 63 read in loops of
+different lengths), which keeps them out of the lockstep form, and they
+share LDS and read lanes and masks whole, which keeps them out of the
+others.
+
+Each console wave runs as one host wave of 32 lanes: host lane n runs
+console lanes n ("lower") and n + 32 ("upper"), and the group has 32
+threads a console wave. The program is lowered from `structure_console` as
+the console runs it: every lane through every block, the branches taken
+wave-wide, EXEC guarding each vector instruction, and here each LDS read
+too (a lane outside EXEC reads no LDS at an address it never set). What a
+lane runs is lowered twice, the lower lane first, each time with that
+lane's state swapped in (`paired::LaneState`: its values, mask bits and
+their joins, its console thread), which keeps the console's order: every
+lane of an instruction before any lane of the next. Scalar code and scalar
+loads run once, as the console's wave runs them, and give both lanes their
+results. What reads the wave reads both lanes of the host wave's threads,
+with nothing exchanged:
+
+| On the console | In paired lanes |
+| --- | --- |
+| a mask read whole (`s_bcnt1`, `s_ff1`, mask tests, branches on EXEC, on VCC and on a mask operation's SCC) | the lower lanes' host ballot, and the upper lanes' |
+| `v_readlane_b32`, `v_readfirstlane_b32` (the first lane from EXEC's two dwords, lane 0 if none) | host lane `n & 31` of the lower or the upper value |
+| `v_mbcnt`, a lane's own bit of a mask held as a number | the lane's console lane |
+| a whole-wave reduction | the host wave's reduction of the lower lanes and of the upper ones, put together |
+| a whole-wave prefix sum | the host wave's prefix of the lower lanes, and of the upper ones after the lower lanes' total |
+
+So the waves of a group may branch apart: each host wave goes where some
+lane of its console wave goes, and the program's own barriers are met as
+the console's waves meet them. The form adds one barrier, on entry, where
+each host wave takes the next console wave from an LDS count, whatever
+threads the host puts in a wave; 2-D and 3-D console thread ids come back
+from the console thread's flat id.
+
+The lanes of one console wave share LDS without barriers on the console;
+here they are the two lanes of a host wave's threads. A group-shared memory
+fence comes before each LDS access that follows another unless both read
+(a group barrier where the group is one console wave). shortcut: D3D12
+orders no group-shared accesses of two threads without a group barrier;
+the host is taken to run a wave's threads in step where they all go the
+same way, as for the console's 32-lane programs that share LDS within a
+wave. shortcut: a host wave stopped by the loop limit leaves the program
+while the group's other waves may still meet at a barrier, which NVIDIA
+lets them pass (it counts the threads that have not ended); D3D12 does not
+promise it.
+
+Version 0 refuses: groups that do not fill their console waves, memory
+reached by address, private memory, and outside whole-wave sections DPP,
+`v_permlane*`, `v_writelane`, `ds_swizzle`, `ds_(b)permute` and samples
+with derivatives from quads (each would read within its lane's half, left
+for a later version with tests of its own); and float sums over the wave,
+which the console adds in its own order. A refused program keeps the
+reason the other forms gave.
+
+`emit::paired_tests` runs, on the RTX 2070 SUPER, hand-assembled programs
+in the patterns of the four, each against a CPU model of the console's
+waves: two waves walking rounds of their own while lane 63 hands an LDS
+value to the next round without a barrier (5 and 9 rounds, and 1,000 and
+1,001), per-wave any tests around a whole-wave minimum and maximum with
+the first lane's LDS slot and a combine after the barrier, a counting sort
+with loops while lanes have records, prefix sums and lane 63's wave
+totals, and per-wave "any and any" counts over two rounds appended to a
+list; and the console flow's one-wave cases in groups of one, two and four
+console waves; and first lanes of the upper half. A broken upper ballot,
+upper lane read or prefix total fails them. On the captured containers (32
+lanes, exact views) no translation changed and 13 programs now translate:
+the four, and nine of the same kind never bound in the logged sessions (a
+second CS_DefragHeap_ComputeRelocations, CS_ShadowUnifiedClearRT, four
+CS_Compact*Classification, two CS_BuildProjDecalTrail* and
+CS_ScreenProbes_TraceRays_Fallback); all valid; the used compute set makes
+672 pipelines with none failing, and the nine make theirs (the largest, 320
+KB of DXIL, in 3.5 s).
+
+| Program | Console VGPRs | DXIL (bytes) | Pipeline on the RTX 2070 SUPER |
+| --- | --- | --- | --- |
+| CS_DefragHeap_ComputeRelocations | 26 | 25,580 | 158 ms |
+| CS_ShadowUnifiedClearRaster | 20 | 26,836 | 114 ms |
+| CS_SortRayTiles | 20 | 9,820 | 95 ms |
+| CS_AssembleComputeList | 9 | 7,684 | 30 ms |
+
+A thread holds two lanes' VGPRs (about 52, 40, 40 and 18 values, besides
+the scalars every thread keeps), against 64 registers a thread for
+Turing's full occupancy (an estimate: D3D12 does not report the host's
+registers); the pipeline times are first compiles, with no driver cache.
+
+From fxceless/victory-fork#854 (PiloteCode, "Paired Wave64 compute
+lowering on 32-lane GPUs"; victory-3060TI 26600c6 and p1nkman-VI,
+GPL-3.0-or-later): the twin lane states swapped per vector instruction,
+the paired lane reads and wave sections. Vyce's console flow already takes
+every branch wave-wide, which the fork's `structure_wide` does there.
+
 ## Testing
 
 The differential tests need the console SDK's compiler, which we do not
@@ -300,9 +405,9 @@ takes `WaveSize(64)`, the NVIDIA reports 32-32).
 5. ~~The console flow and the one-wave exchange (ballots, readlane,
    readfirstlane, writelane, mbcnt, divergent branches and loops).~~
 6. ~~Multi-wave groups: in step where their waves branch alike; local
-   waves where lanes only meet within 32.~~ Left: CS_DefragHeap,
-   CS_ShadowUnifiedClearRaster (branches on lanes that differ per wave) and
-   CS_SortRayTiles (see "Forms without early-outs or skips").
+   waves where lanes only meet within 32; paired lanes where their waves
+   branch apart (CS_DefragHeap_ComputeRelocations,
+   CS_ShadowUnifiedClearRaster, CS_SortRayTiles, CS_AssembleComputeList).~~
 
 ## Credit
 
@@ -311,3 +416,6 @@ the finding that NVIDIA forms waves from non-consecutive thread ids in some
 3-D groups, come from XCL's design notes (`docs/wave64-on-wave32.md` in
 github.com/ivall/xcl and its fork Bathyal). XCL is GPL-2.0-only. Nothing
 here is copied from its code.
+
+Paired lanes are ported from fxceless/victory-fork#854 by PiloteCode
+(victory-3060TI 26600c6, p1nkman-VI), GPL-3.0-or-later.

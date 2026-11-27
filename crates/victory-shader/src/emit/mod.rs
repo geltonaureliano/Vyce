@@ -100,6 +100,8 @@ mod rectangle;
 mod opcode_audit;
 #[cfg(all(test, windows))]
 mod opcode_tests;
+#[cfg(all(test, windows))]
+mod paired_tests;
 mod sampler;
 #[cfg(all(test, windows))]
 mod scratch_tests;
@@ -284,11 +286,16 @@ pub enum Switch {
     /// reads a lane of its own there, so the program can go another way than
     /// the console's wave does (`local_waves::parted_by_lane_read`).
     LaneReadBranches,
+    /// `VICTORY_WAVE_PAIRS=0`: a console wave64 compute program that every
+    /// other form refuses on a host of 32-lane waves stays refused, rather
+    /// than running in paired lanes (one host wave of 32 per console wave,
+    /// two console lanes a thread: [`paired`]).
+    WavePairs,
 }
 
 impl Switch {
     /// Every switch, in the order of [`switches`]'s bits.
-    pub const ALL: [Switch; 12] = [
+    pub const ALL: [Switch; 13] = [
         Switch::ExactNorm,
         Switch::D16Integer,
         Switch::WaveForms,
@@ -301,6 +308,7 @@ impl Switch {
         Switch::HostWaveReads,
         Switch::ViewLoadsApart,
         Switch::LaneReadBranches,
+        Switch::WavePairs,
     ];
 
     /// The environment variable that sets it.
@@ -318,6 +326,7 @@ impl Switch {
             Switch::HostWaveReads => "VICTORY_HOST_WAVE_READS",
             Switch::ViewLoadsApart => "VICTORY_VIEW_LOADS_APART",
             Switch::LaneReadBranches => "VICTORY_LANE_READ_BRANCHES",
+            Switch::WavePairs => "VICTORY_WAVE_PAIRS",
         }
     }
 
@@ -586,6 +595,41 @@ pub fn emit(
     res: &resource::Resources,
     target: Target,
 ) -> Result<HostShader, ShaderError> {
+    let shader = emit_forms(c, native, p, st, io, res, target);
+    // Last of all, for a console wave64 compute program on a host of 32-lane
+    // waves that every form above refuses: paired lanes ([`paired`]). What
+    // it refuses keeps the reason the forms above gave.
+    if matches!(shader, Err(ShaderError::Unsupported { .. }))
+        && native.stage == HwStage::Cs
+        && native.wave64
+        && target.runs(32)
+        && !target.runs(64)
+        && Switch::WavePairs.on()
+    {
+        let again = paired(c, native, p, io, res, target);
+        if std::env::var_os("VICTORY_WHY").is_some() {
+            match &again {
+                Ok(_) => eprintln!("paired lanes: translated"),
+                Err(e) => eprintln!("paired lanes: {e}"),
+            }
+        }
+        if again.is_ok() {
+            return again;
+        }
+    }
+    shader
+}
+
+/// [`emit`] in every form but paired lanes.
+fn emit_forms(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    target: Target,
+) -> Result<HostShader, ShaderError> {
     let original = emit_program(c, native, p, st, io, res, target);
     let wave64_on_32 =
         native.stage == HwStage::Cs && native.wave64 && target.runs(32) && !target.runs(64);
@@ -717,15 +761,76 @@ fn without_branches(
     None
 }
 
-fn emit_program(
+/// A console wave64 compute program on a host of 32-lane waves in paired
+/// lanes ([`lower::Parts::paired`]): each console wave runs as one host wave
+/// of 32 lanes, host lane l running console lanes l and l + 32, as the
+/// console runs it (the console flow: every lane through every block, the
+/// branches taken wave-wide, EXEC guarding each vector instruction). A host
+/// wave's ballots, lane reads and whole-wave sections are then its console
+/// wave's own, with nothing exchanged, and the waves of a group may branch
+/// apart: the program's barriers are met where the console's waves meet
+/// them. The group has 32 threads for each console wave.
+///
+/// Version 0 refuses what it does not model: a group that does not fill its
+/// console waves, memory reached by address, private memory, and (in the
+/// lowering, `lower::paired`) lane operations outside whole-wave sections
+/// other than lane reads, ballots and lane counts, and float sums over the
+/// wave. Tried last, for programs every other form refuses
+/// (`VICTORY_WAVE_PAIRS=0` leaves them refused).
+///
+/// After fxceless/victory-fork#854 (PiloteCode, "Paired Wave64 compute
+/// lowering on 32-lane GPUs"; victory-3060TI 26600c6 and p1nkman-VI,
+/// GPL-3.0-or-later): one host wave per console wave, two lane states a
+/// thread swapped per vector instruction; here on Vyce's console flow, which
+/// already takes every branch wave-wide.
+pub(super) fn paired(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
-    st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
     target: Target,
-) -> Result<(HostShader, Form), ShaderError> {
+) -> Result<HostShader, ShaderError> {
+    let refuse = |what| Err(ShaderError::Unsupported { offset: 0, what });
+    let crate::native::StageIo::Cs(cs) = &native.io else {
+        return refuse("paired lanes outside compute");
+    };
+    let threads: u32 = cs.threads.iter().product();
+    if threads == 0 || !threads.is_multiple_of(64) {
+        return refuse("paired lanes in a group that does not fill its console waves");
+    }
+    if res.addresses {
+        return refuse("paired lanes in a program that reaches memory by address");
+    }
+    if p.blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .any(|i| i.name().starts_with("scratch_"))
+    {
+        return refuse("paired lanes with private memory");
+    }
+    // (the count that numbers the group's host waves takes a dword)
+    if cs.lds_bytes() / 4 >= 8 * 1024 {
+        return refuse("paired lanes without an LDS dword left");
+    }
+    let st = structure::structure_console(p)?;
+    let mut parts = lower_parts(c, native, p, &st, io, res, target)?;
+    parts.console_cf = true;
+    parts.paired = true;
+    lower::lower(&parts).map(|l| host_shader(native, l))
+}
+
+/// What [`lower::lower`] takes for `p`: the signatures and the like, in the
+/// per-lane form (the caller picks another).
+fn lower_parts<'a>(
+    c: &'a Container,
+    native: &'a NativeProgram,
+    p: &'a ir::Program,
+    st: &'a structure::Structured,
+    io: &'a io::Io,
+    res: &'a resource::Resources,
+    target: Target,
+) -> Result<lower::Parts<'a>, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -805,7 +910,7 @@ fn emit_program(
         }
         _ => 0,
     };
-    let mut parts = lower::Parts {
+    Ok(lower::Parts {
         psv: c.part(FourCC::PSV0).map(|p| p.data),
         native,
         p,
@@ -820,7 +925,20 @@ fn emit_program(
         console_cf: false,
         per_lane_only: false,
         local: false,
-    };
+        paired: false,
+    })
+}
+
+fn emit_program(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    target: Target,
+) -> Result<(HostShader, Form), ShaderError> {
+    let mut parts = lower_parts(c, native, p, st, io, res, target)?;
     let local = || match &native.io {
         crate::native::StageIo::Cs(cs)
             if native.wave64 && target.runs(32) && !target.runs(64) =>
@@ -1850,6 +1968,7 @@ mod tests {
             console_cf: false,
             per_lane_only: false,
             local: false,
+            paired: false,
         })
         .unwrap();
         let mut dxil = l.dxil;
@@ -2009,6 +2128,7 @@ mod tests {
             console_cf: false,
             per_lane_only: false,
             local: false,
+            paired: false,
         })
         .unwrap();
         let mut dxil = l.dxil;
@@ -2176,6 +2296,7 @@ mod tests {
             console_cf: false,
             per_lane_only: false,
             local: false,
+            paired: false,
         })
         .unwrap();
         assert!(l.stride_table);
@@ -2336,6 +2457,7 @@ mod tests {
             console_cf: false,
             per_lane_only: false,
             local: false,
+            paired: false,
         })
         .unwrap();
         let mut dxil = l.dxil;

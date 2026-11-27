@@ -172,6 +172,7 @@ fn build_cs(body: &[u32], outputs: &[u8]) -> HostShader {
         console_cf: false,
         per_lane_only: false,
         local: false,
+        paired: false,
     })
     .expect("lower");
     let shader = HostShader {

@@ -1559,6 +1559,7 @@ fn build_lanes_cs(body: &[u32]) -> Result<HostShader, String> {
         console_cf: false,
         per_lane_only: false,
         local: false,
+        paired: false,
     })
     .map_err(|e| format!("{e:?}"))?;
     Ok(HostShader {

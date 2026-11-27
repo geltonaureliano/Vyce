@@ -274,6 +274,7 @@ launcher):
 | VICTORY_EXACT_NORM=0 | Códigos normalizados (UNORM/SNORM) de buffers voltam a ser divididos pela GPU, que erra o último bit em 126 dos 256 códigos de 8 bits nesta placa (materiais trocados) |
 | VICTORY_D16_INTEGER=0 | Dados de 16 bits de vistas de formato inteiro voltam a passar por f16 (viravam ruído) |
 | VICTORY_WAVE_FORMS=0 | Programas wave64 recusados não são tentados de novo sem os saltos de saída antecipada |
+| VICTORY_WAVE_PAIRS=0 | Programas wave64 de compute que nenhuma outra forma aceita voltam a ser recusados (os passes deles são descartados), em vez de rodar em pares de lanes: uma onda de 32 da placa para cada onda de 64 do console, cada thread com duas lanes do console |
 | VICTORY_LDS_LOCAL=0 | Grupos de uma onda com memória compartilhada voltam ao fluxo do console (com uma barreira em cada troca) em vez de duas ondas locais de 32 |
 | VICTORY_LOCAL_MEET_CHECKS=0 | As duas ondas locais voltam a se encontrar onde o fork as punha: também dentro de laços que cada thread deixa numa volta diferente, dentro de desvios em valores que as duas ondas podem ter diferentes (leitura de uma lane, inclusive de um acumulador como `v_fmac_f32` ou de uma seleção por máscara constante, e leitura escalar de memória escrita enquanto o dispatch roda) e em programas que acessam memória por endereço. Só para comparação: pode travar a GPU |
 | VICTORY_LOOP_EARLY_OUTS=0 | As formas sem saída antecipada voltam a tirar também a saída de dentro de um laço, mesmo quando é a única saída dele (as threads giram até o limite de voltas). Só para comparação: pode travar a GPU |
@@ -674,3 +675,80 @@ toma a nossa escrita como do jogo; a leitura da variável, os tíquetes e a
 comparação), também com VICTORY_TEXTURE_BACK=0; victory-hle com 99
 passando e os 5 testes de xmem que já falhavam; a build release passa.
 Ainda não foi medida em jogo.
+
+## Fase 2: programas wave64 em pares de lanes (vyce/wt-pairs)
+
+Os quatro programas de compute wave64 que nenhuma forma de 32 lanes
+aceitava agora traduzem exatos e montam pipeline na RTX 2070 SUPER:
+
+| Programa | O que faz | Antes |
+| --- | --- | --- |
+| CS_ShadowUnifiedClearRaster (0c028454b58543f0) | Cabeça da cadeia das sombras em blocos: zera contadores e imagens e prepara os registros que os resolves das sombras leem | Descartado a cada quadro; o suspeito mais forte das sombras escuras em blocos e de parte da imagem escura |
+| CS_DefragHeap_ComputeRelocations (02384a60fda6f2d0) | Planeja a compactação do heap de índices das partículas (VFX) | Descartado a cada quadro: o heap nunca era compactado |
+| CS_SortRayTiles (a1bf269d5b19f025) | Ordena os tiles de raios | Descartado a cada quadro: tiles fora de ordem |
+| CS_AssembleComputeList (b0d5ffa0801b7450) | Monta uma lista de tiles de 16x16 | Nunca ligado nas sessões registradas |
+
+Como funciona (a forma em pares, `emit::paired`): cada onda de 64 lanes do
+console roda numa onda de 32 da placa, e cada thread faz o trabalho de duas
+lanes do console, a n e a n + 32. O programa roda como no console: cada
+desvio é tomado pela onda inteira e o EXEC guarda cada instrução de lane,
+então as ondas de um grupo podem seguir caminhos diferentes e se encontram
+nas barreiras do próprio programa. Máscaras lidas inteiras, leituras de
+outras lanes e as reduções e somas da onda leem as duas lanes de cada
+thread da onda, sem troca pela memória compartilhada. O grupo tem 32
+threads por onda do console; a única barreira a mais é a da entrada, onde
+cada onda da placa pega a próxima onda do console de um contador. Vem do
+fxceless/victory-fork#854 (PiloteCode; victory-3060TI 26600c6 e p1nkman-VI;
+GPL-3.0), adaptado ao fluxo do console do Vyce.
+
+É a última tentativa do tradutor: só entra num programa wave64 de compute
+que todas as outras formas recusam. Nos 12.919 contêineres do laboratório
+nenhum programa que já traduzia mudou; além dos quatro, nove do mesmo tipo
+que nunca foram ligados nas sessões registradas passam a traduzir também
+(outra variante do DefragHeap, CS_ShadowUnifiedClearRT, quatro
+CS_Compact*Classification, dois CS_BuildProjDecalTrail* e
+CS_ScreenProbes_TraceRays_Fallback). A versão 0 recusa, e o programa fica
+descartado como antes: grupos que não enchem as ondas do console, memória
+por endereço, memória privada, DPP, permutações, escritas de lane e
+derivadas fora das seções da onda, e somas de float da onda (o console
+soma na ordem dele).
+
+Duas suposições, como já nas outras formas de uma onda com memória
+compartilhada: as threads de uma onda da placa rodam juntas quando seguem
+o mesmo caminho (as duas lanes de uma onda do console se passam valores
+pela memória compartilhada sem barreira, com uma cerca entre os acessos);
+e uma onda parada pelo limite de voltas de laço sai do programa sem
+segurar as outras numa barreira (a NVIDIA conta só as threads que não
+terminaram). O D3D12 não promete nenhuma das duas.
+
+O tradutor mudou: a primeira sessão traduz tudo de novo. Rode o warm antes
+de jogar (ver "Cache pronto antes de jogar"), com as chaves que o jogo vai
+usar: VICTORY_WAVE_PAIRS=0 é outro cache.
+
+| O que mudou | Para voltar ao de antes |
+| --- | --- |
+| Programas wave64 de compute que nenhuma outra forma aceita rodam em pares de lanes (uma onda de 32 da placa por onda do console, duas lanes do console por thread) | VICTORY_WAVE_PAIRS=0 |
+
+Testada pelo heavy.sh na RTX 2070 SUPER: victory-shader com 320 passando e
+as 4 valu_tests que já falhavam na NVIDIA. Os 10 testes novos
+(`emit::paired_tests`, também com o validador em VICTORY_DXIL) rodam na
+placa programas montados à mão nos padrões
+dos quatro, cada um contra um modelo na CPU do que as ondas do console
+calculam: duas ondas em laços de tamanhos diferentes com a lane 63 passando
+um valor pela memória compartilhada sem barreira (5 e 9 voltas, e 1.000 e
+1.001), o "algum" de cada onda em volta de mínimo e máximo da onda com o
+slot da primeira lane, uma ordenação por contagem com laços enquanto
+alguma lane tem registros, somas prefixadas e os totais da lane 63, e as
+contagens "algum e algum" em duas rodadas anexadas a uma lista; os casos
+do fluxo do console em grupos de uma, duas e quatro ondas; e a primeira
+lane ativa vinda da metade de cima, ou a lane 0 quando nenhuma está. Um
+ballot, uma
+leitura de lane ou um total errados na metade de cima fazem esses testes
+falharem (conferido). Nos 12.919 contêineres do laboratório (32 lanes,
+vistas exatas): nenhuma tradução mudou, 13 passaram a traduzir (os quatro e
+os nove acima); o validador da Microsoft deu 11.212 válidos, 1.707
+recusados e nenhum inválido; o conjunto de compute usado deu 672 pipelines
+montados na placa, nenhuma falha e os mesmos 35 recusados (endereço num
+SGPR), os quatro entre os montados; os nove também montam (o maior, com 320
+KB de DXIL, em 3,5 s). A build release passa. Ainda não foi medida em
+jogo.
