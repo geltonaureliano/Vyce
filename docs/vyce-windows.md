@@ -122,6 +122,27 @@ extra para tabelas reduz a faixa de índices que o título pode usar
 diretamente. Para comparar com a divisão anterior, defina
 VICTORY_CAPPED_DYNAMIC=65536 no processo que chama o launcher.
 
+Os descritores dinâmicos das tabelas de uma lista voltam assim que a GPU
+termina a última submissão dela (antes voltavam só quando o jogo reiniciava
+ou soltava a lista, o que numa sessão no mundo chegou a 249.113 ocupados e
+uma vez faltou). Isso vale para as listas que o jogo já mostrou usar uma vez
+por gravação (ele reiniciou uma gravação dela enviada uma vez só); a
+primeira gravação de cada lista guarda os descritores até reiniciar, como
+antes, e uma lista que o jogo enviou de novo sem reiniciar passa a guardá-los
+assim em todas as gravações. Os descritores devolvidos ficam emprestados:
+outra tabela só os toma quando não acha outros livres (campo lent_taken). Se
+o jogo enviar de novo uma gravação que já rodou, ela pega de volta os mesmos
+descritores; se outra tabela já tiver
+tomado algum, a lista inteira (todas as partes dela) roda sem os seus
+comandos nesse envio e em todos os seguintes, até o jogo reiniciar a lista
+(aviso "a list submitted again after other tables took its descriptor slots
+runs without its commands until its reset", campo tables_lost); as escritas
+de fim de lista e as transições das texturas continuam. O aviso "a list
+submitted again keeps its descriptor tables until its reset" diz que o jogo
+envia gravações de novo. Uma tabela que não acha descritores livres espera
+a submissão mais antiga em voo terminar e tenta de novo uma vez antes de ser
+descartada.
+
 O limite padrão de loops dos shaders permanece o mesmo. Após aprovar o
 próximo teste, pode-se escolher um limite explícito com
 -ShaderLoopLimit 4096. O cache distingue o limite escolhido. Valores menores
@@ -236,6 +257,9 @@ Chaves de comparação do trabalho da CPU (todas ligadas por padrão; o valor
 | VYCE_JOIN_COPIES=0 | Cópias do jogo que continuam a anterior ficam em passos separados |
 | VYCE_LAZY_PRELUDE=0 | Toda lista nasce com a sua lista de transições, use ou não |
 | VYCE_SHARED_LOOKUPS=0 | As buscas de memória das gravações tomam a tabela só para si |
+| VICTORY_FREE_TABLES_AT_LANDING=0 | Os descritores dinâmicos das tabelas de uma lista só voltam quando o jogo reinicia ou solta a lista, sem empréstimo, espera nem nova tentativa quando faltam (hoje voltam quando a GPU termina a última submissão da lista, para as listas que o jogo usa uma vez por gravação) |
+| VICTORY_TABLE_RETRY_MS=0 | Uma tabela sem descritores dinâmicos livres é descartada na hora (hoje espera até 100 ms a submissão mais antiga em voo terminar e tenta de novo uma vez; outro número muda essa espera, no máximo 2000) |
+| VICTORY_NULL_COPY=0 | Uma cópia pedida pelo jogo à memcpy do VCRUNTIME140 a partir da página nula volta a encerrar o processo (hoje, só nesse caso estreito, o destino recebe zeros e a chamada volta; é a queda da missão do barco, aviso "a copy from the null page read as zeros") |
 
 Campos de VYCE_TELEMETRY desse trabalho (por quadro): gpu_idle_ms (GPU
 parada entre submissões), wait_*_ms e drains_* (tempo e número de esperas
@@ -243,7 +267,13 @@ pela GPU por motivo: execute, signal, work, held, present, fence, list),
 late_signals, late_waits, landed e landed_here (submissões encerradas, e
 as encerradas por quem precisou antes da thread própria), ecl_calls,
 host_lists, watch_asks, watch_ms e watch_ahead (perguntas ao kernel e
-respostas do grupo), copies_joined, flights_max.
+respostas do grupo), copies_joined, flights_max, slots_max (descritores
+dinâmicos ocupados no máximo), slots_freed_at_landing (devolvidos quando a
+submissão da lista terminou), table_retries e table_retry_ms (tabelas sem
+descritores livres que esperaram uma submissão terminar, e o tempo dessa
+espera), tables_lost (envios de listas reenviadas que rodaram sem os seus
+comandos), lent_taken (descritores emprestados que outra tabela tomou por
+falta de outros livres).
 
 ### O que veio do Belobug (belobug/main até 4f62c2a)
 

@@ -40,6 +40,8 @@ pub fn run(
     let image = victory_loader::load(&prepared, &images)?;
     drop(prepared);
     victory_hle::runtime::set_main_image(image.base());
+    // Its copies from the null page read as zeros (`VICTORY_NULL_COPY`).
+    victory_loader::title_code(image.base(), image.info().size_of_image as usize);
     victory_hle::runtime::set_image_path(image.base(), exe);
     println!(
         "mapped at      {:#x} (preferred {:#x})",

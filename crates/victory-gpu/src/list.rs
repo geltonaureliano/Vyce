@@ -127,6 +127,16 @@ struct List {
     parts: std::cell::UnsafeCell<Vec<Arc<crate::host::HostList>>>,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
+    /// The title submitted a recording of this list again: its recordings
+    /// keep their tables until their reset ([`submit`]).
+    #[cfg(windows)]
+    repeats: std::sync::atomic::AtomicBool,
+    /// The title reset a recording of this list it had submitted once:
+    /// from then on, unless it [`List::repeats`], its recordings lend their
+    /// tables at their landing (`crate::host::HostList::submitting`).
+    /// Until then they keep them until their reset, as before.
+    #[cfg(windows)]
+    once: std::sync::atomic::AtomicBool,
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
@@ -189,6 +199,42 @@ pub(crate) fn submitted(this: This) -> Vec<Submitted> {
         (&*list.parts.get(), &*list.host.get())
     };
     parts.iter().chain(host).cloned().map(Submitted).collect()
+}
+
+/// [`submitted`], for a submission of the title's: each host list counts
+/// it until it has landed, and takes back the tables it lent if the title
+/// submits it again; if one cannot, none of the list's parts runs its
+/// commands until the list's reset (`crate::host::submitting`).
+#[cfg(windows)]
+pub(crate) fn submit(this: This) -> Vec<Submitted> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let runs = submitted(this);
+    if runs.is_empty() {
+        return runs;
+    }
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    let before = list.repeats.load(Relaxed);
+    let lends = list.once.load(Relaxed) && !before;
+    let s = crate::host::submitting(runs.iter().map(|r| &**r), lends);
+    if s.lost {
+        crate::telemetry::count(crate::telemetry::Count::TablesLost, 1);
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                "a list submitted again after other tables took its descriptor slots runs \
+                 without its commands until its reset"
+            )
+        });
+    }
+    if s.again && !before {
+        list.repeats.store(true, Relaxed);
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::info!("a list submitted again keeps its descriptor tables until its reset")
+        });
+    }
+    runs
 }
 
 /// Cuts a list's recording before a wait, if work precedes it: the rest goes
@@ -311,6 +357,10 @@ impl Drop for List {
                 std::mem::take(&mut self.state),
             )));
         }
+        // Nothing submits these again; their tables go when they have run.
+        for part in self.parts.get_mut().iter().chain(self.host.get_mut().iter()) {
+            part.parted();
+        }
     }
 }
 
@@ -401,6 +451,10 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
         parts: Default::default(),
         #[cfg(windows)]
         state: Default::default(),
+        #[cfg(windows)]
+        repeats: Default::default(),
+        #[cfg(windows)]
+        once: Default::default(),
     });
     object::hand_out(LIST, list, iid, &LIST_IIDS, out)
 }
@@ -453,8 +507,17 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         };
         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
         state.end_hoist();
+        // A recording submitted once, then reset: the title submits this
+        // list's recordings once each (until it does not, `repeats`).
+        if host.as_ref().is_some_and(|h| h.submitted_once()) {
+            // SAFETY: as above.
+            unsafe { &(*this.cast::<List>()).once }.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         // SAFETY: as above.
         let parts = unsafe { &mut *(*this.cast::<List>()).parts.get() };
+        for part in parts.iter() {
+            part.parted();
+        }
         {
             let mut parted = PARTED.lock().unwrap_or_else(|e| e.into_inner());
             parted.extend(parts.drain(..).map(Submitted));
@@ -463,6 +526,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
             // A submission of it is still to run, with the memory and the
             // descriptors it was recorded with.
             old.keep_until_run(Box::new((std::mem::take(&mut *uploads), std::mem::take(&mut *state))));
+            old.parted();
             PARTED.lock().unwrap_or_else(|e| e.into_inner()).push(Submitted(old));
             *host = spare();
             if host.is_none() {
@@ -2233,6 +2297,44 @@ mod tests {
             assert!(parts[1].unmet().is_empty());
             crate::host::host().unwrap().execute(&[&*parts[1]]);
         }
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// A title's list is known to submit each recording once after it reset
+    /// one it had submitted once (not one it never submitted), and whose
+    /// recording is submitted again is marked so (its recordings keep their
+    /// tables until their reset); one reset between two submissions is not.
+    #[cfg(windows)]
+    #[test]
+    fn a_list_submitted_again_is_marked_so() {
+        use std::sync::atomic::Ordering::Relaxed;
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let (mut allocator, mut list) = (null, null);
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        assert_eq!(new_list(0, allocator, &LIST_IIDS[0], &mut list), S_OK);
+        let marks = || {
+            // SAFETY: one of our lists, alive until released below.
+            let l = unsafe { &*list.cast::<List>() };
+            (l.once.load(Relaxed), l.repeats.load(Relaxed))
+        };
+        assert_eq!(close(list), S_OK);
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert_eq!(marks(), (false, false), "reset unsubmitted");
+        assert_eq!(close(list), S_OK);
+        assert_eq!(submit(list).len(), 1);
+        assert_eq!(marks(), (false, false));
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert_eq!(marks(), (true, false), "reset after one submission");
+        assert_eq!(close(list), S_OK);
+        assert_eq!(submit(list).len(), 1);
+        assert_eq!(marks(), (true, false), "a reset in between");
+        assert_eq!(submit(list).len(), 1);
+        assert_eq!(marks(), (true, true), "submitted again");
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);

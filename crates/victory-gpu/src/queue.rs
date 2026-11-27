@@ -163,7 +163,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
-        let runs: VecDeque<_> = lists.iter().flat_map(|&l| crate::list::submitted(l)).collect();
+        let runs: VecDeque<_> = lists.iter().flat_map(|&l| crate::list::submit(l)).collect();
         queue(this)
             .timeline
             .submit(Op::Lists(Box::new(Submission { host, runs })));

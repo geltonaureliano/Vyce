@@ -115,7 +115,9 @@ pub(crate) struct State {
     /// offset of its fresh table. Kept to reuse its storage across draws.
     made: Vec<(u8, u32)>,
     /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
+    /// back when the list is reset or released. Only with
+    /// `VICTORY_FREE_TABLES_AT_LANDING=0`: else the host list they were
+    /// recorded into holds them (`crate::host::HostList::hold_table`).
     dynamic: Vec<(usize, u32, u32)>,
     /// Whether the last [`State::bind`] left a used unordered access view
     /// with nothing behind it (a null view).
@@ -1482,7 +1484,23 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            // Slots come back when the submissions of lists that hold them
+            // land: before a table goes without, the oldest in flight is
+            // waited for, once (`HostList::room_for_tables`).
+            let at_landing = crate::host::free_tables_at_landing();
+            let taken = if at_landing {
+                host.take_dynamic(n, false).or_else(|| {
+                    (host.could_fit(n) && list.room_for_tables(host))
+                        .then(|| host.take_dynamic(n, true))
+                        .flatten()
+                })
+            } else {
+                host.dynamic(n).map(|first| (first, 0))
+            };
+            let Some((first, tag)) = taken else {
+                if at_landing {
+                    host.not_made(n);
+                }
                 // A table holding constants made from the title's slots
                 // would view them misaligned: the draw is dropped. Other
                 // tables fall back to the title's slots.
@@ -1502,8 +1520,12 @@ impl State {
             if n >= LARGE {
                 self.large_tables.entry(table).or_default().push((records, first));
             }
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            // The host list holds them until its submissions are done with
+            // them; as before, the title's list holds them until its reset.
+            match heap.host_arc().filter(|_| at_landing) {
+                Some(heap) => list.hold_table(crate::host::Table { heap, first, n, tag }),
+                None => self.dynamic.push((std::ptr::from_ref(heap) as usize, first, n)),
+            }
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {

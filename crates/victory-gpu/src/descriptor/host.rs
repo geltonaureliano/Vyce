@@ -38,13 +38,16 @@ pub(crate) struct HostHeap {
     /// slot viewing a pooled texture, so the backing heap cannot be freed while
     /// a shader-visible descriptor slot still points into it.
     kept_textures: Mutex<HashMap<u32, Arc<crate::resource::HostTexture>>>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    /// Where the next search starts, the slots taken, and the smallest run
-    /// known not to be free since the last release (`usize::MAX`: none).
-    next: Mutex<(u32, Vec<bool>, usize)>,
+    /// The dynamic slots: which are taken (by lists whose submissions may
+    /// still read them), where the next search starts, and the tag of the
+    /// table each slot was last taken for ([`Free`]).
+    next: Mutex<Free>,
     /// How many of them are taken (for the session panel).
     taken: AtomicU64,
+    /// How many were given back so far, and that count when a table's wait
+    /// for a landing last gave none back (`u64::MAX`: it did, or none
+    /// waited): `crate::host::HostList::room_for_tables`.
+    released: [AtomicU64; 2],
     /// Per-slot element byte stride (`u32`) for structured buffers whose
     /// stride shader analysis could not recover statically.
     strides: Option<StrideTable>,
@@ -69,6 +72,49 @@ pub(crate) struct HostHeap {
 
 /// The dword of the stride table the element counts start at.
 const COUNTS_AT: u32 = victory_shader::emit::OWN_SLOTS;
+
+/// A heap's dynamic slots ([`HostHeap::take_dynamic`]).
+struct Free {
+    /// Where the next search starts.
+    next: u32,
+    taken: Vec<bool>,
+    /// The smallest run known not to be free since the last release
+    /// (`usize::MAX`: none).
+    no_run: usize,
+    /// The tag of the table each slot was last taken for (0: none yet). A
+    /// slot keeps it when given back, so a list submitted again can tell its
+    /// slots were not taken since ([`HostHeap::retake`]).
+    tags: Vec<u64>,
+    /// The last tag given.
+    tag: u64,
+    /// Free slots lent by a recording the title may submit again
+    /// ([`HostHeap::give_back`]): a table takes them only when no run of
+    /// other free slots fits it, so that recording finds them as it left
+    /// them more often.
+    lent: Vec<bool>,
+    /// How many slots are lent.
+    lent_count: usize,
+    /// The smallest run of free slots not lent known not to be there since
+    /// such slots last came (`usize::MAX`: none).
+    no_clean_run: usize,
+    /// The presented frame, the searches in it that found no run of free
+    /// slots not lent, and the smallest size they looked for.
+    clean_misses: (u64, u64, usize),
+}
+
+/// A run of dynamic slots a table took: the first's index, how many, and
+/// the tag they were taken with ([`HostHeap::take_dynamic`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Run {
+    pub(crate) first: u32,
+    pub(crate) n: u32,
+    pub(crate) tag: u64,
+}
+
+/// Runs given back or taken back under one hold of the heap's lock: a
+/// world list holds thousands, and recording threads search the slots
+/// under the same lock.
+const RUNS_A_LOCK: usize = 1024;
 
 struct StrideTable {
     _resource: ID3D12Resource,
@@ -592,7 +638,10 @@ pub(crate) const PORTABLE_VIEWS: u32 = 1_000_000;
 
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
-/// took until it is reset (its submissions have run) or released. A world
+/// took until its last submission has landed, if the title is known to
+/// submit its recordings once (`crate::host::HostList::landed`), else, and
+/// with `VICTORY_FREE_TABLES_AT_LANDING=0`, until it is reset (its
+/// submissions have run) or released. A world
 /// frame of some 7,000 draws held over 400,000 of 2^19, and tables of 150
 /// slots no longer fit: the draws that needed them were dropped (the
 /// subsurface resolve, tree imposters). `victory_shader::emit::VIEW_SLOTS`
@@ -890,8 +939,19 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             kept_textures: Mutex::default(),
-            next: Mutex::new((0, taken, usize::MAX)),
+            next: Mutex::new(Free {
+                next: 0,
+                tags: vec![0; taken.len()],
+                lent: vec![false; taken.len()],
+                taken,
+                no_run: usize::MAX,
+                tag: 0,
+                lent_count: 0,
+                no_clean_run: usize::MAX,
+                clean_misses: (u64::MAX, 0, usize::MAX),
+            }),
             taken: AtomicU64::new(reserved),
+            released: [AtomicU64::new(0), AtomicU64::new(u64::MAX)],
             strides,
             bindless: Mutex::default(),
             recording: std::sync::atomic::AtomicBool::new(false),
@@ -1011,6 +1071,34 @@ impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps and capped sampler
     /// heaps), taken until [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
+        let taken = self.take_dynamic(n, false).map(|(first, _)| first);
+        if taken.is_none() {
+            self.not_made(n);
+        }
+        taken
+    }
+
+    /// Logs, once, that a table of `n` entries found no free dynamic slots
+    /// and is not made.
+    pub(crate) fn not_made(&self, n: u32) {
+        // (Tables larger than all of them are told of where they are refused.)
+        if n == 0 || self.spare == 0 || n > self.spare {
+            return;
+        }
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let spare = self.spare;
+        ONCE.call_once(|| {
+            tracing::warn!(n, spare, "no free dynamic descriptor slots: a table is not made")
+        });
+    }
+
+    /// [`HostHeap::dynamic`], with the tag the slots were taken with
+    /// ([`HostHeap::retake`]), and without its warning. `again`: after
+    /// slots came back for a table that found none
+    /// (`crate::host::HostList::room_for_tables`), which walks the slots
+    /// even if tables of its size failed often in this frame (once, and
+    /// not counted with those failures).
+    pub(crate) fn take_dynamic(&self, n: u32, again: bool) -> Option<(u32, u64)> {
         if n == 0 || self.spare == 0 {
             return None;
         }
@@ -1028,13 +1116,13 @@ impl HostHeap {
         }
         let spare = self.spare as usize;
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken, no_run) = &mut *guard;
+        let free = &mut *guard;
         let n = n as usize;
         // A search that found no run of this size (or of a smaller one)
         // since the last release finds none now: without this, each table
         // of a frame that does not fit walked all the slots again, and a
         // heavy place took 7 to 11 seconds a frame (runs sw1, sw2).
-        if n >= *no_run {
+        if n >= free.no_run {
             return None;
         }
         // Releases come all the time and each allows a search again: no
@@ -1047,37 +1135,74 @@ impl HostHeap {
             FAILED[1].store(0, Ordering::Relaxed);
             FAILED[2].store(u64::MAX, Ordering::Relaxed);
         }
-        if FAILED[1].load(Ordering::Relaxed) >= WALKS
+        if !again
+            && FAILED[1].load(Ordering::Relaxed) >= WALKS
             && n as u64 >= FAILED[2].load(Ordering::Relaxed)
         {
             return None;
         }
+        // Slots lent by a recording the title may submit again are taken
+        // last: a run of others is looked for through all the slots, unless
+        // none of this size was there since such slots last came, or such
+        // searches failed often in this frame (each walks all the slots).
+        if free.clean_misses.0 != frame {
+            free.clean_misses = (frame, 0, usize::MAX);
+        }
+        let clean = free.lent_count > 0
+            && n < free.no_clean_run
+            && (free.clean_misses.1 < WALKS || n < free.clean_misses.2);
         // Search from `next` on, then from the start.
-        let starts = (*next as usize..spare).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
+        let starts = (free.next as usize..spare).chain(0..free.next as usize);
+        let (mut run, mut clean_run) = (0, 0);
+        let (mut found, mut found_clean) = (None, None);
         let mut last = usize::MAX;
         for at in starts {
             // A run cannot wrap past the end.
             if at != last.wrapping_add(1) {
-                run = 0;
+                (run, clean_run) = (0, 0);
             }
             last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
+            if free.taken[at] {
+                (run, clean_run) = (0, 0);
+                continue;
+            }
+            run += 1;
+            clean_run = if free.lent[at] { 0 } else { clean_run + 1 };
+            if clean_run == n {
+                found_clean = Some(at + 1 - n);
                 break;
             }
+            if run == n && found.is_none() {
+                found = Some(at + 1 - n);
+                if !clean {
+                    break;
+                }
+            }
         }
-        let Some(first) = found else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, spare, "no free dynamic descriptor slots: a table is not made"));
-            *no_run = n;
-            FAILED[1].fetch_add(1, Ordering::Relaxed);
-            FAILED[2].fetch_min(n as u64, Ordering::Relaxed);
+        if clean && found_clean.is_none() {
+            free.no_clean_run = n;
+            free.clean_misses.1 += 1;
+            free.clean_misses.2 = free.clean_misses.2.min(n);
+        }
+        let Some(first) = found_clean.or(found) else {
+            free.no_run = n;
+            if !again {
+                FAILED[1].fetch_add(1, Ordering::Relaxed);
+                FAILED[2].fetch_min(n as u64, Ordering::Relaxed);
+            }
             return None;
         };
-        taken[first..first + n].fill(true);
+        // The recording that lent them loses them: it does not run again.
+        let lent = free.lent[first..first + n].iter().filter(|&&l| l).count();
+        if lent > 0 {
+            free.lent[first..first + n].fill(false);
+            free.lent_count -= lent;
+            crate::telemetry::count(crate::telemetry::Count::LentTaken, lent as u64);
+        }
+        free.taken[first..first + n].fill(true);
+        free.tag += 1;
+        let tag = free.tag;
+        free.tags[first..first + n].fill(tag);
         let held = self.taken.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
         crate::telemetry::note(crate::telemetry::Gauge::Slots, held);
         #[cfg(feature = "diagnostics")]
@@ -1085,12 +1210,99 @@ impl HostHeap {
             static MADE: AtomicU64 = AtomicU64::new(0);
             let before = MADE.fetch_add(n as u64, Ordering::Relaxed);
             if before >> 20 != (before + n as u64) >> 20 {
-                let used = taken.iter().filter(|t| **t).count();
+                let used = free.taken.iter().filter(|t| **t).count();
                 tracing::info!(used, spare, "dynamic descriptor slots");
             }
         }
-        *next = ((first + n) % spare) as u32;
-        Some(self.count + first as u32)
+        free.next = ((first + n) % spare) as u32;
+        Some((self.count + first as u32, tag))
+    }
+
+    /// The dynamic slots of `run`, as indices into [`Free`]'s vectors.
+    fn slots_of(&self, run: &Run) -> Option<std::ops::Range<usize>> {
+        let at = run.first.checked_sub(self.count)? as usize;
+        let end = at.checked_add(run.n as usize)?;
+        (run.n > 0 && end <= self.spare as usize).then_some(at..end)
+    }
+
+    /// Takes the slots of `runs` again, for a recording the title submits
+    /// again after it gave them back (`crate::host::HostList::submitting`):
+    /// all of them, or none if any is taken or a table took it since it
+    /// was taken with its run's tag (it no longer holds what the
+    /// recording's commands read). Under one hold of the lock.
+    pub(crate) fn retake(&self, runs: &[Run]) -> bool {
+        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let free = &mut *guard;
+        let mut slots = Vec::with_capacity(runs.len());
+        for run in runs {
+            let Some(at) = self.slots_of(run) else {
+                return false;
+            };
+            if free.taken[at.clone()].iter().any(|&t| t) || free.tags[at.clone()].iter().any(|&t| t != run.tag) {
+                return false;
+            }
+            slots.push(at);
+        }
+        let mut n = 0;
+        for at in slots {
+            let lent = free.lent[at.clone()].iter().filter(|&&l| l).count();
+            free.lent[at.clone()].fill(false);
+            free.lent_count -= lent;
+            n += at.len() as u64;
+            free.taken[at].fill(true);
+        }
+        let held = self.taken.fetch_add(n, Ordering::Relaxed) + n;
+        crate::telemetry::note(crate::telemetry::Gauge::Slots, held);
+        true
+    }
+
+    /// Gives back the slots of `runs` that are still the recording's (taken,
+    /// or lent, with their run's tag): with `lend`, lent while the title may
+    /// submit the recording again ([`HostHeap::retake`]), else for good.
+    /// A few lock holds for all of them. How many came free.
+    pub(crate) fn give_back(&self, runs: &[Run], lend: bool) -> u64 {
+        let mut freed = 0;
+        for chunk in runs.chunks(RUNS_A_LOCK) {
+            let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+            let free = &mut *guard;
+            let (mut came, mut cleaned) = (0, 0);
+            for run in chunk {
+                let Some(at) = self.slots_of(run) else { continue };
+                for i in at {
+                    if free.tags[i] != run.tag {
+                        // Another table's since.
+                    } else if free.taken[i] {
+                        free.taken[i] = false;
+                        free.lent[i] = lend;
+                        came += 1;
+                    } else if free.lent[i] && !lend {
+                        free.lent[i] = false;
+                        cleaned += 1;
+                    }
+                }
+            }
+            if lend {
+                free.lent_count += came;
+            } else {
+                free.lent_count -= cleaned;
+            }
+            if came > 0 {
+                self.taken.fetch_sub(came as u64, Ordering::Relaxed);
+                self.released[0].fetch_add(came as u64, Ordering::AcqRel);
+                free.no_run = usize::MAX;
+            }
+            if !lend && came + cleaned > 0 {
+                free.no_clean_run = usize::MAX;
+            }
+            freed += came as u64;
+        }
+        freed
+    }
+
+    /// How many dynamic slots are lent ([`HostHeap::give_back`]).
+    #[cfg(test)]
+    pub(crate) fn lent(&self) -> usize {
+        self.next.lock().unwrap_or_else(|e| e.into_inner()).lent_count
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -1108,13 +1320,48 @@ impl HostHeap {
             return;
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let free = &mut *guard;
         let end = at.saturating_add(n).min(self.spare) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
+        if let Some(slots) = free.taken.get_mut(at as usize..end) {
             let held = slots.iter().filter(|&&t| t).count();
             self.taken.fetch_sub(held as u64, Ordering::Relaxed);
+            self.released[0].fetch_add(held as u64, Ordering::AcqRel);
             slots.fill(false);
         }
-        guard.2 = usize::MAX;
+        if let Some(lent) = free.lent.get_mut(at as usize..end) {
+            free.lent_count -= lent.iter().filter(|&&l| l).count();
+            lent.fill(false);
+        }
+        free.no_run = usize::MAX;
+        free.no_clean_run = usize::MAX;
+    }
+
+    /// Whether a table of `n` entries fits in the dynamic slots once enough
+    /// are free.
+    pub(crate) fn could_fit(&self, n: u32) -> bool {
+        n > 0 && n <= self.spare
+    }
+
+    /// How many dynamic slots were given back so far.
+    pub(crate) fn released(&self) -> u64 {
+        self.released[0].load(Ordering::Acquire)
+    }
+
+    /// What [`HostHeap::released`] was when a table's wait for a landing
+    /// last gave no slot back (`u64::MAX`: none such since one did).
+    pub(crate) fn dry(&self) -> u64 {
+        self.released[1].load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_dry(&self, released: u64) {
+        self.released[1].store(released, Ordering::Release);
+    }
+
+    /// A sampler heap past the host's limit, with its dynamic slots, and
+    /// how many those are.
+    #[cfg(test)]
+    pub(crate) fn capped_samplers() -> Option<(Arc<HostHeap>, u32)> {
+        Some((Arc::new(HostHeap::new(true, 4 * SAMPLERS)?), SAMPLER_DYNAMIC))
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -3587,7 +3834,7 @@ void main() {
         // (A host that caps its heaps gives the title all the others.)
         let start = heap.count();
         // (The last one may be kept null for wild indices.)
-        let spare = heap.next.lock().unwrap().1.iter().filter(|t| !**t).count() as u32;
+        let spare = heap.next.lock().unwrap().taken.iter().filter(|t| !**t).count() as u32;
         let a = heap.dynamic(spare - 100).unwrap();
         let b = heap.dynamic(60).unwrap();
         assert_eq!((a, b), (start, start + spare - 100));
@@ -3613,6 +3860,61 @@ void main() {
         assert_eq!(heap.dynamic(1), None);
         heap.release(a, 8);
         assert_eq!(heap.dynamic(8), Some(count));
+    }
+
+    /// Slots lent by a recording the title may submit again are taken by
+    /// another table only when no run of other free slots fits it; the
+    /// recording takes back all of its runs, or none once one was taken,
+    /// and its runs given back for good leave others' slots alone.
+    #[test]
+    fn lent_slots_are_taken_last() {
+        let Some((heap, slots)) = HostHeap::capped_samplers() else {
+            return; // no host GPU
+        };
+        let take = |n: u32| {
+            let (first, tag) = heap.take_dynamic(n, true).expect("free slots");
+            Run { first, n, tag }
+        };
+        let a = take(8);
+        let b = take(slots - 16);
+        let c = take(8);
+        assert_eq!((a.first + 8, b.first + slots - 16), (b.first, c.first));
+        // `a` lent and `c` given back for good: the next search starts at
+        // `a`, and takes `c`.
+        assert_eq!(heap.give_back(&[a], true), 8);
+        assert_eq!(heap.give_back(&[c], false), 8);
+        assert_eq!(heap.lent(), 8);
+        let d = take(8);
+        assert_eq!((d.first, heap.lent()), (c.first, 8));
+        // Then `a`'s, the only ones free: `a` cannot take them back.
+        let e = take(8);
+        assert_eq!((e.first, heap.lent()), (a.first, 0));
+        assert!(!heap.retake(&[a]));
+        assert_eq!(heap.give_back(&[a], false), 0, "another table's slots");
+        assert_eq!(heap.take_dynamic(1, true), None);
+        // All of a recording's runs, or none.
+        assert_eq!(heap.give_back(&[d, e], true), 16);
+        assert_eq!(heap.lent(), 16);
+        let f = take(4);
+        assert_eq!(f.first, d.first);
+        assert!(!heap.retake(&[e, d]), "a run of it was taken");
+        assert_eq!(heap.lent(), 12);
+        assert!(heap.retake(&[e]));
+        assert_eq!(heap.lent(), 4);
+        // Given back for good: lent no longer, free all the same, and the
+        // part another table took left alone.
+        assert_eq!(heap.give_back(&[d], false), 0);
+        assert_eq!(heap.lent(), 0);
+        assert_eq!(heap.take_dynamic(4, true).map(|t| t.0), Some(d.first + 4));
+        // A table that took part of a lent run and gave it back made it
+        // another's all the same.
+        assert_eq!(heap.give_back(&[e], true), 8);
+        let g = take(3);
+        assert_eq!((g.first, heap.lent()), (e.first, 5));
+        heap.release(g.first, 3);
+        assert!(!heap.retake(&[e]));
+        assert_eq!(heap.give_back(&[e], false), 0);
+        assert_eq!(heap.lent(), 0);
     }
 
     /// A sampler heap within the limit has a slot per title slot and no

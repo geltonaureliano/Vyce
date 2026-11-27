@@ -425,6 +425,10 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
+    if null_copies() && unsafe { null_copy(info) } {
+        return -1; // EXCEPTION_CONTINUE_EXECUTION
+    }
+    // SAFETY: as above.
     let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
     if FATAL.contains(&code) {
         let to_file =
@@ -433,6 +437,231 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         unsafe { report("first-chance exception", info, to_file) };
     }
     EXCEPTION_CONTINUE_SEARCH
+}
+
+/// Whether a copy the title asks of the C runtime from the null page reads
+/// as zeros ([`null_copy`]; `VICTORY_NULL_COPY=0`: the process ends there,
+/// as before).
+fn null_copies() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NULL_COPY").is_none_or(|v| v != "0"))
+}
+
+/// The title's image (start, end), the only code whose copies from the
+/// null page [`null_copy`] answers; none until [`title_code`].
+static TITLE: [std::sync::atomic::AtomicUsize; 2] =
+    [std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0)];
+
+/// The title's image is `len` bytes from `base`: copies its code asks of
+/// the C runtime from the null page read as zeros ([`null_copy`]).
+pub fn title_code(base: usize, len: usize) {
+    TITLE[0].store(base, Ordering::Relaxed);
+    TITLE[1].store(base.saturating_add(len), Ordering::Release);
+}
+
+fn in_title(address: usize) -> bool {
+    let end = TITLE[1].load(Ordering::Acquire);
+    (TITLE[0].load(Ordering::Relaxed)..end).contains(&address)
+}
+
+/// The first 64 KiB of the address space, which Windows never maps.
+const NULL_PAGES: usize = 0x1_0000;
+/// The most a copy answered by [`null_copy`] may write.
+const PAGE: usize = 0x1000;
+
+/// A copy from the null page that the title asks of VCRUNTIME140's `memcpy`
+/// reads as zeros. The title's script interpreter copies a field through a
+/// null pointer a few minutes into the boat mission, and the process ended
+/// there on every fork. Answered only when all of these hold: the access
+/// violation reads the first 64 KiB, inside the code of VCRUNTIME140's
+/// `memcpy` ([`memcpy_code`]), at an address in the source range (`rdx` for
+/// `r8` bytes); the copy is of at most a page, to a destination that is
+/// committed writable memory; and the return address (at `rsp`: the code
+/// keeps no frame) is in the title's image ([`title_code`]). Then the
+/// destination gets zeros and the call returns it. The first hits are
+/// logged, then one in 1,000.
+///
+/// From codeberg.org/p1nkman/p1nkman-VI (9aaa9ec, `null_copy` in
+/// crates/victory-loader/src/crash.rs, GPL-3.0-or-later; carried by
+/// github.com/gabrielcruzg3/victory-3060TI 5fe5557). Here `memcpy`'s code is
+/// bounded by its unwind data rather than its module, the destination is
+/// checked, and the title's image is its own range, not a module name.
+///
+/// # Safety
+/// `info` comes from the system, for an exception being dispatched.
+unsafe fn null_copy(info: *mut EXCEPTION_POINTERS) -> bool {
+    use std::sync::atomic::AtomicU64;
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    const READ: usize = 0;
+    // SAFETY: the system passes valid exception pointers.
+    let (record, context) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
+    if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record.NumberParameters < 2 {
+        return false;
+    }
+    let (kind, at) = (record.ExceptionInformation[0], record.ExceptionInformation[1]);
+    let (dst, src, len) = (context.Rcx as usize, context.Rdx as usize, context.R8 as usize);
+    let from_source = at >= src && at - src < len;
+    if kind != READ || at >= NULL_PAGES || !(1..=PAGE).contains(&len) || !from_source {
+        return false;
+    }
+    if !memcpy_code().is_some_and(|code| code.contains(&(context.Rip as usize))) {
+        return false;
+    }
+    let Some(ret) = stack_word(context.Rsp as usize) else {
+        return false;
+    };
+    if !in_title(ret) || dst < NULL_PAGES || !writable(dst, len) {
+        return false;
+    }
+    let n = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 3 || n.is_multiple_of(1000) {
+        tracing::warn!(
+            n,
+            len,
+            from = format_args!("{at:#x}"),
+            caller = %locate(ret),
+            "a copy from the null page read as zeros"
+        );
+    }
+    // SAFETY: committed writable memory the title handed the copy to fill.
+    unsafe { (dst as *mut u8).write_bytes(0, len) };
+    // `memcpy` returns its destination.
+    context.Rax = dst as u64;
+    context.Rip = ret as u64;
+    context.Rsp += 8;
+    true
+}
+
+/// The code of VCRUNTIME140's `memcpy`: where its export leads (past the
+/// jumps it may be), as far as the function's unwind data reaches, and only
+/// if that data says it keeps no frame (its return address stays at `rsp`).
+/// Not looked for again once found; looked for again while the module is
+/// not loaded.
+fn memcpy_code() -> Option<std::ops::Range<usize>> {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    static CODE: std::sync::OnceLock<Option<std::ops::Range<usize>>> = std::sync::OnceLock::new();
+    if let Some(code) = CODE.get() {
+        return code.clone();
+    }
+    // SAFETY: looks up a loaded module by name; no reference is taken.
+    let module = unsafe { GetModuleHandleW(windows_sys::w!("vcruntime140.dll")) };
+    if module.is_null() {
+        return None;
+    }
+    CODE.get_or_init(|| frameless(module, c"memcpy")).clone()
+}
+
+/// The code of the export `name` of `module`, if it is a function without
+/// a frame ([`memcpy_code`]).
+fn frameless(module: HMODULE, name: &std::ffi::CStr) -> Option<std::ops::Range<usize>> {
+    use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
+    let image = image_of(module)?;
+    // SAFETY: an export of a loaded module.
+    let mut at = unsafe { GetProcAddress(module, name.as_ptr().cast()) }? as usize;
+    // An export may be a jump to the code (`jmp rel32`, `jmp rel8`).
+    for _ in 0..4 {
+        if !(image.start..image.end.saturating_sub(5)).contains(&at) {
+            return None;
+        }
+        // SAFETY: inside the module's image, which is mapped.
+        let jump = unsafe {
+            match (at as *const u8).read() {
+                0xe9 => Some(5 + ((at + 1) as *const i32).read_unaligned() as isize),
+                0xeb => Some(2 + ((at + 1) as *const i8).read() as isize),
+                _ => None,
+            }
+        };
+        match jump {
+            Some(by) => at = at.wrapping_add_signed(by),
+            None => break,
+        }
+    }
+    let mut base = 0;
+    // SAFETY: looks up the function table entry covering `at`, if any.
+    let entry = unsafe { RtlLookupFunctionEntry(at as u64, &mut base, null_mut()) };
+    // SAFETY: a live entry of a loaded image's function table.
+    let entry = unsafe { entry.as_ref() }?;
+    let base = base as usize;
+    let (begin, end) = (base + entry.BeginAddress as usize, base + entry.EndAddress as usize);
+    // SAFETY: both members of the union are the same dword.
+    let unwind = base + unsafe { entry.Anonymous.UnwindInfoAddress } as usize;
+    if base != image.start || begin != at || end <= begin || unwind & 1 != 0 {
+        return None;
+    }
+    if !(image.start..image.end.saturating_sub(4)).contains(&unwind) {
+        return None;
+    }
+    // SAFETY: the entry's unwind data, inside the mapped image.
+    let info = unsafe { (unwind as *const [u8; 4]).read_unaligned() };
+    // Version 1 or 2, no handler and no chain, no prolog codes, no frame
+    // register.
+    let (version, flags, codes, frame) = (info[0] & 7, info[0] >> 3, info[2], info[3] & 0x0f);
+    ((1..=2).contains(&version) && flags == 0 && codes == 0 && frame == 0).then_some(begin..end)
+}
+
+/// The addresses a loaded module's image takes, from its headers.
+fn image_of(module: HMODULE) -> Option<std::ops::Range<usize>> {
+    let base = module as usize;
+    if base == 0 {
+        return None;
+    }
+    // SAFETY: a loaded module's headers are mapped: `e_lfanew` at 0x3c, the
+    // signature, the file header (20 bytes), then the optional header with
+    // the image's size at 56.
+    unsafe {
+        let nt = base + ((base + 0x3c) as *const u32).read_unaligned() as usize;
+        if (nt as *const u32).read_unaligned() != u32::from_le_bytes(*b"PE\0\0") {
+            return None;
+        }
+        let size = ((nt + 24 + 56) as *const u32).read_unaligned() as usize;
+        Some(base..base + size)
+    }
+}
+
+/// The word at `at` (the faulting thread's `rsp`) on the current thread's
+/// stack, if it lies there.
+fn stack_word(at: usize) -> Option<usize> {
+    let (mut low, mut high) = (0, 0);
+    // SAFETY: writes the current thread's stack bounds.
+    unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
+    if at < low || at.checked_add(8).is_none_or(|end| end > high) {
+        return None;
+    }
+    // SAFETY: inside this thread's stack, committed from the thread's `rsp`
+    // up, where the call that faulted put its return address.
+    Some(unsafe { (at as *const usize).read_unaligned() })
+}
+
+/// Whether the `len` bytes at `at` are committed memory a write may go to.
+fn writable(at: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+        PAGE_GUARD, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+    };
+    let Some(end) = at.checked_add(len) else {
+        return false;
+    };
+    let mut from = at;
+    // At most two regions: the copy is at most a page.
+    while from < end {
+        // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: reads the address space's bookkeeping, not the memory.
+        if unsafe { VirtualQuery(from as *const _, &mut info, size_of_val(&info)) } == 0 {
+            return false;
+        }
+        let protect = info.Protect;
+        let writes = matches!(
+            protect & 0xff,
+            PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+        );
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if info.State != MEM_COMMIT || !writes || protect & PAGE_GUARD != 0 || next <= from {
+            return false;
+        }
+        from = next;
+    }
+    true
 }
 
 /// For an unhandled-exception filter: reports the exception that is about
@@ -1068,5 +1297,140 @@ mod tests {
             assert_eq!(instruction_bytes(end as usize), "0f 01 fd");
             VirtualFree(page.cast(), 0, MEM_RELEASE);
         }
+    }
+
+    /// `memcpy` as the title calls it: VCRUNTIME140's, loaded here as the
+    /// runtime binds it for the title (these tests link the C runtime
+    /// statically), with this test program standing in for the title's
+    /// image. `None` without the module.
+    fn title_memcpy() -> Option<extern "C" fn(*mut u8, *const u8, usize) -> *mut u8> {
+        use windows_sys::Win32::System::LibraryLoader::{
+            GetModuleHandleW, GetProcAddress, LoadLibraryW,
+        };
+        // SAFETY: loads a system DLL by name and looks up an export; the
+        // test program's own module.
+        let (runtime, own) = unsafe {
+            (LoadLibraryW(windows_sys::w!("vcruntime140.dll")), GetModuleHandleW(std::ptr::null()))
+        };
+        if runtime.is_null() {
+            return None;
+        }
+        let image = image_of(own).expect("the test program's image");
+        title_code(image.start, image.len());
+        // SAFETY: an export of a loaded module.
+        let memcpy = unsafe { GetProcAddress(runtime, c"memcpy".as_ptr().cast()) }?;
+        // SAFETY: memcpy's signature; "C" and "system" are one convention on
+        // x86-64.
+        Some(unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, _>(memcpy) })
+    }
+
+    /// The boat mission's fault (a 16-byte copy from 0) and a small copy
+    /// from a field of a null struct, both from the title's code into the C
+    /// runtime's copy: the destination gets zeros, the call returns it, and
+    /// nothing past what was asked is written. Copies from real memory
+    /// still copy. Real faults, through the handler.
+    #[test]
+    #[inline(never)]
+    fn a_null_copy_from_the_title_reads_as_zeros() {
+        if !null_copies() {
+            return;
+        }
+        let Some(memcpy) = title_memcpy() else {
+            return; // no VCRUNTIME140 on this machine
+        };
+        report_crashes();
+        for (from, len) in [(0usize, 16usize), (0x28, 8)] {
+            let mut dst = [0xaau8; 96];
+            let to = std::hint::black_box(dst.as_mut_ptr());
+            let back = memcpy(to, std::hint::black_box(from as *const u8), len);
+            assert_eq!(back, to, "{len} bytes from {from:#x}");
+            assert!(dst[..len].iter().all(|&b| b == 0), "{len} bytes from {from:#x}");
+            assert!(dst[len..].iter().all(|&b| b == 0xaa), "{len} bytes from {from:#x}");
+        }
+        let (mut dst, from) = ([0u8; 16], [7u8; 16]);
+        memcpy(dst.as_mut_ptr(), from.as_ptr(), 16);
+        assert_eq!(dst, from);
+    }
+
+    /// Gives the guard a fault: at `rip`, a read (or a write) at `at`, the
+    /// copy's registers, `ret` on top of the stack. Whether it answered,
+    /// and `rip` and `rax` after.
+    fn guard(
+        rip: usize,
+        write: bool,
+        at: usize,
+        src: usize,
+        len: usize,
+        dst: usize,
+        ret: usize,
+    ) -> (bool, u64, u64) {
+        // SAFETY: zeroed system structures are valid.
+        let mut record: EXCEPTION_RECORD = unsafe { std::mem::zeroed() };
+        record.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+        record.NumberParameters = 2;
+        record.ExceptionInformation[0] = usize::from(write);
+        record.ExceptionInformation[1] = at;
+        // SAFETY: as above.
+        let mut context = Aligned16(unsafe { std::mem::zeroed() });
+        let stack = std::hint::black_box([ret, 0]);
+        let c = &mut context.0;
+        (c.Rip, c.Rsp, c.Rcx, c.Rdx, c.R8, c.Rax) =
+            (rip as u64, stack.as_ptr() as u64, dst as u64, src as u64, len as u64, 0x5a);
+        let mut info = EXCEPTION_POINTERS { ExceptionRecord: &mut record, ContextRecord: c };
+        // SAFETY: the structures above; the destination is the caller's.
+        let answered = unsafe { null_copy(&mut info) };
+        let c = &context.0;
+        assert_eq!(c.Rsp, stack.as_ptr() as u64 + if answered { 8 } else { 0 });
+        (answered, c.Rip, c.Rax)
+    }
+
+    /// Only a read of the null pages in memcpy's code, from its source, of
+    /// at most a page, to writable memory, returning into the title, is
+    /// answered; the destination is untouched otherwise.
+    #[test]
+    #[inline(never)]
+    fn only_null_copies_in_memcpy_from_the_title_are_answered() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, VirtualAlloc, VirtualFree,
+        };
+        if title_memcpy().is_none() {
+            return; // no VCRUNTIME140 on this machine
+        }
+        let code = memcpy_code().expect("memcpy's code, without a frame");
+        let rip = code.start + (code.end - code.start) / 2;
+        // Inside this test program, which stands in for the title's image.
+        let ret = only_null_copies_in_memcpy_from_the_title_are_answered as *const () as usize + 4;
+        let mut dst = vec![0xaau8; 0x2000];
+        let to = dst.as_mut_ptr() as usize;
+        let refused = [
+            ("a write", guard(rip, true, 8, 0, 16, to, ret)),
+            ("past the null pages", guard(rip, false, NULL_PAGES, NULL_PAGES, 16, to, ret)),
+            ("past the source", guard(rip, false, 40, 0, 16, to, ret)),
+            ("before the source", guard(rip, false, 8, 16, 16, to, ret)),
+            ("nothing to copy", guard(rip, false, 0, 0, 0, to, ret)),
+            ("more than a page", guard(rip, false, 8, 0, PAGE + 1, to, ret)),
+            ("past memcpy's code", guard(code.end, false, 8, 0, 16, to, ret)),
+            ("outside the C runtime", guard(ret, false, 8, 0, 16, to, ret)),
+            ("a return outside the title", guard(rip, false, 8, 0, 16, to, code.start)),
+            ("into the null pages", guard(rip, false, 8, 0, 16, 0x100, ret)),
+        ];
+        for (what, (answered, ..)) in refused {
+            assert!(!answered, "answered {what}");
+        }
+        assert!(dst.iter().all(|&b| b == 0xaa));
+        // SAFETY: a fresh page of ours, read-only.
+        let page =
+            unsafe { VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY) };
+        assert!(!page.is_null());
+        let (answered, ..) = guard(rip, false, 8, 0, 16, page as usize, ret);
+        assert!(!answered, "answered into read-only memory");
+        // SAFETY: ours, made above.
+        unsafe { VirtualFree(page, 0, MEM_RELEASE) };
+        // A page's worth: zeros, and the call returns its destination.
+        let at = to + 0x800;
+        assert_eq!(guard(rip, false, 0x10, 0x10, PAGE, at, ret), (true, ret as u64, at as u64));
+        assert!(dst[..0x800].iter().all(|&b| b == 0xaa));
+        assert!(dst[0x800..0x1800].iter().all(|&b| b == 0));
+        assert!(dst[0x1800..].iter().all(|&b| b == 0xaa));
     }
 }
