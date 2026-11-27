@@ -220,6 +220,76 @@ fn committed() -> u64 {
     }
 }
 
+/// The machine's physical memory not in use, if Windows tells.
+fn available_memory() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: a structure of the size it says it is.
+    unsafe {
+        let mut status: MEMORYSTATUSEX = std::mem::zeroed();
+        status.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+        (GlobalMemoryStatusEx(&mut status) != 0).then_some(status.ullAvailPhys)
+    }
+}
+
+/// How long the driver's compiler may work on a pipeline before
+/// [`endless`] stops it: past `endless` it is stopped once the process has
+/// grown by `growth` bytes since, or once the machine has less than
+/// `least_free` bytes of memory free (0: never for that); past `even_so`
+/// in any case.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Hold {
+    endless: Duration,
+    even_so: Duration,
+    growth: u64,
+    least_free: u64,
+}
+
+/// Not sooner, nor for less memory (upstream Belobug's 7263339): while the
+/// world loads the process takes gigabytes by itself and every core is busy,
+/// and four pipelines the driver makes in seconds were left out for good
+/// with 20 s and 3 GiB (run amd1, 2026-11-25). A compile that never ends
+/// takes 8 GiB a minute; with 32 GB and the title's 13 to 19 GB beside it,
+/// one is also stopped once less than 2 GiB are free, before the machine
+/// pages.
+const HOLD: Hold = Hold {
+    endless: Duration::from_secs(60),
+    even_so: Duration::from_secs(300),
+    growth: 8 << 30,
+    least_free: 2 << 30,
+};
+
+/// `VICTORY_COMPILE_HOLD=<s>,<s>,<GiB>,<GiB>`: [`Hold`]'s four, in that order;
+/// those left out keep [`HOLD`]'s. `20,150,3,0` is the hold before upstream's
+/// 7263339. Pure, for testing.
+fn parse_hold(value: Option<&str>) -> Option<Hold> {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Some(HOLD);
+    };
+    let mut hold = HOLD;
+    for (i, part) in value.split(',').enumerate() {
+        let n: f64 = part.trim().parse().ok().filter(|n: &f64| n.is_finite() && *n >= 0.0)?;
+        match i {
+            0 => hold.endless = Duration::try_from_secs_f64(n).ok()?,
+            1 => hold.even_so = Duration::try_from_secs_f64(n).ok()?,
+            2 => hold.growth = (n * f64::from(1u32 << 30)) as u64,
+            3 => hold.least_free = (n * f64::from(1u32 << 30)) as u64,
+            _ => return None,
+        }
+    }
+    Some(hold)
+}
+
+fn hold() -> Hold {
+    static HOLDS: std::sync::OnceLock<Hold> = std::sync::OnceLock::new();
+    *HOLDS.get_or_init(|| {
+        let value = std::env::var("VICTORY_COMPILE_HOLD").ok();
+        parse_hold(value.as_deref()).unwrap_or_else(|| {
+            tracing::warn!(value, "VICTORY_COMPILE_HOLD: expected up to four numbers (s,s,GiB,GiB); the default is kept");
+            HOLD
+        })
+    })
+}
+
 /// Workers (threads) lost to compiles that crashed, not replaced yet.
 static LOST: LostWorkers = LostWorkers::new();
 
@@ -316,16 +386,13 @@ fn suspend(id: u32) -> bool {
 }
 
 /// Notes pipelines the driver's compiler has worked on for long
-/// ([`ENDLESS`]): they are left out from the next run on. AMD's never ends
+/// ([`hold`]): they are left out from the next run on. AMD's never ends
 /// some of the world's ray tracing programs, and takes memory all the while
 /// (16 GB in two minutes), so their threads are stopped.
 fn endless(report: &Arc<CompileReport>, begins: bool) {
     const SCAN_INTERVAL: Duration = Duration::from_secs(2);
     // Some long programs take a while (the upscaler's 10,000 instructions);
     // what takes memory all along goes first.
-    const ENDLESS: Duration = Duration::from_secs(20);
-    const EVEN_SO: Duration = Duration::from_secs(150);
-    const GROWTH: u64 = 3 << 30;
     static AT_WORK: Mutex<Vec<(Arc<CompileReport>, Instant, u32)>> = Mutex::new(Vec::new());
     static WATCH: std::sync::Once = std::sync::Once::new();
     {
@@ -342,6 +409,7 @@ fn endless(report: &Arc<CompileReport>, begins: bool) {
         let _ = std::thread::Builder::new()
             .name("victory-compiles".into())
             .spawn(|| {
+                let hold = hold();
                 let mut noted: Vec<String> = Vec::new();
                 // The process's commit when a compile was first seen late.
                 let mut late: Option<u64> = None;
@@ -360,7 +428,7 @@ fn endless(report: &Arc<CompileReport>, begins: bool) {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .iter()
-                        .filter(|w| w.1.elapsed() > ENDLESS && !noted.contains(&w.0.name))
+                        .filter(|w| w.1.elapsed() > hold.endless && !noted.contains(&w.0.name))
                         .map(|w| (w.0.clone(), w.2))
                         .collect();
                     if long.is_empty() {
@@ -368,8 +436,17 @@ fn endless(report: &Arc<CompileReport>, begins: bool) {
                         continue;
                     }
                     let now = committed();
-                    let grown = now.saturating_sub(*late.get_or_insert(now)) > GROWTH;
-                    let long: Vec<(Arc<CompileReport>, u32)> = if grown {
+                    let grown = now.saturating_sub(*late.get_or_insert(now)) > hold.growth;
+                    let short =
+                        hold.least_free > 0 && available_memory().is_some_and(|free| free < hold.least_free);
+                    let why = if grown {
+                        "the process grew"
+                    } else if short {
+                        "memory runs short"
+                    } else {
+                        "too long"
+                    };
+                    let long: Vec<(Arc<CompileReport>, u32)> = if grown || short {
                         late = None;
                         long
                     } else {
@@ -377,7 +454,7 @@ fn endless(report: &Arc<CompileReport>, begins: bool) {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .iter()
-                            .filter(|w| w.1.elapsed() > EVEN_SO && !noted.contains(&w.0.name))
+                            .filter(|w| w.1.elapsed() > hold.even_so && !noted.contains(&w.0.name))
                             .map(|w| (w.0.clone(), w.2))
                             .collect()
                     };
@@ -390,6 +467,7 @@ fn endless(report: &Arc<CompileReport>, begins: bool) {
                             name = report.name.as_str(),
                             shaders = %report.shaders,
                             stopped,
+                            why,
                             "the driver's compiler does not end a pipeline: it is left out from the next run on"
                         );
                         note_crashed(&report.name);
@@ -620,6 +698,30 @@ mod tests {
         assert!(known.contains("failed-pipeline"));
         let contents = std::fs::read_to_string(&file).unwrap();
         assert_eq!(contents.lines().collect::<Vec<_>>(), ["failed-pipeline"]);
+    }
+
+    /// The compile hold: upstream's by default, the one before it on
+    /// demand, nothing taken from a malformed value.
+    #[test]
+    fn the_compile_hold_is_set_by_its_switch() {
+        assert_eq!(parse_hold(None), Some(HOLD));
+        assert_eq!(parse_hold(Some(" ")), Some(HOLD));
+        assert_eq!(HOLD.endless, Duration::from_secs(60));
+        assert_eq!((HOLD.even_so, HOLD.growth, HOLD.least_free), (Duration::from_secs(300), 8 << 30, 2 << 30));
+        let before = Hold {
+            endless: Duration::from_secs(20),
+            even_so: Duration::from_secs(150),
+            growth: 3 << 30,
+            least_free: 0,
+        };
+        assert_eq!(parse_hold(Some("20,150,3,0")), Some(before));
+        let some = parse_hold(Some("90, 600")).unwrap();
+        assert_eq!((some.endless, some.even_so, some.growth), (Duration::from_secs(90), Duration::from_secs(600), HOLD.growth));
+        assert_eq!(parse_hold(Some("1.5")).unwrap().endless, Duration::from_millis(1500));
+        assert_eq!(parse_hold(Some("60,300,0.5")).unwrap().growth, 1 << 29);
+        for bad in ["sixty", "60,-1", "1,2,3,4,5", "60,,8", "inf"] {
+            assert_eq!(parse_hold(Some(bad)), None, "{bad}");
+        }
     }
 
     #[test]

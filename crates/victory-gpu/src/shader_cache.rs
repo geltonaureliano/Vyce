@@ -87,6 +87,15 @@ fn key(build: &[u8; 32], target: Target) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(build);
     h.update(&target.key());
+    // The clean-up passes are part of the translation, with the sources the
+    // translator's fingerprint leaves out; none (the default) leaves the key
+    // as it was before there were any.
+    let passes = victory_shader::emit::shader_opt();
+    if passes != 0 {
+        h.update(b"clean-up passes");
+        h.update(&passes.to_le_bytes());
+        h.update(victory_shader::emit::CLEANUP_SOURCES.as_bytes());
+    }
     *h.finalize().as_bytes()
 }
 
@@ -372,6 +381,26 @@ mod tests {
         assert_eq!(key(&build, nvidia), key(&build, nvidia));
         assert_ne!(key(&build, nvidia), key(&build, rdna));
         assert_ne!(key(&build, nvidia), key(&[8; 32], nvidia));
+    }
+
+    /// With the clean-up passes off (the default, `VICTORY_SHADER_OPT`
+    /// unset) a key is the one of a build that never had them: the cache
+    /// of the build before them serves this one.
+    #[test]
+    fn keys_without_the_clean_up_are_as_before_it() {
+        if victory_shader::emit::shader_opt() != 0 {
+            return;
+        }
+        let build = [7u8; 32];
+        let nvidia = Target {
+            lanes_min: 32,
+            lanes_max: 32,
+            exact_views: true,
+        };
+        let mut before = blake3::Hasher::new();
+        before.update(&build);
+        before.update(&nvidia.key());
+        assert_eq!(key(&build, nvidia), *before.finalize().as_bytes());
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

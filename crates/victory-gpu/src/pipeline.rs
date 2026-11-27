@@ -89,10 +89,16 @@ pub(crate) struct Shader {
 ///   there are no hits to shade. There are hundreds of these, and the host's
 ///   compiler takes 10 to 30 seconds for each, so a first start was busy with
 ///   them for many minutes. `VICTORY_RAY_RESOLVES=1` has them run.
+/// - It tells the screen probes which rays to trace
+///   (`CS_ScreenProbes_ActivateRays`, by that name anywhere in its
+///   container), and no rays run. shortcut: with no rays behind it, once it
+///   ran the whole picture lost light, shadows and reflections (upstream
+///   Belobug's 6986a57: run opt31b against sans39, 2026-11-25).
+///   `VICTORY_PROBE_RAYS=1` has it run.
 /// - `VICTORY_SKIP_PIPELINES` lists its hash.
 #[cfg(windows)]
 fn left_out_program(container: &[u8], hash: &str) -> Option<&'static str> {
-    static RUN: OnceLock<[bool; 2]> = OnceLock::new();
+    static RUN: OnceLock<[bool; 3]> = OnceLock::new();
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     const RESOLVES: [&[u8]; 2] = [b"CS_RaytracingResolve", b"CS_DummyResolve"];
     const HAIR: [&[u8]; 18] = [
@@ -121,13 +127,18 @@ fn left_out_program(container: &[u8], hash: &str) -> Option<&'static str> {
     if hashes.iter().any(|h| h == hash) {
         return Some("named");
     }
-    let [hair, resolves] = *RUN.get_or_init(|| {
+    let [hair, resolves, probe_rays] = *RUN.get_or_init(|| {
+        let on = |name: &str| std::env::var(name).is_ok_and(|v| v == "1");
         [
             std::env::var_os("VICTORY_HAIR").is_some(),
-            victory_shader::emit::rays()
-                || std::env::var("VICTORY_RAY_RESOLVES").is_ok_and(|v| v == "1"),
+            victory_shader::emit::rays() || on("VICTORY_RAY_RESOLVES"),
+            victory_shader::emit::rays() || on("VICTORY_PROBE_RAYS"),
         ]
     });
+    const PROBE_RAYS: &[u8] = b"CS_ScreenProbes_ActivateRays";
+    if !probe_rays && container.windows(PROBE_RAYS.len()).any(|w| w == PROBE_RAYS) {
+        return Some("probe rays");
+    }
     const END: &[u8] = b"_Wrapped";
     container
         .windows(END.len())
@@ -311,6 +322,18 @@ fn dump(shader: &Shader) {
     } else if let Err(error) = std::fs::write(&path, &shader.container) {
         tracing::warn!(%error, "shader not saved");
     }
+}
+
+/// As [`dump`], for the shaders of a pipeline the host refused: they
+/// translate, so only this tells which containers to look at.
+#[cfg(windows)]
+fn dump_all(shaders: &[Arc<Shader>]) {
+    #[cfg(feature = "diagnostics")]
+    for shader in shaders {
+        dump(shader);
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = shaders;
 }
 
 #[cfg(windows)]
@@ -878,7 +901,8 @@ pub fn save_pipeline_cache() {
 #[cfg(test)]
 mod tests {
     /// Programs left out of the picture, by the names their containers
-    /// hold: hair strands, and ray resolves while no rays run.
+    /// hold: hair strands, and ray resolves and the probes' ray activation
+    /// while no rays run.
     #[test]
     #[cfg(windows)]
     fn left_out_programs_are_found_by_name() {
@@ -892,6 +916,10 @@ mod tests {
         assert_eq!(super::left_out_program(&named("CS_InterpolateStrands"), hash), Some("hair strands"));
         assert_eq!(super::left_out_program(&named("CS_RaytracingResolve_12"), hash), Some("ray resolves"));
         assert_eq!(super::left_out_program(&named("CS_DummyResolve"), hash), Some("ray resolves"));
+        // The probes' ray activation, by its name anywhere in the container.
+        assert_eq!(super::left_out_program(&named("CS_ScreenProbes_ActivateRays"), hash), Some("probe rays"));
+        assert_eq!(super::left_out_program(b"..CS_ScreenProbes_ActivateRays..", hash), Some("probe rays"));
+        assert_eq!(super::left_out_program(&named("CS_ScreenProbes_Activate"), hash), None);
         assert_eq!(super::left_out_program(&named("CS_ScreenProbes_TemporalResolve"), hash), None);
         assert_eq!(super::left_out_program(&named("CS_BatchCullMeshlets"), hash), None);
         assert_eq!(super::left_out_program(b"no name at all", hash), None);
