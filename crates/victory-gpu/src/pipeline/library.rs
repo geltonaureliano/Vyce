@@ -234,11 +234,12 @@ fn available_memory() -> Option<u64> {
 /// How long the driver's compiler may work on a pipeline before
 /// [`endless`] stops it: past `endless` it is stopped once the process has
 /// grown by `growth` bytes since it got there; past `even_so` in any case.
-/// While the machine has less than `least_free` bytes of memory free (0:
-/// never for that), one at work for more than [`FLOOR_FROM`] (`endless` if
-/// sooner) is stopped if the process grew by [`OWN_GROWTH`] since it was
-/// first watched; else the shortage is not its doing, which is said, and
-/// it is watched on.
+/// Only these two note it, so it is left out from the next run on. While
+/// the machine has less than `least_free` bytes of memory free (0: never
+/// for that), one at work for more than [`FLOOR_FROM`] (`endless` if
+/// sooner) is stopped if the process grew by [`OWN_GROWTH`] since it
+/// began, and left out for this run only; else the shortage is not its
+/// doing, which is said, and it is watched on.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Hold {
     endless: Duration,
@@ -266,10 +267,11 @@ const HOLD: Hold = Hold {
 /// ends fills the floor's 2 GiB in a quarter of a minute.
 const FLOOR_FROM: Duration = Duration::from_secs(20);
 
-/// What the process must grow by while a compile is watched for a shortage
-/// to be laid to it: with less, the shortage is the title's (its 13 to 19
-/// GB while the world loads) or another program's, and a good pipeline
-/// would be left out in every later session.
+/// What the process must grow by since a compile began for a shortage to
+/// stop it: with less, the shortage is not the compile's doing. With more
+/// it may still be the title's, which runs in the same process (its 13 to
+/// 19 GB while the world loads, upstream's 7263339), so such a stop leaves
+/// the pipeline out for this run only and never notes it.
 const OWN_GROWTH: u64 = 1 << 30;
 
 /// What [`endless`] does with a compile.
@@ -278,26 +280,28 @@ enum Verdict {
     /// Left to work.
     Work,
     /// Memory runs short, but the process grew less than [`OWN_GROWTH`]
-    /// while it was watched: said, never noted, watched on.
+    /// since the compile began: said, watched on.
     NotItsShortage,
-    /// Stopped and left out from the next run on, for this reason.
-    Stop(&'static str),
+    /// Stopped, its pipeline left out for the rest of this run only, for
+    /// this reason: not written to the driver's list.
+    StopThisRun(&'static str),
+    /// Stopped and noted: left out from the next run on too, for this reason.
+    StopForGood(&'static str),
 }
 
 /// A compile [`endless`] watches, on the thread `thread`: the process's
-/// commit when it was first watched and when first seen past `endless`,
-/// and whether a shortage not its doing was said.
+/// commit when it was first seen past `endless`, and whether a shortage
+/// not its doing was said.
 struct Watched {
     report: Arc<CompileReport>,
     thread: u32,
-    seen: u64,
     late: Option<u64>,
     told: bool,
 }
 
 impl Watched {
-    fn new(report: &Arc<CompileReport>, thread: u32, commit: u64) -> Watched {
-        Watched { report: report.clone(), thread, seen: commit, late: None, told: false }
+    fn new(report: &Arc<CompileReport>, thread: u32) -> Watched {
+        Watched { report: report.clone(), thread, late: None, told: false }
     }
 
     fn is(&self, report: &Arc<CompileReport>, thread: u32) -> bool {
@@ -306,20 +310,20 @@ impl Watched {
 }
 
 /// The hold's verdict on a compile at work for `busy`, while the process
-/// grew by `grown` bytes since the compile was first watched and by
-/// `grown_late` since it was first seen past `endless`, with `free` bytes
-/// of the machine's memory free (if Windows tells). Pure, for testing.
+/// grew by `grown` bytes since the compile began and by `grown_late` since
+/// it was first seen past `endless`, with `free` bytes of the machine's
+/// memory free (if Windows tells). Pure, for testing.
 fn verdict(hold: &Hold, busy: Duration, grown: u64, grown_late: u64, free: Option<u64>) -> Verdict {
     if busy > hold.even_so {
-        return Verdict::Stop("too long");
+        return Verdict::StopForGood("too long");
     }
     if busy > hold.endless && grown_late > hold.growth {
-        return Verdict::Stop("the process grew");
+        return Verdict::StopForGood("the process grew");
     }
     let short = hold.least_free > 0 && free.is_some_and(|free| free < hold.least_free);
     if short && busy > FLOOR_FROM.min(hold.endless) {
         return if grown >= OWN_GROWTH {
-            Verdict::Stop("memory runs short")
+            Verdict::StopThisRun("memory runs short")
         } else {
             Verdict::NotItsShortage
         };
@@ -331,9 +335,9 @@ fn verdict(hold: &Hold, busy: Duration, grown: u64, grown_late: u64, free: Optio
 /// those left out keep [`HOLD`]'s. `20,150,3,0` is the hold before upstream's
 /// 7263339. The four mean what they did; only the fourth, the memory floor,
 /// is watched from [`FLOOR_FROM`] of work instead of from the first number's,
-/// and stops only a compile the process grew by [`OWN_GROWTH`] beside
-/// ([`verdict`]): one caught by a shortage it did not cause is never noted.
-/// Pure, for testing.
+/// stops only a compile the process grew by [`OWN_GROWTH`] beside since it
+/// began, and leaves that pipeline out for the run only ([`verdict`]): a
+/// shortage never writes the driver's list. Pure, for testing.
 fn parse_hold(value: Option<&str>) -> Option<Hold> {
     let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
         return Some(HOLD);
@@ -458,22 +462,25 @@ fn suspend(id: u32) -> bool {
     }
 }
 
-/// Notes pipelines the driver's compiler has worked on for long
-/// ([`hold`]): they are left out from the next run on. AMD's never ends
-/// some of the world's ray tracing programs, and takes memory all the while
-/// (16 GB in two minutes), so their threads are stopped.
+/// Stops pipelines the driver's compiler has worked on for long
+/// ([`hold`]): they are left out from the next run on, or for this run
+/// only when memory runs short. AMD's never ends some of the world's ray
+/// tracing programs, and takes memory all the while (16 GB in two
+/// minutes), so their threads are stopped.
 fn endless(report: &Arc<CompileReport>, begins: bool) {
     const SCAN_INTERVAL: Duration = Duration::from_secs(2);
     // Some long programs take a while (the upscaler's 10,000 instructions);
-    // what takes memory all along goes first.
-    static AT_WORK: Mutex<Vec<(Arc<CompileReport>, Instant, u32)>> = Mutex::new(Vec::new());
+    // what takes memory all along goes first. Each with the process's
+    // commit when it began.
+    static AT_WORK: Mutex<Vec<(Arc<CompileReport>, Instant, u32, u64)>> = Mutex::new(Vec::new());
     static WATCH: std::sync::Once = std::sync::Once::new();
     {
         // SAFETY: a plain call.
         let id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+        let began = if begins { committed() } else { 0 };
         let mut at_work = AT_WORK.lock().unwrap_or_else(|e| e.into_inner());
         if begins {
-            at_work.push((report.clone(), Instant::now(), id));
+            at_work.push((report.clone(), Instant::now(), id, began));
         } else if let Some(i) = at_work.iter().position(|w| Arc::ptr_eq(&w.0, report) && w.2 == id) {
             at_work.swap_remove(i);
         }
@@ -499,11 +506,11 @@ fn endless(report: &Arc<CompileReport>, begins: bool) {
                         continue;
                     }
                     next_scan = now + SCAN_INTERVAL;
-                    let long: Vec<(Arc<CompileReport>, u32, Duration)> = AT_WORK
+                    let long: Vec<(Arc<CompileReport>, u32, Duration, u64)> = AT_WORK
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .iter()
-                        .map(|w| (w.0.clone(), w.2, w.1.elapsed()))
+                        .map(|w| (w.0.clone(), w.2, w.1.elapsed(), w.3))
                         .filter(|w| w.2 > from && !noted.contains(&w.0.name))
                         .collect();
                     watched.retain(|w| long.iter().any(|l| w.is(&l.0, l.1)));
@@ -512,18 +519,18 @@ fn endless(report: &Arc<CompileReport>, begins: bool) {
                     }
                     let commit = committed();
                     let free = if hold.least_free > 0 { available_memory() } else { None };
-                    for (report, id, busy) in long {
+                    for (report, id, busy, began) in long {
                         let i = watched.iter().position(|w| w.is(&report, id)).unwrap_or_else(|| {
-                            watched.push(Watched::new(&report, id, commit));
+                            watched.push(Watched::new(&report, id));
                             watched.len() - 1
                         });
                         let w = &mut watched[i];
                         if busy > hold.endless {
                             w.late.get_or_insert(commit);
                         }
-                        let grown = commit.saturating_sub(w.seen);
+                        let grown = commit.saturating_sub(began);
                         let grown_late = w.late.map_or(0, |late| commit.saturating_sub(late));
-                        let why = match verdict(&hold, busy, grown, grown_late, free) {
+                        let (why, for_good) = match verdict(&hold, busy, grown, grown_late, free) {
                             Verdict::Work => continue,
                             Verdict::NotItsShortage => {
                                 if !std::mem::replace(&mut w.told, true) {
@@ -538,20 +545,38 @@ fn endless(report: &Arc<CompileReport>, begins: bool) {
                                 }
                                 continue;
                             }
-                            Verdict::Stop(why) => why,
+                            Verdict::StopThisRun(why) => (why, false),
+                            Verdict::StopForGood(why) => (why, true),
                         };
                         let stopped = suspend(id);
                         if stopped {
                             super::make::worker_lost(id);
                         }
-                        tracing::error!(
-                            name = report.name.as_str(),
-                            shaders = %report.shaders,
-                            stopped,
-                            why,
-                            "the driver's compiler does not end a pipeline: it is left out from the next run on"
-                        );
-                        note_crashed(&report.name);
+                        if for_good {
+                            tracing::error!(
+                                name = report.name.as_str(),
+                                shaders = %report.shaders,
+                                stopped,
+                                why,
+                                "the driver's compiler does not end a pipeline: it is left out from the next run on"
+                            );
+                        } else {
+                            tracing::error!(
+                                name = report.name.as_str(),
+                                shaders = %report.shaders,
+                                stopped,
+                                why,
+                                seconds = busy.as_secs(),
+                                free_mib = free.unwrap_or(0) >> 20,
+                                grown_mib = grown >> 20,
+                                "the process grew while the driver made a pipeline and memory runs short: \
+                                 it is left out for this run only, not noted"
+                            );
+                        }
+                        // Left out for the rest of the run either way, so it
+                        // is not made again unwatched; in the driver's list
+                        // only for good.
+                        remember_crash(crashed_names(), crashed_path().filter(|_| for_good), &report.name);
                         noted.push(report.name.clone());
                     }
                 }
@@ -805,39 +830,51 @@ mod tests {
         }
     }
 
-    /// The memory floor is watched from 20 s of work, and stops (and notes)
-    /// only a compile the process grew 1 GiB beside: one caught by a
-    /// shortage it did not cause (the title loading the world) goes on, at
-    /// 25 s or at 90 s. The other two rules are as they were.
+    /// The memory floor is watched from 20 s of work, and stops only a
+    /// compile the process grew 1 GiB beside since it began, for this run
+    /// only: the title grows the same process by gigabytes while the world
+    /// loads, so a shortage never notes a pipeline. One the process hardly
+    /// grew beside goes on, at 25 s or at 90 s. The other two rules, the
+    /// only ones that note, are as they were.
     #[test]
-    fn the_hold_lays_a_shortage_only_to_a_compile_that_grew() {
+    fn a_shortage_stops_a_compile_that_grew_for_this_run_only() {
         let s = Duration::from_secs;
         let gib = |n: f64| (n * f64::from(1u32 << 30)) as u64;
         let (short, plenty) = (Some(gib(1.5)), Some(gib(10.0)));
         let v = |busy, grown, grown_late, free| verdict(&HOLD, s(busy), grown, grown_late, free);
         // Not watched before 20 s, short or not.
         assert_eq!(v(15, gib(4.0), 0, short), Verdict::Work);
-        // Short past 20 s: stopped if the process grew 1 GiB, else kept.
-        assert_eq!(v(25, gib(1.0), 0, short), Verdict::Stop("memory runs short"));
+        // Short past 20 s: stopped for this run if the process grew 1 GiB
+        // since the compile began, else kept.
+        assert_eq!(v(21, gib(2.7), 0, short), Verdict::StopThisRun("memory runs short"));
+        assert_eq!(v(25, gib(1.0), 0, short), Verdict::StopThisRun("memory runs short"));
         assert_eq!(v(25, gib(0.5), 0, short), Verdict::NotItsShortage);
         assert_eq!(v(90, 0, 0, short), Verdict::NotItsShortage);
-        assert_eq!(v(90, gib(2.0), gib(1.0), short), Verdict::Stop("memory runs short"));
+        assert_eq!(v(90, gib(2.0), gib(1.0), short), Verdict::StopThisRun("memory runs short"));
+        // A shortage alone never notes, whatever the process grew.
+        for busy in [21, 30, 59, 61, 120, 299] {
+            for grown in [0.0, 0.9, 1.0, 3.0, 6.0, 12.0] {
+                let got = v(busy, gib(grown), 0, short);
+                assert!(!matches!(got, Verdict::StopForGood(_)), "{busy} s, {grown} GiB: {got:?}");
+            }
+        }
         // Plenty free, or nothing known: only the growth and the time count.
         assert_eq!(v(25, gib(4.0), 0, plenty), Verdict::Work);
         assert_eq!(v(90, gib(9.0), gib(7.0), None), Verdict::Work);
-        assert_eq!(v(90, gib(9.0), gib(9.0), plenty), Verdict::Stop("the process grew"));
+        assert_eq!(v(90, gib(9.0), gib(9.0), plenty), Verdict::StopForGood("the process grew"));
+        assert_eq!(v(90, gib(9.0), gib(9.0), short), Verdict::StopForGood("the process grew"));
         assert_eq!(v(55, gib(9.0), gib(9.0), plenty), Verdict::Work, "not past `endless`");
-        assert_eq!(v(301, 0, 0, plenty), Verdict::Stop("too long"));
-        assert_eq!(v(301, 0, 0, short), Verdict::Stop("too long"));
+        assert_eq!(v(301, 0, 0, plenty), Verdict::StopForGood("too long"));
+        assert_eq!(v(301, 0, 0, short), Verdict::StopForGood("too long"));
         // The hold before upstream's 7263339 has no floor.
         let before = parse_hold(Some("20,150,3,0")).unwrap();
         let old = |busy, grown_late, free| verdict(&before, s(busy), gib(5.0), grown_late, free);
         assert_eq!(old(25, gib(2.0), Some(0)), Verdict::Work);
-        assert_eq!(old(25, gib(4.0), Some(0)), Verdict::Stop("the process grew"));
-        assert_eq!(old(151, 0, plenty), Verdict::Stop("too long"));
+        assert_eq!(old(25, gib(4.0), Some(0)), Verdict::StopForGood("the process grew"));
+        assert_eq!(old(151, 0, plenty), Verdict::StopForGood("too long"));
         // A first number below 20 s brings the floor's watch with it.
         let soon = parse_hold(Some("5")).unwrap();
-        assert_eq!(verdict(&soon, s(6), gib(1.0), 0, short), Verdict::Stop("memory runs short"));
+        assert_eq!(verdict(&soon, s(6), gib(1.0), 0, short), Verdict::StopThisRun("memory runs short"));
         assert_eq!(verdict(&soon, s(4), gib(1.0), 0, short), Verdict::Work);
     }
 
