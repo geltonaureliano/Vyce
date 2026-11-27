@@ -1257,9 +1257,11 @@ struct ClampChunks {
 const STAMPS: u32 = 16384;
 
 /// Whether the dynamic descriptor slots of a list's tables go back as soon
-/// as its last submission has landed (`VICTORY_FREE_TABLES_AT_LANDING=0`:
-/// when the title resets or releases the list, or when a list it parted
-/// from is used again, as before). The capped view heap of NVIDIA leaves
+/// as its last submission has landed, lent while the title may submit it
+/// again, for title's lists seen to submit each recording once (`Tables`)
+/// (`VICTORY_FREE_TABLES_AT_LANDING=0`: when the title resets or releases
+/// the list, or when a list it parted from is used again, as before;
+/// neither lent nor waited for). The capped view heap of NVIDIA leaves
 /// 262,144 of them; a world session held 249,113 at most and once ran out,
 /// with tables and draws dropped, while at most two submissions were in
 /// flight: the slots of lists that had run waited for the title to come
@@ -1301,40 +1303,81 @@ pub(crate) struct Table {
     pub(crate) tag: u64,
 }
 
-impl Table {
-    fn release(&self) {
-        self.heap.release(self.first, self.n);
-    }
+/// The runs of dynamic slots of one heap a recording's tables hold.
+struct HeapRuns {
+    heap: Arc<crate::descriptor::host::HostHeap>,
+    runs: Vec<crate::descriptor::host::Run>,
+}
+
+/// Gives back the slots of `groups` ([`crate::descriptor::host::HostHeap::give_back`]):
+/// a few lock holds per heap. How many came free.
+fn give_back(groups: &[HeapRuns], lend: bool) -> u64 {
+    groups.iter().map(|g| g.heap.give_back(&g.runs, lend)).sum()
 }
 
 /// A recording's tables ([`HostList::hold_table`]) and its submissions.
 ///
 /// The title may submit a closed list again until it resets it, and its
 /// commands name the slots of its tables: those given back at the landing
-/// of its last submission are lent, not forgotten. A submission that comes
-/// again takes them back, if no other table took one meanwhile (they still
-/// hold what the commands read); else the recording is lost. From then on
-/// the title's list keeps its tables until its reset, as before.
+/// of its last submission are lent, not forgotten, and only for a title's
+/// list known to reset what it submitted once ([`HostList::submitting`]).
+/// A submission that comes again takes them back, if no other table took
+/// one meanwhile (they still hold what the commands read; tables take lent
+/// slots last); else the recording is lost, with every part of its title's
+/// list, until its reset.
 #[derive(Default)]
 struct Tables {
-    /// The slots the recording's commands read.
-    held: Vec<Table>,
+    /// The slots the recording's commands read, by heap.
+    held: Vec<HeapRuns>,
     /// Given back at the landing of its last submission, while the title
     /// could still submit it again.
-    lent: Vec<Table>,
+    lent: Vec<HeapRuns>,
     /// The title's submissions of it that have not landed yet.
     pending: u32,
     /// Times the title submitted it since it began.
     submissions: u32,
+    /// The host fence value of its last landing (`u64::MAX`: a waited
+    /// submission's).
+    landed: u64,
     /// The title's list moved on from it (a reset or a release while a
     /// submission of it was still to run): it is not submitted again.
     parted: bool,
-    /// It, or its title's list, was submitted again: its tables stay until
-    /// its reset.
-    repeats: bool,
-    /// Other tables took slots it lent: its commands would read their
-    /// descriptors, so its submissions do not run them ([`HostList::skipped`]).
+    /// Its tables stay until its reset: it, or its title's list, was
+    /// submitted again, or its title's list was not seen yet to reset a
+    /// recording it submitted once.
+    keeps: bool,
+    /// Other tables took slots it, or another part of its title's list,
+    /// lent: its commands would read their descriptors, so its submissions
+    /// do not run them until its reset ([`HostList::skipped`]).
     lost: bool,
+}
+
+/// How a title's submission of a recording stands
+/// ([`HostList::submitting`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Submitting {
+    /// The title submitted it before since it began.
+    pub(crate) again: bool,
+    /// Its commands are not run ([`HostList::skipped`]).
+    pub(crate) lost: bool,
+}
+
+/// The title submits a recording of one of its lists, cut into `parts`
+/// (`crate::list::submit`); `lends` as for [`HostList::submitting`]. A
+/// title's list runs whole or not at all: if one part lost its slots,
+/// every part does without its commands (the parts pass what they make on
+/// to the next), and the slots the others took back are given back.
+pub(crate) fn submitting<'a>(parts: impl Iterator<Item = &'a HostList> + Clone, lends: bool) -> Submitting {
+    let mut all = Submitting::default();
+    for part in parts.clone() {
+        let s = part.submitting(lends);
+        all.again |= s.again;
+        all.lost |= s.lost;
+    }
+    if all.lost {
+        parts.for_each(HostList::lose);
+    }
+    all
 }
 
 impl Drop for HostList {
@@ -1865,9 +1908,11 @@ impl Host {
             let uploads = list.run_deferred(&mut batch);
             firsts.push(lists.len());
             // A recording submitted again after other tables took the slots
-            // it lent: its commands would read their descriptors. Only what
-            // it leaves its textures in is done.
-            // shortcut: its draws and dispatches are lost for the frame.
+            // it, or another part of its title's list, lent: its commands
+            // would read their descriptors. Only what it leaves its
+            // textures in is done.
+            // shortcut: its draws and dispatches are lost until the title
+            // resets the list.
             let skip = list.skipped();
             let recording = crate::telemetry::start();
             if let Some(prelude) = list.prelude(&uploads, skip) {
@@ -2632,55 +2677,73 @@ impl HostList {
     /// Holds `table` for the recording's commands, until no submission of
     /// them is to run ([`free_tables_at_landing`]).
     pub(crate) fn hold_table(&self, table: Table) {
-        self.tables().held.push(table);
+        let Table { heap, first, n, tag } = table;
+        let run = crate::descriptor::host::Run { first, n, tag };
+        let mut t = self.tables();
+        // (Mostly one or two heaps, the last one's again.)
+        match t.held.iter_mut().rev().find(|g| Arc::ptr_eq(&g.heap, &heap)) {
+            Some(group) => group.runs.push(run),
+            None => t.held.push(HeapRuns { heap, runs: vec![run] }),
+        }
     }
 
     /// The title submits this recording (its `ExecuteCommandLists`, before
-    /// the submission is prepared); `repeats`: its title's list submitted a
-    /// recording again before. Tables it lent are taken back, or it is
-    /// lost. Whether the title submitted it before since it began.
-    pub(crate) fn submitting(&self, repeats: bool) -> bool {
+    /// the submission is prepared; [`submitting`] for all the parts of its
+    /// list). `lends`: its title's list was seen to reset a recording it
+    /// submitted once, and never to submit one again, so this one's tables
+    /// may be lent at its landing; else they stay until its reset, as they
+    /// do once it is submitted again. Tables it lent are taken back, all of
+    /// them, or it is lost.
+    pub(crate) fn submitting(&self, lends: bool) -> Submitting {
         let mut t = self.tables();
         t.submissions = t.submissions.saturating_add(1);
         let again = t.submissions > 1;
-        t.repeats |= repeats || again;
+        t.keeps |= !lends || again;
         t.pending += 1;
-        if t.pending == 1 && !t.lent.is_empty() {
+        if t.pending == 1 && !t.lent.is_empty() && !t.lost {
             let lent = std::mem::take(&mut t.lent);
-            let mut back = Vec::with_capacity(lent.len());
-            for table in lent {
-                if !table.heap.retake(table.first, table.n, table.tag) {
-                    t.lost = true;
-                    break;
-                }
-                back.push(table);
-            }
-            if t.lost {
-                // Of no use to commands that do not run.
-                back.iter().for_each(Table::release);
-                static ONCE: std::sync::Once = std::sync::Once::new();
-                ONCE.call_once(|| {
-                    tracing::warn!(
-                        "a list submitted again after other tables took its descriptor slots \
-                         runs without its commands"
-                    );
-                });
+            if lent.iter().all(|g| g.heap.retake(&g.runs)) {
+                t.held.extend(lent);
             } else {
-                t.held = back;
+                // Of no use to commands that do not run: those taken back,
+                // and those still lent.
+                give_back(&lent, false);
+                t.lost = true;
             }
         }
+        Submitting { again, lost: t.lost }
+    }
+
+    /// Another part of the title's list this recording is in lost its slots
+    /// in the submission being made ([`submitting`]): its commands are not
+    /// run either, until its reset, and its slots go back for good once no
+    /// submission that may run them is to.
+    pub(crate) fn lose(&self) {
+        let mut t = self.tables();
         if t.lost {
-            crate::telemetry::count(Count::TablesLost, 1);
+            return;
         }
-        again
+        t.lost = true;
+        let lent = std::mem::take(&mut t.lent);
+        give_back(&lent, false);
+        // Only the submission being made, which does not run them.
+        if t.pending <= 1 {
+            let held = std::mem::take(&mut t.held);
+            give_back(&held, false);
+        }
+    }
+
+    /// Whether the title submitted this recording exactly once.
+    pub(crate) fn submitted_once(&self) -> bool {
+        self.tables().submissions == 1
     }
 
     /// A submission of the title's that names this recording has landed:
     /// the host GPU ran it, and `fence` was signalled behind it (`u64::MAX`:
     /// behind everything sent so far). Once no other submission of it is
     /// to run, its tables go back: for good if the title's list moved on
-    /// from it, lent if the title may submit it again, and not before its
-    /// reset if the title submitted it again before.
+    /// from it or it is lost, lent if the title may submit it again, and
+    /// not before its reset if it keeps them ([`Tables::keeps`]).
     pub(crate) fn landed(&self, fence: u64) {
         let mut t = self.tables();
         // Ours, and tests', are not the title's.
@@ -2688,9 +2751,11 @@ impl HostList {
             return;
         }
         t.pending -= 1;
+        t.landed = t.landed.max(fence);
+        let lend = !t.parted && !t.lost;
         if t.pending > 0
             || t.held.is_empty()
-            || (t.repeats && !t.parted)
+            || (lend && t.keeps)
             || !free_tables_at_landing()
             // Sent again since (not by the title).
             || self.last_fence.load(Ordering::Acquire) > fence
@@ -2698,12 +2763,9 @@ impl HostList {
             return;
         }
         let held = std::mem::take(&mut t.held);
-        held.iter().for_each(Table::release);
-        crate::telemetry::count(
-            Count::SlotsFreedAtLanding,
-            held.iter().map(|table| u64::from(table.n)).sum(),
-        );
-        if !t.parted {
+        let freed = give_back(&held, lend);
+        crate::telemetry::count(Count::SlotsFreedAtLanding, freed);
+        if lend {
             t.lent = held;
         }
     }
@@ -2715,21 +2777,23 @@ impl HostList {
     pub(crate) fn parted(&self) {
         let mut t = self.tables();
         t.parted = true;
-        t.lent.clear();
-        if t.pending == 0
-            && free_tables_at_landing()
-            && self.line.landed_up_to(self.last_fence.load(Ordering::Acquire))
-        {
+        let lent = std::mem::take(&mut t.lent);
+        give_back(&lent, false);
+        // (A landing that just counted its last submission tells the line
+        // a little later.)
+        let last = self.last_fence.load(Ordering::Acquire);
+        if t.pending == 0 && free_tables_at_landing() && (last <= t.landed || self.line.landed_up_to(last)) {
             let held = std::mem::take(&mut t.held);
-            held.iter().for_each(Table::release);
+            give_back(&held, false);
         }
     }
 
-    /// Gives back every slot the recording holds and starts its count of
-    /// submissions anew: only once none of them is to run.
+    /// Gives back every slot the recording holds or lent, and starts its
+    /// count of submissions anew: only once none of them is to run.
     fn release_tables(&self) {
         let t = std::mem::take(&mut *self.tables());
-        t.held.iter().for_each(Table::release);
+        give_back(&t.held, false);
+        give_back(&t.lent, false);
     }
 
     /// Whether the recording's commands are not run ([`Tables::lost`]).

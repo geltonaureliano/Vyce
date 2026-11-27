@@ -148,9 +148,13 @@ pub(crate) enum Count {
     /// Submissions of lists the title submitted again after other tables
     /// took their slots: their commands were not run.
     TablesLost,
+    /// Lent dynamic descriptor slots other tables took, when no run of
+    /// other free slots fitted them
+    /// (`crate::descriptor::host::HostHeap::give_back`).
+    LentTaken,
 }
 
-const COUNTS: usize = Count::TablesLost as usize + 1;
+const COUNTS: usize = Count::LentTaken as usize + 1;
 
 /// The count of waits of the kind a wait's time is counted as.
 pub(crate) fn drains_of(why: Count) -> Option<Count> {
@@ -243,6 +247,7 @@ const MORE: &[(&str, Count, f64)] = &[
     ("table_retries", Count::TableRetries, 1.0),
     ("table_retry_ms", Count::TableRetryTime, 1e3),
     ("tables_lost", Count::TablesLost, 1.0),
+    ("lent_taken", Count::LentTaken, 1.0),
 ];
 
 const MORE_GAUGES: [(&str, Gauge); GAUGES] = [

@@ -968,19 +968,19 @@ mod tests {
         first
     }
 
-    /// A closed list with `n` slots of `heap` in a table, a bottom-of-pipe
-    /// write of `value` at `at`, and a copy of 4 bytes on the host GPU from
-    /// `copy.0` to `copy.1` if given.
-    fn tabled(
-        host: &Host,
+    /// Records into the open `list` a table of `n` slots of `heap`, a
+    /// bottom-of-pipe write of `value` at `at`, and a copy of 4 bytes on the
+    /// host GPU from `copy.0` to `copy.1` if given, and closes it: the
+    /// table's first slot.
+    fn record(
+        list: &HostList,
         heap: &Arc<HostHeap>,
         n: u32,
         at: usize,
         value: u64,
         copy: Option<(&ID3D12Resource, &ID3D12Resource)>,
-    ) -> (Arc<HostList>, u32) {
-        let list = host.new_list().unwrap();
-        let first = table(heap, &list, n);
+    ) -> u32 {
+        let first = table(heap, list, n);
         list.count_work();
         if let Some((from, to)) = copy {
             // SAFETY: an open list; live buffers it keeps, in the states
@@ -991,14 +991,72 @@ mod tests {
         }
         list.defer_write(at as *mut u8, Written::Value(value), 8);
         list.close();
+        first
+    }
+
+    /// A closed list as [`record`] makes it.
+    fn tabled(
+        host: &Host,
+        heap: &Arc<HostHeap>,
+        n: u32,
+        at: usize,
+        value: u64,
+        copy: Option<(&ID3D12Resource, &ID3D12Resource)>,
+    ) -> (Arc<HostList>, u32) {
+        let list = host.new_list().unwrap();
+        let first = record(&list, heap, n, at, value, copy);
         (Arc::new(list), first)
     }
 
-    /// As the title's `ExecuteCommandLists`: counted at the call, then run.
+    /// As the title's `ExecuteCommandLists` of a list cut into `parts`, of
+    /// a title's list known to submit each recording once (they may lend):
+    /// counted at the call, then run.
+    fn submit_parts(host: &Host, parts: &[Arc<HostList>]) -> crate::host::Submitting {
+        let s = crate::host::submitting(parts.iter().map(|p| &**p), true);
+        host.execute_title(parts);
+        s
+    }
+
+    /// [`submit_parts`] of a list in one part: whether it was submitted
+    /// before since it began.
     fn submit(host: &Host, list: &Arc<HostList>) -> bool {
-        let again = list.submitting(false);
-        host.execute_title(std::slice::from_ref(list));
-        again
+        submit_parts(host, std::slice::from_ref(list)).again
+    }
+
+    /// A copy's source, an upload buffer holding `0x1234_5678`, and its
+    /// destination, a read-back buffer.
+    struct Copied {
+        from: ID3D12Resource,
+        to: ID3D12Resource,
+        back: *const u8,
+    }
+
+    impl Copied {
+        fn new(host: &Host) -> Option<Copied> {
+            let ((from, data), (to, back)) = (host.upload_buffer(256)?, host.readback_buffer(256)?);
+            // SAFETY: mapped buffers of 256 bytes, the host GPU not using them.
+            unsafe {
+                data.cast::<u32>().write_volatile(0x1234_5678);
+                back.cast_mut().cast::<u32>().write_volatile(0);
+            }
+            Some(Copied { from, to, back })
+        }
+
+        fn pair(&self) -> Option<(&ID3D12Resource, &ID3D12Resource)> {
+            Some((&self.from, &self.to))
+        }
+
+        /// Whether the copy ran since the last look.
+        fn ran(&self) -> bool {
+            let at = self.back.cast_mut().cast::<u32>();
+            // SAFETY: a mapped read-back buffer of 256 bytes, looked at
+            // between submissions.
+            unsafe {
+                let word = at.read_volatile();
+                at.write_volatile(0);
+                word == 0x1234_5678
+            }
+        }
     }
 
     /// A table's slots come back when the title's submission of its list
@@ -1066,7 +1124,7 @@ mod tests {
         let (twice, _) = tabled(host, &heap, half, at(memory, 0), 1, None);
         let (once, lent) = tabled(host, &heap, slots - half, at(memory, 1), 2, None);
         // Two submissions of `twice` called before either runs.
-        assert!(!twice.submitting(false) && twice.submitting(false));
+        assert!(!twice.submitting(true).again && twice.submitting(true).again);
         host.execute_title(&[twice.clone()]);
         line.drain(Count::WaitHeld);
         assert_eq!(heap.take_dynamic(1, true), None, "given back while a submission is to run");
@@ -1095,46 +1153,119 @@ mod tests {
         assert!(heap.take_dynamic(half, true).is_some(), "kept after its last landing");
     }
 
-    /// A list the title submits again after another table took slots it
-    /// lent does not run its commands (they would read that table's
-    /// descriptors), but its bottom-of-pipe writes are done; one whose
-    /// slots were not taken runs as ever.
+    /// A list of a title's list not seen yet to submit each recording once
+    /// keeps its table after its landing, until its reset, or until the
+    /// title moves on from it, then at once.
     #[test]
-    fn a_list_whose_lent_slots_were_taken_does_not_run_its_commands() {
+    fn a_list_not_known_to_be_submitted_once_keeps_its_table() {
         if !crate::host::free_tables_at_landing() {
             return;
         }
         let Some((host, memory)) = host() else { return };
         let Some((heap, slots)) = HostHeap::capped_samplers() else { return };
         let line = host.line();
-        let buffers = (host.upload_buffer(256), host.readback_buffer(256));
-        let (Some((from, data)), Some((to, back))) = buffers else {
-            return;
-        };
-        let copied = || {
-            // SAFETY: a mapped read-back buffer of 256 bytes, read once its
-            // submission has landed.
-            unsafe { back.cast::<u32>().read_volatile() }
-        };
-        // SAFETY: mapped buffers of 256 bytes, the host GPU not using them.
-        unsafe {
-            data.cast::<u32>().write_volatile(0x1234_5678);
-            back.cast_mut().cast::<u32>().write_volatile(0);
+        let half = slots / 2;
+        let (reset, first) = tabled(host, &heap, half, at(memory, 0), 1, None);
+        let (parted, second) = tabled(host, &heap, slots - half, at(memory, 1), 2, None);
+        for list in [&reset, &parted] {
+            assert_eq!(list.submitting(false), crate::host::Submitting::default());
         }
-        let (list, first) = tabled(host, &heap, 8, at(memory, 0), 1, Some((&from, &to)));
-        heap.take_dynamic(slots - 8, true).expect("the other slots");
+        host.execute_title(&[reset.clone(), parted.clone()]);
+        line.drain(Count::WaitHeld);
+        assert_eq!(read(memory)[..2], [1, 2]);
+        assert_eq!((heap.take_dynamic(1, true), heap.lent()), (None, 0), "given back at the landing");
+        reset.reset();
+        assert_eq!(heap.take_dynamic(half, true).map(|t| t.0), Some(first));
+        parted.parted();
+        assert_eq!(heap.take_dynamic(slots - half, true).map(|t| t.0), Some(second));
+    }
+
+    /// A list the title submits again after another table took slots it
+    /// lent does not run its commands (they would read that table's
+    /// descriptors), but its bottom-of-pipe writes are done, in that
+    /// submission and every one after until its reset; one whose slots
+    /// were not taken runs as ever, as does its next recording.
+    #[test]
+    fn a_list_whose_lent_slots_were_taken_runs_without_its_commands_until_its_reset() {
+        if !crate::host::free_tables_at_landing() {
+            return;
+        }
+        let Some((host, memory)) = host() else { return };
+        let Some((heap, slots)) = HostHeap::capped_samplers() else { return };
+        let Some(copy) = Copied::new(host) else { return };
+        let line = host.line();
+        let (list, first) = tabled(host, &heap, 8, at(memory, 0), 1, copy.pair());
+        let (rest, _) = heap.take_dynamic(slots - 8, true).expect("the other slots");
         assert!(!submit(host, &list));
         line.drain(Count::WaitHeld);
-        assert_eq!((copied(), memory[0].load(Ordering::Acquire)), (0x1234_5678, 1));
-        // Lent: another table takes the same slots.
-        assert_eq!(heap.take_dynamic(8, true).map(|t| t.0), Some(first));
-        // SAFETY: as above, between submissions.
-        unsafe { back.cast_mut().cast::<u32>().write_volatile(0) };
-        memory[0].store(0, Ordering::Release);
-        assert!(submit(host, &list), "submitted again");
-        assert!(list.skipped());
+        assert_eq!((copy.ran(), memory[0].load(Ordering::Acquire)), (true, 1));
+        assert_eq!(heap.lent(), 8);
+        // Lent, and the only free ones: another table takes them.
+        let (taker, _) = heap.take_dynamic(8, true).expect("the lent slots");
+        assert_eq!((taker, heap.lent()), (first, 0));
+        for (i, submission) in ["again", "a third time"].into_iter().enumerate() {
+            memory[0].store(0, Ordering::Release);
+            let s = submit_parts(host, std::slice::from_ref(&list));
+            assert_eq!(s, crate::host::Submitting { again: true, lost: true }, "submitted {submission}");
+            assert!(list.skipped());
+            line.drain(Count::WaitHeld);
+            assert_eq!((copy.ran(), memory[0].load(Ordering::Acquire)), (false, 1), "its copy ran ({i})");
+        }
+        // Its next recording runs.
+        list.reset();
+        assert!(!list.skipped());
+        heap.release(taker, 8);
+        let again = record(&list, &heap, 8, at(memory, 0), 3, copy.pair());
+        assert_eq!(again, first);
+        assert!(!submit(host, &list));
         line.drain(Count::WaitHeld);
-        assert_eq!((copied(), memory[0].load(Ordering::Acquire)), (0, 1), "its copy ran");
+        assert_eq!((copy.ran(), memory[0].load(Ordering::Acquire)), (true, 3));
+        heap.release(rest, slots - 8);
+    }
+
+    /// A title's list cut into two parts, the second of which lost the
+    /// slots it lent, runs neither: the first part gives back the slots it
+    /// took back, both do their bottom-of-pipe writes, and both stay so
+    /// when submitted once more.
+    #[test]
+    fn a_title_list_whose_part_lost_its_slots_runs_none_of_its_parts() {
+        if !crate::host::free_tables_at_landing() {
+            return;
+        }
+        let Some((host, memory)) = host() else { return };
+        let Some((heap, slots)) = HostHeap::capped_samplers() else { return };
+        let (Some(copy_a), Some(copy_b)) = (Copied::new(host), Copied::new(host)) else { return };
+        let line = host.line();
+        // The second part's table first: it comes first where the next
+        // search starts.
+        let b = host.new_list().unwrap();
+        let a = host.new_list().unwrap();
+        let second = record(&b, &heap, 8, at(memory, 1), 2, copy_b.pair());
+        let first = record(&a, &heap, 8, at(memory, 0), 1, copy_a.pair());
+        let (rest, _) = heap.take_dynamic(slots - 16, true).expect("the other slots");
+        let parts = [Arc::new(a), Arc::new(b)];
+        assert_eq!(submit_parts(host, &parts), crate::host::Submitting::default());
+        line.drain(Count::WaitHeld);
+        assert_eq!((copy_a.ran(), copy_b.ran(), read(memory)[..2].to_vec()), (true, true, vec![1, 2]));
+        assert_eq!(heap.lent(), 16);
+        let (taker, _) = heap.take_dynamic(8, true).expect("lent slots");
+        assert_eq!(taker, second, "the second part's");
+        for submission in ["again", "a third time"] {
+            memory[0].store(0, Ordering::Release);
+            memory[1].store(0, Ordering::Release);
+            let s = submit_parts(host, &parts);
+            assert_eq!(s, crate::host::Submitting { again: true, lost: true }, "submitted {submission}");
+            assert!(parts.iter().all(|p| p.skipped()), "submitted {submission}");
+            line.drain(Count::WaitHeld);
+            let ran = (copy_a.ran(), copy_b.ran(), read(memory)[..2].to_vec());
+            assert_eq!(ran, (false, false, vec![1, 2]), "submitted {submission}");
+            // The first part's slots are free, and no longer lent.
+            assert_eq!(heap.lent(), 0);
+            assert_eq!(heap.take_dynamic(8, true).map(|t| t.0), Some(first));
+            heap.release(first, 8);
+        }
+        heap.release(taker, 8);
+        heap.release(rest, slots - 16);
     }
 
     /// A table that finds no free slots waits for the oldest flight to land
