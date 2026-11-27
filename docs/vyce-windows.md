@@ -90,6 +90,18 @@ Ele traduz os contêineres das pastas dadas para o cache de shaders e monta
 os pipelines de compute cujos hashes o arquivo lista. Pipelines gráficos
 dependem do estado que o jogo passa e só são montados em jogo.
 
+Rode-o com o mesmo ambiente que o launcher dá ao jogo (VICTORY_CONFIG,
+VICTORY_CACHE_DIR e VICTORY_DATA_DIR de Vyce-data) e com as chaves do
+tradutor como o jogo vai usar: uma chave trocada é outro cache. O alvo da
+tradução vem da placa, como no jogo; o log diz "host wave sizes" (32 e 32
+lanes, exact_views=true na RTX 2070 SUPER) e "the host's view heaps hold
+fewer views than the title's" (views=1000000). No fim ele diz quantas
+traduções vieram do cache e quantas foram feitas agora, e quantos
+pipelines foram compilados agora e quantos vieram da biblioteca. A lista
+dos pipelines do jogo que começam cedo no carregamento
+(cache\pipelines\early-pipelines.txt) fica como estava: até a build B o
+warm a gravava vazia ao salvar a biblioteca.
+
 ## Local dos arquivos
 
 Com o clone em D:\torrent\Vyce, o launcher usa a pasta irmã
@@ -394,3 +406,97 @@ valu_tests que já falhavam na NVIDIA, victory-hle com 99 passando e os 5
 testes de xmem que já falhavam, victory-loader com todos passando menos um
 do load_probe (falta a delayimp.lib no toolchain do laboratório) e os quatro
 lugares do código conferidos no executável 1.0.2.1, victory-core e o app.
+
+## Fase 1 (build B)
+
+A build B é a build A (vyce/2070s 2081287) com a correção de shaders
+juntada por merge, sem conflitos, e uma correção do comando warm:
+
+1. vyce/wt-shader (171e532): códigos normalizados (UNORM/SNORM) de buffers
+   exatos, dados de 16 bits de vistas de formato inteiro sem passar por f16,
+   programas wave64 recusados tentados de novo sem as saídas antecipadas (a
+   de dentro de um laço fica), os modificadores de v_interp_p2_f16, a
+   tabela de passos lida uma vez por vista e bloco, e os grupos de uma onda
+   com memória compartilhada rodando como duas ondas locais de 32 lanes que
+   só se encontram onde as duas rodam o mesmo número de vezes (as correções
+   dos travamentos da GPU e a análise do que as duas ondas podem ter
+   diferente). As chaves do tradutor ficam fora das regiões das passadas de
+   limpeza (as marcas `// clean-up passes: begin/end` continuam como
+   estavam).
+2. O warm não esvazia mais a lista dos pipelines do jogo que começam cedo
+   no carregamento (cache\pipelines\early-pipelines.txt): ao salvar a
+   biblioteca de pipelines ele gravava a lista que tinha lido, e ele não
+   lê nenhuma. Agora a lista é lida antes de ser gravada. No jogo nada
+   muda: ele a lê no primeiro pipeline do jogo, antes de qualquer gravação.
+   Sem chave: o comportamento antigo só perdia a lista. O resumo do warm
+   diz agora o que veio dos caches.
+
+O tradutor mudou: a impressão dele passou de
+5d536b05afbcb18a491c46fd06fd99a3 para d291d9a04367aead5a126f9532c6da45, e
+a primeira sessão traduziria todos os shaders e montaria os pipelines de
+novo no disco (na última vez, cerca de 1.700 pipelines e 11,5 minutos até
+o mundo). Por isso os caches foram preparados antes, com o jogo fechado, com
+a build release feita pelo launcher (scripts\vyce.ps1 -Action Build) e o
+ambiente que o launcher dá ao jogo:
+
+~~~powershell
+victory warm D:\torrent\Vyce-data\lab\shaders\host --pipelines <lista> --jobs 8
+~~~
+
+A lista tem os 954 programas de compute de lab\compute-used.txt e os de
+todas as sessões em Vyce-data\logs (960 ao todo). Em 253 s: 11.199
+contêineres traduzidos para o cache de shaders (todos novos), 72 recusados
+(endereço num SGPR, wave64 sem forma de 32 lanes, saídas de malha), 1.648
+pulados por serem DXIL de PC, sem programa do console; 631 pipelines de
+compute na biblioteca (534 já estavam lá, de shaders cujo DXIL não mudou,
+e 97 compilados), nenhum recusado pela placa, 39 programas que não
+traduzem e 290 deixados de fora pelas regras do jogo (247 resolves de
+raios, 42 da lista do cabelo e 1 dos raios das sondas). Os 626 pipelines
+de compute da última sessão estão entre eles. O alvo veio da placa, como
+no jogo: o log diz views=1000000 e lanes_min=32 lanes_max=32
+exact_views=true. Um segundo warm, em outro processo, achou no cache os 50
+contêineres que testou. A lista dos que começam cedo ficou com as mesmas
+2.042 entradas.
+
+O que ainda fica para a primeira sessão: 177 dos 2.050 shaders da última
+sessão não estão em lab\shaders\host (são todos de desenho: 89 de pixel,
+81 de malha e 7 de vértice) e são traduzidos em jogo, e os pipelines de
+desenho só podem ser montados com o estado que o jogo passa. Pelos
+pipelines que a última sessão usou, no máximo perto de 280 deles mudam
+(202 de malha com um shader mudado e 54 com um shader fora da pasta; 22 de
+vértice e pixel) e são compilados em jogo, começando no carregamento pela
+lista; os outros (408 dos 686 de desenho) vêm da biblioteca. Uma chave do
+tradutor trocada é outro cache: a primeira sessão com ela traduz tudo de
+novo.
+
+Para jogar, em PowerShell na raiz do Vyce:
+
+~~~powershell
+.\scripts\vyce.ps1 -Action Run
+~~~
+
+A build A ficou ao lado da nova, como
+Vyce-data\target\release\victory-2081287.exe; o cache dela continua no
+mesmo lugar, nada foi apagado.
+
+| O que mudou | Para voltar ao de antes |
+| --- | --- |
+| Códigos normalizados de buffers com o valor exato, não a divisão da GPU (126 dos 256 códigos de 8 bits erravam o último bit nesta placa) | VICTORY_EXACT_NORM=0 |
+| Dados de 16 bits de vistas de formato inteiro com os bits como estão, marcados na tabela de passos | VICTORY_D16_INTEGER=0 |
+| Programas wave64 recusados tentados de novo sem as saídas antecipadas e os saltos que o código depois deles não vê | VICTORY_WAVE_FORMS=0 |
+| A saída antecipada de dentro de um laço fica (pode ser a única saída dele) | VICTORY_LOOP_EARLY_OUTS=0, só para comparar: pode travar a GPU |
+| v_interp_p2_f16 escreve a metade que op_sel pede, depois do multiplicador e da saturação | VICTORY_INTERP_F16_MODS=0 |
+| Resultados de 16 bits arredondados ao mais próximo, como no console | Desligado por padrão; VICTORY_F16_NEAREST=1 liga |
+| A tabela de passos lida uma vez por vista e bloco | VICTORY_STRIDE_ONCE=0 |
+| Grupos de uma onda com memória compartilhada como duas ondas locais de 32 | VICTORY_LDS_LOCAL=0 |
+| As duas ondas locais só se encontram onde as duas rodam o mesmo número de vezes | VICTORY_LOCAL_MEET_CHECKS=0, só para comparar: pode travar a GPU |
+| A análise do que as duas ondas podem ter diferente conta acumuladores, máscaras de seleção e leituras de memória que o dispatch escreve | VICTORY_HOST_WAVE_READS=0, só para comparar: pode travar a GPU |
+| O warm grava de volta a lista dos pipelines que começam cedo | Sem chave (antes ele a esvaziava) |
+
+Testada pelo heavy.sh: victory-shader com 310 passando e as 4 valu_tests
+que já falhavam na NVIDIA (com VICTORY_DXIL, as 26 split_tests passam),
+victory-gpu na placa com 196 passando e 9 ignorados, victory-hle com 99
+passando e os 5 testes de xmem que já falhavam, victory-loader com todos
+passando menos um do load_probe (falta a delayimp.lib no toolchain do
+laboratório) e os lugares do código conferidos no executável 1.0.2.1,
+victory-core e o app. Ainda não foi medida em jogo.
