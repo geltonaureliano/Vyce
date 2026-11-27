@@ -38,13 +38,16 @@ pub(crate) struct HostHeap {
     /// slot viewing a pooled texture, so the backing heap cannot be freed while
     /// a shader-visible descriptor slot still points into it.
     kept_textures: Mutex<HashMap<u32, Arc<crate::resource::HostTexture>>>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    /// Where the next search starts, the slots taken, and the smallest run
-    /// known not to be free since the last release (`usize::MAX`: none).
-    next: Mutex<(u32, Vec<bool>, usize)>,
+    /// The dynamic slots: which are taken (by lists whose submissions may
+    /// still read them), where the next search starts, and the tag of the
+    /// table each slot was last taken for ([`Free`]).
+    next: Mutex<Free>,
     /// How many of them are taken (for the session panel).
     taken: AtomicU64,
+    /// How many were given back so far, and that count when a table's wait
+    /// for a landing last gave none back (`u64::MAX`: it did, or none
+    /// waited): `crate::host::HostList::room_for_tables`.
+    released: [AtomicU64; 2],
     /// Per-slot element byte stride (`u32`) for structured buffers whose
     /// stride shader analysis could not recover statically.
     strides: Option<StrideTable>,
@@ -69,6 +72,22 @@ pub(crate) struct HostHeap {
 
 /// The dword of the stride table the element counts start at.
 const COUNTS_AT: u32 = victory_shader::emit::OWN_SLOTS;
+
+/// A heap's dynamic slots ([`HostHeap::take_dynamic`]).
+struct Free {
+    /// Where the next search starts.
+    next: u32,
+    taken: Vec<bool>,
+    /// The smallest run known not to be free since the last release
+    /// (`usize::MAX`: none).
+    no_run: usize,
+    /// The tag of the table each slot was last taken for (0: none yet). A
+    /// slot keeps it when given back, so a list submitted again can tell its
+    /// slots were not taken since ([`HostHeap::retake`]).
+    tags: Vec<u64>,
+    /// The last tag given.
+    tag: u64,
+}
 
 struct StrideTable {
     _resource: ID3D12Resource,
@@ -592,7 +611,10 @@ pub(crate) const PORTABLE_VIEWS: u32 = 1_000_000;
 
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
-/// took until it is reset (its submissions have run) or released. A world
+/// took until its last submission has landed
+/// (`crate::host::HostList::landed`), or with
+/// `VICTORY_FREE_TABLES_AT_LANDING=0` until it is reset (its submissions
+/// have run) or released. A world
 /// frame of some 7,000 draws held over 400,000 of 2^19, and tables of 150
 /// slots no longer fit: the draws that needed them were dropped (the
 /// subsurface resolve, tree imposters). `victory_shader::emit::VIEW_SLOTS`
@@ -878,8 +900,15 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             kept_textures: Mutex::default(),
-            next: Mutex::new((0, taken, usize::MAX)),
+            next: Mutex::new(Free {
+                next: 0,
+                tags: vec![0; taken.len()],
+                taken,
+                no_run: usize::MAX,
+                tag: 0,
+            }),
             taken: AtomicU64::new(reserved),
+            released: [AtomicU64::new(0), AtomicU64::new(u64::MAX)],
             strides,
             bindless: Mutex::default(),
             recording: std::sync::atomic::AtomicBool::new(false),
@@ -999,6 +1028,34 @@ impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps and capped sampler
     /// heaps), taken until [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
+        let taken = self.take_dynamic(n, false).map(|(first, _)| first);
+        if taken.is_none() {
+            self.not_made(n);
+        }
+        taken
+    }
+
+    /// Logs, once, that a table of `n` entries found no free dynamic slots
+    /// and is not made.
+    pub(crate) fn not_made(&self, n: u32) {
+        // (Tables larger than all of them are told of where they are refused.)
+        if n == 0 || self.spare == 0 || n > self.spare {
+            return;
+        }
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let spare = self.spare;
+        ONCE.call_once(|| {
+            tracing::warn!(n, spare, "no free dynamic descriptor slots: a table is not made")
+        });
+    }
+
+    /// [`HostHeap::dynamic`], with the tag the slots were taken with
+    /// ([`HostHeap::retake`]), and without its warning. `again`: after
+    /// slots came back for a table that found none
+    /// (`crate::host::HostList::room_for_tables`), which walks the slots
+    /// even if tables of its size failed often in this frame (once, and
+    /// not counted with those failures).
+    pub(crate) fn take_dynamic(&self, n: u32, again: bool) -> Option<(u32, u64)> {
         if n == 0 || self.spare == 0 {
             return None;
         }
@@ -1016,13 +1073,13 @@ impl HostHeap {
         }
         let spare = self.spare as usize;
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken, no_run) = &mut *guard;
+        let free = &mut *guard;
         let n = n as usize;
         // A search that found no run of this size (or of a smaller one)
         // since the last release finds none now: without this, each table
         // of a frame that does not fit walked all the slots again, and a
         // heavy place took 7 to 11 seconds a frame (runs sw1, sw2).
-        if n >= *no_run {
+        if n >= free.no_run {
             return None;
         }
         // Releases come all the time and each allows a search again: no
@@ -1035,13 +1092,14 @@ impl HostHeap {
             FAILED[1].store(0, Ordering::Relaxed);
             FAILED[2].store(u64::MAX, Ordering::Relaxed);
         }
-        if FAILED[1].load(Ordering::Relaxed) >= WALKS
+        if !again
+            && FAILED[1].load(Ordering::Relaxed) >= WALKS
             && n as u64 >= FAILED[2].load(Ordering::Relaxed)
         {
             return None;
         }
         // Search from `next` on, then from the start.
-        let starts = (*next as usize..spare).chain(0..*next as usize);
+        let starts = (free.next as usize..spare).chain(0..free.next as usize);
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
@@ -1051,21 +1109,24 @@ impl HostHeap {
                 run = 0;
             }
             last = at;
-            run = if taken[at] { 0 } else { run + 1 };
+            run = if free.taken[at] { 0 } else { run + 1 };
             if run == n {
                 found = Some(at + 1 - n);
                 break;
             }
         }
         let Some(first) = found else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, spare, "no free dynamic descriptor slots: a table is not made"));
-            *no_run = n;
-            FAILED[1].fetch_add(1, Ordering::Relaxed);
-            FAILED[2].fetch_min(n as u64, Ordering::Relaxed);
+            free.no_run = n;
+            if !again {
+                FAILED[1].fetch_add(1, Ordering::Relaxed);
+                FAILED[2].fetch_min(n as u64, Ordering::Relaxed);
+            }
             return None;
         };
-        taken[first..first + n].fill(true);
+        free.taken[first..first + n].fill(true);
+        free.tag += 1;
+        let tag = free.tag;
+        free.tags[first..first + n].fill(tag);
         let held = self.taken.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
         crate::telemetry::note(crate::telemetry::Gauge::Slots, held);
         #[cfg(feature = "diagnostics")]
@@ -1073,12 +1134,36 @@ impl HostHeap {
             static MADE: AtomicU64 = AtomicU64::new(0);
             let before = MADE.fetch_add(n as u64, Ordering::Relaxed);
             if before >> 20 != (before + n as u64) >> 20 {
-                let used = taken.iter().filter(|t| **t).count();
+                let used = free.taken.iter().filter(|t| **t).count();
                 tracing::info!(used, spare, "dynamic descriptor slots");
             }
         }
-        *next = ((first + n) % spare) as u32;
-        Some(self.count + first as u32)
+        free.next = ((first + n) % spare) as u32;
+        Some((self.count + first as u32, tag))
+    }
+
+    /// Takes the `n` dynamic slots from `first` again, for a list submitted
+    /// again after it gave them back (`crate::host::HostList::submitting`):
+    /// only if all of them are free and no table took any since they were
+    /// taken with `tag`, so they still hold what the list's commands read.
+    pub(crate) fn retake(&self, first: u32, n: u32, tag: u64) -> bool {
+        let Some(at) = first.checked_sub(self.count) else {
+            return false;
+        };
+        let at = at as usize;
+        let end = at.checked_add(n as usize).filter(|&end| n > 0 && end <= self.spare as usize);
+        let Some(end) = end else {
+            return false;
+        };
+        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let free = &mut *guard;
+        if free.taken[at..end].iter().any(|&t| t) || free.tags[at..end].iter().any(|&t| t != tag) {
+            return false;
+        }
+        free.taken[at..end].fill(true);
+        let held = self.taken.fetch_add(u64::from(n), Ordering::Relaxed) + u64::from(n);
+        crate::telemetry::note(crate::telemetry::Gauge::Slots, held);
+        true
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -1097,12 +1182,41 @@ impl HostHeap {
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = at.saturating_add(n).min(self.spare) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
+        if let Some(slots) = guard.taken.get_mut(at as usize..end) {
             let held = slots.iter().filter(|&&t| t).count();
             self.taken.fetch_sub(held as u64, Ordering::Relaxed);
+            self.released[0].fetch_add(held as u64, Ordering::AcqRel);
             slots.fill(false);
         }
-        guard.2 = usize::MAX;
+        guard.no_run = usize::MAX;
+    }
+
+    /// Whether a table of `n` entries fits in the dynamic slots once enough
+    /// are free.
+    pub(crate) fn could_fit(&self, n: u32) -> bool {
+        n > 0 && n <= self.spare
+    }
+
+    /// How many dynamic slots were given back so far.
+    pub(crate) fn released(&self) -> u64 {
+        self.released[0].load(Ordering::Acquire)
+    }
+
+    /// What [`HostHeap::released`] was when a table's wait for a landing
+    /// last gave no slot back (`u64::MAX`: none such since one did).
+    pub(crate) fn dry(&self) -> u64 {
+        self.released[1].load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_dry(&self, released: u64) {
+        self.released[1].store(released, Ordering::Release);
+    }
+
+    /// A sampler heap past the host's limit, with its dynamic slots, and
+    /// how many those are.
+    #[cfg(test)]
+    pub(crate) fn capped_samplers() -> Option<(Arc<HostHeap>, u32)> {
+        Some((Arc::new(HostHeap::new(true, 4 * SAMPLERS)?), SAMPLER_DYNAMIC))
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -3535,7 +3649,7 @@ void main() {
         // (A host that caps its heaps gives the title all the others.)
         let start = heap.count();
         // (The last one may be kept null for wild indices.)
-        let spare = heap.next.lock().unwrap().1.iter().filter(|t| !**t).count() as u32;
+        let spare = heap.next.lock().unwrap().taken.iter().filter(|t| !**t).count() as u32;
         let a = heap.dynamic(spare - 100).unwrap();
         let b = heap.dynamic(60).unwrap();
         assert_eq!((a, b), (start, start + spare - 100));

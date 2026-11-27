@@ -138,9 +138,19 @@ pub(crate) enum Count {
     /// Title buffer copies that went on where the one before ended, made one
     /// with it.
     CopiesJoined,
+    /// Dynamic descriptor slots given back when the submission of their
+    /// list landed (`crate::host::free_tables_at_landing`).
+    SlotsFreedAtLanding,
+    /// Tables that found no free dynamic slots and waited for a landing,
+    /// and the time they waited.
+    TableRetries,
+    TableRetryTime,
+    /// Submissions of lists the title submitted again after other tables
+    /// took their slots: their commands were not run.
+    TablesLost,
 }
 
-const COUNTS: usize = Count::CopiesJoined as usize + 1;
+const COUNTS: usize = Count::TablesLost as usize + 1;
 
 /// The count of waits of the kind a wait's time is counted as.
 pub(crate) fn drains_of(why: Count) -> Option<Count> {
@@ -229,6 +239,10 @@ const MORE: &[(&str, Count, f64)] = &[
     ("watch_ms", Count::WatchTime, 1e3),
     ("watch_ahead", Count::WatchAhead, 1.0),
     ("copies_joined", Count::CopiesJoined, 1.0),
+    ("slots_freed_at_landing", Count::SlotsFreedAtLanding, 1.0),
+    ("table_retries", Count::TableRetries, 1.0),
+    ("table_retry_ms", Count::TableRetryTime, 1e3),
+    ("tables_lost", Count::TablesLost, 1.0),
 ];
 
 const MORE_GAUGES: [(&str, Gauge); GAUGES] = [

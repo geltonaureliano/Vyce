@@ -1,8 +1,10 @@
 //! Submissions sent to the host GPU and not waited for ("flights"), in the
 //! order they were sent, and what is left to do once each has run (its
 //! landing): what its shaders wrote goes back into title memory, then its
-//! read-backs, then its bottom-of-pipe writes, then what the title's queues
-//! put behind it (fence signals).
+//! read-backs, then its bottom-of-pipe writes, then the dynamic descriptor
+//! slots of its lists that no other submission runs
+//! (`crate::host::HostList::landed`), then what the title's queues put
+//! behind it (fence signals).
 //!
 //! All the title's queues run on one host queue, in submission order. So a
 //! queue's signal need not wait for the host GPU: it goes behind the newest
@@ -329,6 +331,60 @@ impl Line {
         }
     }
 
+    /// Whether the flight with fence value `fence` has landed.
+    pub(crate) fn landed_up_to(&self, fence: u64) -> bool {
+        self.landed.load(Ordering::Acquire) >= fence
+    }
+
+    /// Waits up to `most` for the oldest flight in the air to land, landing
+    /// it here once the host GPU has run it (unless another thread does):
+    /// whether it landed. At once `false` with nothing in flight, and inside
+    /// a landing, behind which nothing lands.
+    pub(crate) fn land_oldest(&self, most: Duration) -> bool {
+        if LANDING.get() {
+            return false;
+        }
+        let Some(target) = self.state().flights.front().map(|f| f.fence) else {
+            return false;
+        };
+        let began = Instant::now();
+        loop {
+            if self.landed.load(Ordering::Acquire) >= target {
+                return true;
+            }
+            let left = most.saturating_sub(began.elapsed());
+            if left.is_zero() || !self.reached_within(target, left) {
+                return false;
+            }
+            if self.land() == 0 {
+                // Another thread is landing it.
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    /// Whether the host GPU reaches `target` within `most`.
+    fn reached_within(&self, target: u64, most: Duration) -> bool {
+        use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+        // SAFETY: our fence, and an event of our own, closed when done: a
+        // wait that timed out leaves the event object with the fence, which
+        // holds it, not our handle, until it sets it.
+        unsafe {
+            if self.fence.GetCompletedValue() >= target {
+                return true;
+            }
+            let Ok(event) = CreateEventW(None, false, false, None) else {
+                return false;
+            };
+            let ms = most.as_millis().clamp(1, u128::from(u32::MAX - 1)) as u32;
+            let set = self.fence.SetEventOnCompletion(target, event).is_ok()
+                && WaitForSingleObject(event, ms) == WAIT_OBJECT_0;
+            let _ = CloseHandle(event);
+            set || self.fence.GetCompletedValue() >= target
+        }
+    }
+
     /// Blocks until the host GPU has reached `target`.
     fn reached(&self, target: u64) {
         // SAFETY: our fence; without an event the call itself blocks, on any
@@ -403,6 +459,11 @@ impl Line {
             }
             crate::host::ran(runs.len(), took);
             crate::host::finish(&self.queue, &runs, &flight.back, &flight.writes);
+            // The dynamic descriptor slots of lists no other submission
+            // runs come back, before the title is told.
+            for list in &runs {
+                list.landed(flight.fence);
+            }
             {
                 // Then what was put behind it, under the lock: who looks
                 // finds a signal still to come, or the fence at its value.
@@ -460,7 +521,8 @@ fn land_all(line: &Weak<Line>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::Host;
+    use crate::descriptor::host::HostHeap;
+    use crate::host::{Host, Table};
     use crate::memwait::Wait;
     use crate::object::{This, slot};
     use crate::timeline::{Lists, Op, Timeline};
@@ -896,6 +958,225 @@ mod tests {
         assert_eq!(seen.load(Ordering::Acquire), 7, "ran before the value it follows");
         worker.join().unwrap();
         until(|| queue.idle() && !line.busy());
+    }
+
+    /// Gives `list` a table of `n` dynamic slots of `heap`, as `crate::draw`
+    /// does: the first's index.
+    fn table(heap: &Arc<HostHeap>, list: &HostList, n: u32) -> u32 {
+        let (first, tag) = heap.take_dynamic(n, true).expect("free dynamic slots");
+        list.hold_table(Table { heap: heap.clone(), first, n, tag });
+        first
+    }
+
+    /// A closed list with `n` slots of `heap` in a table, a bottom-of-pipe
+    /// write of `value` at `at`, and a copy of 4 bytes on the host GPU from
+    /// `copy.0` to `copy.1` if given.
+    fn tabled(
+        host: &Host,
+        heap: &Arc<HostHeap>,
+        n: u32,
+        at: usize,
+        value: u64,
+        copy: Option<(&ID3D12Resource, &ID3D12Resource)>,
+    ) -> (Arc<HostList>, u32) {
+        let list = host.new_list().unwrap();
+        let first = table(heap, &list, n);
+        list.count_work();
+        if let Some((from, to)) = copy {
+            // SAFETY: an open list; live buffers it keeps, in the states
+            // their heaps keep them in (upload: read, read-back: copy).
+            unsafe { list.list.CopyBufferRegion(to, 0, from, 0, 4) };
+            list.keep(from);
+            list.keep(to);
+        }
+        list.defer_write(at as *mut u8, Written::Value(value), 8);
+        list.close();
+        (Arc::new(list), first)
+    }
+
+    /// As the title's `ExecuteCommandLists`: counted at the call, then run.
+    fn submit(host: &Host, list: &Arc<HostList>) -> bool {
+        let again = list.submitting(false);
+        host.execute_title(std::slice::from_ref(list));
+        again
+    }
+
+    /// A table's slots come back when the title's submission of its list
+    /// lands, not before: while it is in flight (behind a gate) no other
+    /// table takes them, and once it has landed one takes the same. A list
+    /// recorded and never submitted keeps its table through the landings
+    /// of others, until its reset.
+    #[test]
+    fn a_table_comes_back_once_its_flight_has_landed() {
+        if !crate::host::free_tables_at_landing() {
+            return;
+        }
+        let Some((host, memory)) = host() else { return };
+        let Some((heap, slots)) = HostHeap::capped_samplers() else { return };
+        let line = host.line();
+        let kept = host.new_list().unwrap();
+        let held = table(&heap, &kept, 16);
+        let gate = Gate(host.gate());
+        let (sent, first) = tabled(host, &heap, slots - 16, at(memory, 0), 1, None);
+        assert!(!submit(host, &sent));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(line.busy());
+        assert_eq!(heap.take_dynamic(1, true), None, "taken while its flight is in the air");
+        gate.open();
+        line.drain(Count::WaitHeld);
+        assert_eq!(memory[0].load(Ordering::Acquire), 1);
+        let (again, _) = heap.take_dynamic(slots - 16, true).expect("given back when it landed");
+        assert_eq!(again, first);
+        assert_eq!(heap.take_dynamic(1, true), None, "the list never submitted keeps its own");
+        kept.close();
+        kept.reset();
+        assert_eq!(heap.take_dynamic(16, true).map(|t| t.0), Some(held));
+    }
+
+    /// A recording the title moved on from gives its table back at once when
+    /// nothing of it is to run (it was never submitted).
+    #[test]
+    fn a_parted_recording_nothing_runs_gives_its_table_back_at_once() {
+        if !crate::host::free_tables_at_landing() {
+            return;
+        }
+        let Some((host, _)) = host() else { return };
+        let Some((heap, slots)) = HostHeap::capped_samplers() else { return };
+        let idle = host.new_list().unwrap();
+        let first = table(&heap, &idle, slots);
+        assert_eq!(heap.take_dynamic(1, true), None);
+        idle.parted();
+        assert_eq!(heap.take_dynamic(slots, true).map(|t| t.0), Some(first));
+    }
+
+    /// A list submitted twice keeps its table while one of the submissions
+    /// is still to run, and after both (the title submits it again), until
+    /// its reset, unless the title parted from it while it was in flight.
+    /// A table lent at a landing is taken back by a submission that comes
+    /// again.
+    #[test]
+    fn a_table_a_submission_may_still_read_is_kept() {
+        if !crate::host::free_tables_at_landing() {
+            return;
+        }
+        let Some((host, memory)) = host() else { return };
+        let Some((heap, slots)) = HostHeap::capped_samplers() else { return };
+        let line = host.line();
+        let half = slots / 2;
+        let (twice, _) = tabled(host, &heap, half, at(memory, 0), 1, None);
+        let (once, lent) = tabled(host, &heap, slots - half, at(memory, 1), 2, None);
+        // Two submissions of `twice` called before either runs.
+        assert!(!twice.submitting(false) && twice.submitting(false));
+        host.execute_title(&[twice.clone()]);
+        line.drain(Count::WaitHeld);
+        assert_eq!(heap.take_dynamic(1, true), None, "given back while a submission is to run");
+        host.execute_title(&[twice.clone()]);
+        line.drain(Count::WaitHeld);
+        assert_eq!(heap.take_dynamic(1, true), None, "given back by a list submitted again");
+        // `once` lends its table when it lands, and takes it back.
+        assert!(!submit(host, &once));
+        line.drain(Count::WaitHeld);
+        assert!(submit(host, &once), "submitted again");
+        assert!(!once.skipped());
+        assert_eq!(heap.take_dynamic(1, true), None, "not taken back");
+        line.drain(Count::WaitHeld);
+        assert_eq!(memory[1].load(Ordering::Acquire), 2);
+        assert_eq!(heap.take_dynamic(1, true), None, "lent by a list the title submits again");
+        once.reset();
+        assert_eq!(heap.take_dynamic(slots - half, true).map(|t| t.0), Some(lent));
+        // The title moves on from `twice` (a reset) while it is in flight:
+        // its table goes once that has landed, submitted again or not.
+        let gate = Gate(host.gate());
+        assert!(submit(host, &twice));
+        twice.parted();
+        assert_eq!(heap.take_dynamic(1, true), None, "given back while in flight");
+        gate.open();
+        line.drain(Count::WaitHeld);
+        assert!(heap.take_dynamic(half, true).is_some(), "kept after its last landing");
+    }
+
+    /// A list the title submits again after another table took slots it
+    /// lent does not run its commands (they would read that table's
+    /// descriptors), but its bottom-of-pipe writes are done; one whose
+    /// slots were not taken runs as ever.
+    #[test]
+    fn a_list_whose_lent_slots_were_taken_does_not_run_its_commands() {
+        if !crate::host::free_tables_at_landing() {
+            return;
+        }
+        let Some((host, memory)) = host() else { return };
+        let Some((heap, slots)) = HostHeap::capped_samplers() else { return };
+        let line = host.line();
+        let buffers = (host.upload_buffer(256), host.readback_buffer(256));
+        let (Some((from, data)), Some((to, back))) = buffers else {
+            return;
+        };
+        let copied = || {
+            // SAFETY: a mapped read-back buffer of 256 bytes, read once its
+            // submission has landed.
+            unsafe { back.cast::<u32>().read_volatile() }
+        };
+        // SAFETY: mapped buffers of 256 bytes, the host GPU not using them.
+        unsafe {
+            data.cast::<u32>().write_volatile(0x1234_5678);
+            back.cast_mut().cast::<u32>().write_volatile(0);
+        }
+        let (list, first) = tabled(host, &heap, 8, at(memory, 0), 1, Some((&from, &to)));
+        heap.take_dynamic(slots - 8, true).expect("the other slots");
+        assert!(!submit(host, &list));
+        line.drain(Count::WaitHeld);
+        assert_eq!((copied(), memory[0].load(Ordering::Acquire)), (0x1234_5678, 1));
+        // Lent: another table takes the same slots.
+        assert_eq!(heap.take_dynamic(8, true).map(|t| t.0), Some(first));
+        // SAFETY: as above, between submissions.
+        unsafe { back.cast_mut().cast::<u32>().write_volatile(0) };
+        memory[0].store(0, Ordering::Release);
+        assert!(submit(host, &list), "submitted again");
+        assert!(list.skipped());
+        line.drain(Count::WaitHeld);
+        assert_eq!((copied(), memory[0].load(Ordering::Acquire)), (0, 1), "its copy ran");
+    }
+
+    /// A table that finds no free slots waits for the oldest flight to land
+    /// and finds those of its lists; behind a gate that stays shut it waits
+    /// no longer than its bound, and the next waits not at all while no slot
+    /// came back.
+    #[test]
+    fn a_table_without_slots_waits_for_the_oldest_flight_a_while() {
+        if !crate::host::free_tables_at_landing() || crate::host::table_retry_ms() < 20 {
+            return;
+        }
+        let Some((host, memory)) = host() else { return };
+        let Some((heap, slots)) = HostHeap::capped_samplers() else { return };
+        let line = host.line();
+        let recording = host.new_list().unwrap();
+        let gate = Gate(host.gate());
+        let (full, first) = tabled(host, &heap, slots, at(memory, 0), 1, None);
+        submit(host, &full);
+        std::thread::scope(|s| {
+            let waiter = s.spawn(|| recording.room_for_tables(&heap));
+            std::thread::sleep(Duration::from_millis(10));
+            gate.open();
+            assert!(waiter.join().unwrap(), "no slots came back");
+        });
+        let (again, _) = heap.take_dynamic(slots, true).expect("given back");
+        assert_eq!(again, first);
+        heap.release(again, slots);
+        // Behind a gate that stays shut.
+        let gate = Gate(host.gate());
+        let (shut, _) = tabled(host, &heap, slots, at(memory, 1), 2, None);
+        submit(host, &shut);
+        let began = Instant::now();
+        assert!(!recording.room_for_tables(&heap));
+        let waited = began.elapsed();
+        let most = Duration::from_millis(crate::host::table_retry_ms());
+        assert!(waited >= most / 2 && waited < most + Duration::from_secs(2), "{waited:?}");
+        let began = Instant::now();
+        assert!(!recording.room_for_tables(&heap));
+        assert!(began.elapsed() < most / 2, "waited again");
+        gate.open();
+        line.drain(Count::WaitHeld);
+        assert!(heap.take_dynamic(slots, true).is_some());
     }
 
     /// Shaders' writes go into title memory when their flight lands, before
