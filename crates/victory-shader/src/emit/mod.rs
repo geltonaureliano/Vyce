@@ -250,8 +250,8 @@ pub enum Switch {
     /// group meet where the fork put their group barriers again: also in
     /// the blocks of a loop that lanes leave after different numbers of
     /// turns, inside branches on scalars the two host waves may hold apart
-    /// (the slots each reserved, a lane read, a scalar load of memory the
-    /// dispatch writes), and in programs that reach
+    /// (the slots each reserved, a lane read, a scalar load of memory
+    /// written while the dispatch runs), and in programs that reach
     /// memory by address (their last group's threads past the dispatch
     /// return at once). Each can leave a host thread waiting at a barrier
     /// the others never reach: a hang (`lower::local_lds`).
@@ -270,11 +270,25 @@ pub enum Switch {
     /// A lane read of such a value can then part the host waves at a
     /// barrier: a hang (`local_waves::host_wave_varying`).
     HostWaveReads,
+    /// `VICTORY_VIEW_LOADS_APART=0`: with the host-wave reads on, a plain
+    /// scalar load of an unordered-access view or of a view of no declared
+    /// kind counts as one the two host waves may read apart only in a
+    /// program that itself stores to memory, as in 5c99db2: a write by
+    /// another dispatch landing between their two loads is not seen
+    /// (`local_waves::loads_of_written_memory`).
+    ViewLoadsApart,
+    /// `VICTORY_LANE_READ_BRANCHES=0`: a program with a branch the two host
+    /// waves of local waves take apart only because a lane read took a value
+    /// the lanes hold apart (not the slots the allocation idiom reserved)
+    /// runs as local waves again before the console flow. Each host wave
+    /// reads a lane of its own there, so the program can go another way than
+    /// the console's wave does (`local_waves::parted_by_lane_read`).
+    LaneReadBranches,
 }
 
 impl Switch {
     /// Every switch, in the order of [`switches`]'s bits.
-    pub const ALL: [Switch; 10] = [
+    pub const ALL: [Switch; 12] = [
         Switch::ExactNorm,
         Switch::D16Integer,
         Switch::WaveForms,
@@ -285,6 +299,8 @@ impl Switch {
         Switch::LocalMeetChecks,
         Switch::LoopEarlyOuts,
         Switch::HostWaveReads,
+        Switch::ViewLoadsApart,
+        Switch::LaneReadBranches,
     ];
 
     /// The environment variable that sets it.
@@ -300,6 +316,8 @@ impl Switch {
             Switch::LocalMeetChecks => "VICTORY_LOCAL_MEET_CHECKS",
             Switch::LoopEarlyOuts => "VICTORY_LOOP_EARLY_OUTS",
             Switch::HostWaveReads => "VICTORY_HOST_WAVE_READS",
+            Switch::ViewLoadsApart => "VICTORY_VIEW_LOADS_APART",
+            Switch::LaneReadBranches => "VICTORY_LANE_READ_BRANCHES",
         }
     }
 
@@ -624,6 +642,9 @@ enum Form {
     PerLane,
     /// Each host wave of 32 lanes a console wave of its own.
     Local,
+    /// [`Form::Local`] where the console flow, which was to come first,
+    /// does not translate the program ([`local_waves::parted_by_lane_read`]).
+    LocalAfterConsole,
     /// As the console runs it ([`lower::CONSOLE_FLOW`]).
     Console,
 }
@@ -642,9 +663,10 @@ fn one_wave_with_lds(native: &NativeProgram) -> bool {
 /// [`emit`]'s other forms of a console wave64 compute program: without its
 /// early-outs, then without its skips ([`ir::without_early_outs`],
 /// [`ir::without_skips`]); the first that translates (with `local`, the
-/// first that translates as local waves). `VICTORY_WHY=1` says what each
-/// gave. (The forms are VIctory-7900XTX's, tried there in this order
-/// before its approximate ones, which are not taken here.)
+/// first that translates as local waves before the console flow, not those
+/// a lane read parts). `VICTORY_WHY=1` says what each gave. (The forms are
+/// VIctory-7900XTX's, tried there in this order before its approximate
+/// ones, which are not taken here.)
 fn without_branches(
     c: &Container,
     native: &NativeProgram,
@@ -828,14 +850,33 @@ fn emit_program(
     let mut form = Form::PerLane;
     let l = match lower::lower(&parts) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
+            // Local waves before the console flow; after it where a branch
+            // would part the two host waves only by a lane read, which
+            // takes each host wave's own lane (`VICTORY_LANE_READ_BRANCHES=0`:
+            // before it all the same).
+            let mut local_after = false;
             if local() == Local::First {
-                parts.local = true;
-                match lower::lower(&parts) {
-                    Ok(l) => return Ok((host_shader(native, l), Form::Local)),
-                    Err(e) if why => eprintln!("local waves: {e}"),
-                    Err(_) => {}
+                let parted = Switch::LaneReadBranches
+                    .on()
+                    .then(|| local_waves::parted_by_lane_read(native, p, st, res))
+                    .flatten();
+                if let Some(offset) = parted {
+                    if why {
+                        eprintln!(
+                            "local waves: a lane read parts the host waves at the branch at \
+                             {offset:#x}; the console flow first"
+                        );
+                    }
+                    local_after = true;
+                } else {
+                    parts.local = true;
+                    match lower::lower(&parts) {
+                        Ok(l) => return Ok((host_shader(native, l), Form::Local)),
+                        Err(e) if why => eprintln!("local waves: {e}"),
+                        Err(_) => {}
+                    }
+                    parts.local = false;
                 }
-                parts.local = false;
             }
             let console = structure::structure_console(p);
             let lowered = match &console {
@@ -861,11 +902,21 @@ fn emit_program(
                     form = Form::Console;
                     l
                 }
-                // What the console flow cannot lower keeps the per-lane form
-                // where that translates; else the console flow's reason.
+                // What the console flow cannot lower keeps the local waves it
+                // was to come before, then the per-lane form where that
+                // translates; else the console flow's reason.
                 Err(e) => {
                     parts.st = st;
                     parts.console_cf = false;
+                    if local_after {
+                        parts.local = true;
+                        match lower::lower(&parts) {
+                            Ok(l) => return Ok((host_shader(native, l), Form::LocalAfterConsole)),
+                            Err(l) if why => eprintln!("local waves: {l}"),
+                            Err(_) => {}
+                        }
+                        parts.local = false;
+                    }
                     parts.per_lane_only = true;
                     lower::lower(&parts).map_err(|_| e)?
                 }
@@ -896,7 +947,9 @@ enum Local {
     No,
     /// Before the console flow: the same result without exchanges (the
     /// idiom's slots in another order). (What translates in the per-lane
-    /// form keeps it.)
+    /// form keeps it; a program with a branch that a lane read parts the
+    /// host waves on takes the console flow first,
+    /// [`local_waves::parted_by_lane_read`].)
     First,
     /// Where nothing else translates it.
     Last,

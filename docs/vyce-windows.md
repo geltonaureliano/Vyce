@@ -17,6 +17,15 @@ A checagem padrão mostra os caminhos e o estado do binário. A compilação
 usa o Cargo.lock e gera victory.exe fora do repositório. O perfil diag
 mantém uma segunda compilação com as ferramentas de diagnóstico habilitadas.
 
+A compilação é offline: o launcher põe CARGO_NET_OFFLINE=true, e o Cargo
+só usa as dependências que já estão em Vyce-data\cargo (se faltar alguma,
+ele para e o launcher avisa). Com -Online o Cargo pode baixar o que
+faltar:
+
+~~~powershell
+.\scripts\vyce.ps1 -Action Build -Online
+~~~
+
 Quando quiser iniciar o jogo de propósito:
 
 ~~~powershell
@@ -101,6 +110,18 @@ pipelines foram compilados agora e quantos vieram da biblioteca. A lista
 dos pipelines do jogo que começam cedo no carregamento
 (cache\pipelines\early-pipelines.txt) fica como estava: até a build B o
 warm a gravava vazia ao salvar a biblioteca.
+
+Só a falta desse arquivo conta como lista vazia. Se ele existe e não pode
+ser lido (outro programa o segura, falta permissão), o log avisa uma vez
+("the list of title pipelines to start early cannot be read: it is not
+written over until it can be"), nada começa cedo por ele, e cada
+salvamento grava a biblioteca mas deixa o arquivo como está; os pipelines
+que a sessão usou ficam guardados e entram na lista no primeiro
+salvamento que conseguir lê-la. Antes, qualquer erro de leitura valia
+como lista vazia, e o salvamento seguinte gravava por cima dela só o que
+a sessão tinha usado. Bytes que não são texto num arquivo danificado
+viram chaves que não casam com nenhum pipeline; as outras continuam
+valendo.
 
 ## Local dos arquivos
 
@@ -254,9 +275,11 @@ launcher):
 | VICTORY_D16_INTEGER=0 | Dados de 16 bits de vistas de formato inteiro voltam a passar por f16 (viravam ruído) |
 | VICTORY_WAVE_FORMS=0 | Programas wave64 recusados não são tentados de novo sem os saltos de saída antecipada |
 | VICTORY_LDS_LOCAL=0 | Grupos de uma onda com memória compartilhada voltam ao fluxo do console (com uma barreira em cada troca) em vez de duas ondas locais de 32 |
-| VICTORY_LOCAL_MEET_CHECKS=0 | As duas ondas locais voltam a se encontrar onde o fork as punha: também dentro de laços que cada thread deixa numa volta diferente, dentro de desvios em valores que as duas ondas podem ter diferentes (leitura de uma lane, inclusive de um acumulador como `v_fmac_f32` ou de uma seleção por máscara constante, e leitura escalar de memória que o próprio dispatch escreve) e em programas que acessam memória por endereço. Só para comparação: pode travar a GPU |
+| VICTORY_LOCAL_MEET_CHECKS=0 | As duas ondas locais voltam a se encontrar onde o fork as punha: também dentro de laços que cada thread deixa numa volta diferente, dentro de desvios em valores que as duas ondas podem ter diferentes (leitura de uma lane, inclusive de um acumulador como `v_fmac_f32` ou de uma seleção por máscara constante, e leitura escalar de memória escrita enquanto o dispatch roda) e em programas que acessam memória por endereço. Só para comparação: pode travar a GPU |
 | VICTORY_LOOP_EARLY_OUTS=0 | As formas sem saída antecipada voltam a tirar também a saída de dentro de um laço, mesmo quando é a única saída dele (as threads giram até o limite de voltas). Só para comparação: pode travar a GPU |
-| VICTORY_HOST_WAVE_READS=0 | Com as checagens acima ligadas, a análise das duas ondas locais volta a ser a de 1952aaf: um valor conta como igual em todas as lanes mesmo quando a instrução lê algo além dos operandos (o valor antigo de um acumulador como `v_fmac_f32`, `v_mac_f32` ou `v_dot4c_i32_i8`, o de uma troca, o VCC de `v_div_fmas_f32`) ou seleciona por uma máscara constante de algumas lanes, e uma leitura escalar conta como igual nas duas ondas mesmo de memória que o próprio dispatch escreve. Só para comparação: pode travar a GPU |
+| VICTORY_HOST_WAVE_READS=0 | Com as checagens acima ligadas, a análise das duas ondas locais volta a ser a de 1952aaf: um valor conta como igual em todas as lanes mesmo quando a instrução lê algo além dos operandos (o valor antigo de um acumulador como `v_fmac_f32`, `v_mac_f32` ou `v_dot4c_i32_i8`, o de uma troca, o VCC de `v_div_fmas_f32`) ou seleciona por uma máscara constante de algumas lanes, e uma leitura escalar conta como igual nas duas ondas mesmo de memória escrita enquanto o dispatch roda. Só para comparação: pode travar a GPU |
+| VICTORY_VIEW_LOADS_APART=0 | Com VICTORY_HOST_WAVE_READS ligada, uma leitura escalar simples (`s_load_*`, `s_buffer_load_*`, sem glc nem dlc) de uma vista de acesso não ordenado ou sem tipo declarado volta a contar como algo que as duas ondas locais podem ler diferente só num programa que escreve na memória, como na 5c99db2. Hoje conta em qualquer programa: outro dispatch pode escrever nessa vista entre as duas leituras. Só para comparação: pode travar a GPU |
+| VICTORY_LANE_READ_BRANCHES=0 | Um programa com um desvio que as duas ondas locais tomariam diferente só por uma leitura de lane (`v_readfirstlane_b32`, `v_readlane_b32`) de um valor que as lanes têm diferente (que não seja a base reservada pelo idioma de alocação) volta a rodar como ondas locais antes do fluxo do console. Ali cada onda local lê uma lane sua, e o programa pode seguir outro caminho que o do console (no teste LDS_FMAC, 32 em vez de 64). Hoje ele vai para o fluxo do console; se o fluxo do console não o traduz, fica com as ondas locais de antes. Não conta a leitura da primeira lane de um valor que toda lane tem igual: uma leitura de memória num endereço igual em todas as lanes, ou o índice do grupo tirado do índice da thread (`(grupo << 6 + t) >> 6`) |
 | VICTORY_STRIDE_ONCE=0 | A tabela de passos volta a ser lida a cada uso, não uma vez por vista e bloco |
 | VICTORY_INTERP_F16_MODS=0 | Interpolações de 16 bits voltam a escrever só a metade baixa, sem multiplicador nem saturação |
 | VICTORY_F16_NEAREST=1 | Resultados de 16 bits arredondados ao mais próximo, como no console (a Turing arredonda para zero); desligado por padrão, custa uma dúzia de instruções por resultado |
@@ -285,6 +308,7 @@ Chaves de comparação do trabalho da CPU (todas ligadas por padrão; o valor
 | VICTORY_FREE_TABLES_AT_LANDING=0 | Os descritores dinâmicos das tabelas de uma lista só voltam quando o jogo reinicia ou solta a lista, sem empréstimo, espera nem nova tentativa quando faltam (hoje voltam quando a GPU termina a última submissão da lista, para as listas que o jogo usa uma vez por gravação) |
 | VICTORY_TABLE_RETRY_MS=0 | Uma tabela sem descritores dinâmicos livres é descartada na hora (hoje espera até 100 ms a submissão mais antiga em voo terminar e tenta de novo uma vez; outro número muda essa espera, no máximo 2000) |
 | VICTORY_SLOTS_ACROSS_CURSOR=0 | A busca de descritores dinâmicos livres para no ponto onde começou, como antes, e não acha uma faixa livre que passa por esse ponto; aí também anota que não há faixa daquele tamanho, e tabelas desse tamanho ou maiores deixam de ser feitas até algum descritor voltar (hoje a busca segue até n - 1 descritores depois desse ponto, nunca além do último, nas duas passadas: a dos livres não emprestados e a de quaisquer livres) |
+| VICTORY_WALKS_PER_HEAP=0 | O limite das buscas de descritores dinâmicos que não acham faixa livre (8 por quadro; depois delas, tabelas do tamanho que falhou ou maiores não são feitas até o fim do quadro) volta a contar todos os heaps juntos: as falhas do heap de vistas recusavam as tabelas do heap de samplers, e vice-versa (hoje cada heap tem o seu limite) |
 | VICTORY_NULL_COPY=0 | Uma cópia pedida pelo jogo à memcpy do VCRUNTIME140 a partir da página nula volta a encerrar o processo (hoje, só nesse caso estreito, o destino recebe zeros e a chamada volta; é a queda da missão do barco, aviso "a copy from the null page read as zeros") |
 
 Campos de VYCE_TELEMETRY desse trabalho (por quadro): gpu_idle_ms (GPU
@@ -500,3 +524,65 @@ passando e os 5 testes de xmem que já falhavam, victory-loader com todos
 passando menos um do load_probe (falta a delayimp.lib no toolchain do
 laboratório) e os lugares do código conferidos no executável 1.0.2.1,
 victory-core e o app. Ainda não foi medida em jogo.
+
+## Fase 2: pendências menores da fase 1
+
+A branch vyce/wt-minors (de vyce/2070s 5c99db2) corrige as cinco
+pendências pequenas que as revisões da fase 1 deixaram:
+
+1. A compilação do launcher é offline (em Comandos, acima): -Action Build
+   passava --locked, mas deixava o Cargo baixar. Agora o processo do Cargo
+   recebe CARGO_NET_OFFLINE=true, seja o que for que o ambiente de quem
+   chama diga (e o valor de antes volta ao sair); -Online deixa baixar.
+2. A lista dos pipelines que começam cedo só conta como vazia quando o
+   arquivo não existe (em Cache pronto antes de jogar, acima). Sem chave:
+   o comportamento antigo só apagava a lista.
+3. Uma leitura escalar simples de uma vista de acesso não ordenado ou sem
+   tipo declarado conta como algo que as duas ondas locais podem ler
+   diferente em qualquer programa, não só nos que escrevem na memória:
+   outro dispatch pode escrever nessa vista enquanto este roda. Nenhum
+   programa de lab\shaders\host muda com isso.
+4. Um programa com um desvio que as duas ondas locais tomariam diferente
+   só por uma leitura de lane de um valor que as lanes têm diferente vai
+   antes para o fluxo do console, que dá o resultado do console (no teste
+   LDS_FMAC, 64 como no console, onde as ondas locais davam 32). A regra
+   ao pé da letra mudaria 12 programas da pasta, mas em todos a leitura
+   era de um valor igual em toda lane: o índice do grupo tirado do índice
+   da thread em 6 programas de 64 threads (dois deles na lista de compute
+   que o jogo usou), um buffer lido num índice só em 5 e uma textura lida
+   num ponto só em 1. A leitura da primeira lane de um valor assim não
+   conta mais. Mudam 5 programas, nenhum deles nas listas de compute do
+   jogo: os do buffer num índice só, que rodam na forma sem saídas
+   antecipadas, onde essa leitura fica sob a condição de uma lane só (a
+   segunda onda local não tem lane ativa ali e leria um valor qualquer).
+5. O limite de 8 buscas de descritores dinâmicos que não acham faixa livre
+   por quadro é de cada heap: antes um heap que gastava o limite recusava
+   as tabelas do outro até o fim do quadro.
+
+| O que mudou | Para voltar ao de antes |
+| --- | --- |
+| Compilação do launcher offline | -Online |
+| Só a falta do arquivo conta como lista vazia de pipelines que começam cedo; com outro erro de leitura ela não é regravada, e o que a sessão usou espera o primeiro salvamento que a ler | Sem chave (antes um erro de leitura apagava a lista) |
+| Leituras escalares simples de vistas que podem ser escritas contam como diferentes entre as duas ondas locais em qualquer programa | VICTORY_VIEW_LOADS_APART=0, só para comparar: pode travar a GPU |
+| Um desvio que só uma leitura de lane separa vai para o fluxo do console | VICTORY_LANE_READ_BRANCHES=0 |
+| O limite das buscas de descritores que não acham faixa livre é de cada heap | VICTORY_WALKS_PER_HEAP=0 |
+
+O tradutor mudou com os itens 3 e 4: a impressão dele passou de
+d291d9a04367aead5a126f9532c6da45 para dc0e869b0f4d6e0ca4a17f17abd1891f,
+e a primeira sessão sem um warm traduz todos os shaders de novo.
+
+Conferido pelo heavy.sh: o regx sobre lab\shaders\host (12.919 contêineres,
+32 lanes, vistas exatas), contra a 5c99db2, deu 5 programas mudados (os do
+item 4), nenhum com VICTORY_LANE_READ_BRANCHES=0 e nenhum com as duas
+chaves novas do tradutor desligadas; o valx, 11.199 válidos, 1.720
+recusados como antes e nenhum inválido; os 707 programas de compute usados
+(lab\shaders\used-cs), 668 pipelines feitos na placa, nenhuma falha e os
+39 que não traduzem. As suítes: victory-shader com 312 passando e as 4
+valu_tests que já falhavam na NVIDIA (com VICTORY_DXIL, as 28 split_tests
+passam, as de LDS_FMAC e do índice do grupo rodando na placa),
+victory-gpu na placa com 198 passando e 9 ignorados (também com
+VICTORY_WALKS_PER_HEAP=0) e o teste de integração do tradutor. A
+compilação offline foi conferida com um cargo.exe de mentira num par
+Vyce/Vyce-data de teste (8 casos: offline por padrão, -Online, o ambiente
+de quem chama, o aviso quando falha), e a release compila. Ainda não foi
+medida em jogo.

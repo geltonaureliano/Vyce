@@ -698,22 +698,23 @@ pub(crate) fn save(now: bool) {
     let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
     // Read first if this process has not read it: one that makes pipelines
     // and draws with none (`victory warm`) writes the list back as it was,
-    // not empty.
-    let used: Vec<String> = {
-        let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
-        listed_or_read(&mut used, Some(dir)).iter().cloned().collect()
-    };
-    let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+    // not empty. A list that cannot be read is not written over this time
+    // (the library is), and keeps what this run noted for a later save.
+    let used = early_to_write(&USED, dir);
+    let written = write_files(dir, &blob, used.as_deref());
     match written {
         Ok(()) => {
             let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
             // Keep pipelines stored while the files were being written.
             l.added = l.added.saturating_sub(saved_additions);
+            // The early list stays to be written while it cannot be read.
+            if used.is_none() && used_changed {
+                USED_CHANGED.store(true, Ordering::Relaxed);
+            }
             tracing::info!(
                 bytes = blob.len(),
-                early = used.len(),
+                early = used.as_ref().map_or(0, Vec::len),
+                early_unread = used.is_none(),
                 made = MADE.load(Ordering::Relaxed),
                 loaded = LOADED.load(Ordering::Relaxed),
                 started_early = EARLY.load(Ordering::Relaxed),
@@ -749,43 +750,144 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
     written
 }
 
+/// Writes the library's `blob`, then the early list `early` unless it is
+/// `None` (a list that could not be read is left as it is).
+fn write_files(
+    dir: &std::path::Path,
+    blob: &[u8],
+    early: Option<&[String]>,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    write_atomically(&dir.join(LIBRARY_FILE), blob)?;
+    match early {
+        Some(keys) => write_atomically(&dir.join(EARLY_FILE), keys.join("\n").as_bytes()),
+        None => Ok(()),
+    }
+}
+
 /// Title pipeline keys drawn or dispatched with (this run and the last).
-static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static USED: std::sync::LazyLock<Mutex<Early>> =
+    std::sync::LazyLock::new(|| Mutex::new(Early::default()));
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 
-fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
+/// The early list: the keys of its file, joined with those noted since.
+#[derive(Default)]
+struct Early {
+    /// The file's keys and those noted since; `None` until the file is read
+    /// (a missing file reads as none).
+    listed: Option<HashSet<String>>,
+    /// Keys noted while the file could not be read: joined to it when it is.
+    noted: HashSet<String>,
+    /// The title's first use tried the file (later ones do not: saves do).
+    tried: bool,
+    /// A read that failed was told (once a run).
+    warned: bool,
+}
+
+impl Early {
+    /// Takes what a read of the list's `file` gave, if the list is still
+    /// unread: its keys, joined with those noted meanwhile; or nothing (a
+    /// warning, the first time). Whether the list is read now.
+    fn take(&mut self, read: std::io::Result<HashSet<String>>, file: &std::path::Path) -> bool {
+        if self.listed.is_some() {
+            return true;
+        }
+        match read {
+            Ok(mut keys) => {
+                keys.extend(self.noted.drain());
+                self.listed = Some(keys);
+                true
+            }
+            Err(e) => {
+                if !std::mem::replace(&mut self.warned, true) {
+                    tracing::warn!(
+                        error = %e,
+                        file = %file.display(),
+                        "the list of title pipelines to start early cannot be read: \
+                         it is not written over until it can be"
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    fn wanted(&self, key: &str) -> bool {
+        self.listed.as_ref().is_some_and(|s| s.contains(key)) || self.noted.contains(key)
+    }
+
+    /// Notes `key`; whether it is new to the list.
+    fn note(&mut self, key: &str) -> bool {
+        let held = self.listed.as_ref().map_or(0, HashSet::len) + self.noted.len();
+        if held >= EARLY_MAX || self.wanted(key) {
+            return false;
+        }
+        match &mut self.listed {
+            Some(keys) => keys.insert(key.to_owned()),
+            None => self.noted.insert(key.to_owned()),
+        }
+    }
+}
+
+/// The keys of the early list in `dir`: none if there is no such file;
+/// `Err` for any other failure to read it, which leaves the list unread.
+/// Bytes that are not text read as replacement characters: a damaged key
+/// matches no pipeline, and the others still count.
+fn read_early(dir: &std::path::Path) -> std::io::Result<HashSet<String>> {
+    match std::fs::read(dir.join(EARLY_FILE)) {
+        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashSet::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The early list a save writes in `dir`: read first if it is unread
+/// (outside `early`'s lock: the title takes it at each pipeline it makes);
+/// `None` while it cannot be read.
+fn early_to_write(early: &Mutex<Early>, dir: &std::path::Path) -> Option<Vec<String>> {
+    let unread = early.lock().unwrap_or_else(|e| e.into_inner()).listed.is_none();
+    let read = unread.then(|| read_early(dir));
+    let mut early = early.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(read) = read
+        && !early.take(read, &dir.join(EARLY_FILE))
+    {
+        return None;
+    }
+    early.listed.as_ref().map(|keys| keys.iter().cloned().collect())
+}
+
+fn used() -> std::sync::MutexGuard<'static, Early> {
     let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
-    if used.is_none() {
-        let set = listed_or_read(&mut used, DIR.get().map(PathBuf::as_path));
-        tracing::info!(pipelines = set.len(), "title pipelines to start early");
+    if !std::mem::replace(&mut used.tried, true) {
+        // (a save may have read it first; without a cache folder nothing is
+        // kept: an empty list)
+        let read = used.listed.is_some() || {
+            let (read, file) = match DIR.get() {
+                Some(dir) => (read_early(dir), dir.join(EARLY_FILE)),
+                None => (Ok(HashSet::new()), PathBuf::from(EARLY_FILE)),
+            };
+            used.take(read, &file)
+        };
+        if read {
+            let pipelines = used.listed.as_ref().map_or(0, HashSet::len);
+            tracing::info!(pipelines, "title pipelines to start early");
+        }
     }
     used
 }
 
-/// The early list `used` holds, read from `dir` first (empty without a
-/// list there) if it holds none yet.
-fn listed_or_read<'a>(
-    used: &'a mut Option<HashSet<String>>,
-    dir: Option<&std::path::Path>,
-) -> &'a HashSet<String> {
-    used.get_or_insert_with(|| {
-        let listed = dir
-            .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
-            .unwrap_or_default();
-        listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect()
-    })
-}
-
 /// Whether the title pipeline with `key` was drawn with in an earlier run.
 pub(crate) fn wanted_early(key: &str) -> bool {
-    used().as_ref().is_some_and(|s| s.contains(key))
+    used().wanted(key)
 }
 
 /// The title pipeline with `key` was drawn or dispatched with.
 pub(crate) fn note_used(key: &str) {
-    let mut used = used();
-    let set = used.get_or_insert_with(HashSet::new);
-    if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
+    if used().note(key) {
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
 }
@@ -895,21 +997,81 @@ mod tests {
 
     /// A save in a process that never read the early list (`victory warm`
     /// makes pipelines and draws with none) writes back the list on disk,
-    /// not an empty one; a list already read is the one written.
+    /// not an empty one; a list already read is the one written; a missing
+    /// file is an empty list.
     #[test]
     fn a_save_keeps_an_early_list_it_never_read() {
+        let sorted = |keys: Option<Vec<String>>| {
+            let mut keys = keys.expect("a list to write");
+            keys.sort();
+            keys
+        };
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(EARLY_FILE), "aa\n\nbb\n").unwrap();
-        let mut never_read = None;
-        let mut keys: Vec<String> = listed_or_read(&mut never_read, Some(dir.path())).iter().cloned().collect();
+        let never_read = Mutex::new(Early::default());
+        assert_eq!(sorted(early_to_write(&never_read, dir.path())), ["aa", "bb"]);
+        assert!(never_read.lock().unwrap().listed.is_some(), "read once, kept");
+        let listed = Some(HashSet::from(["cc".to_owned()]));
+        let read = Mutex::new(Early { listed, ..Early::default() });
+        assert_eq!(sorted(early_to_write(&read, dir.path())), ["cc"]);
+        let none = Mutex::new(Early::default());
+        assert!(sorted(early_to_write(&none, &dir.path().join("none"))).is_empty());
+        // Bytes that are not text: the other keys still count.
+        std::fs::write(dir.path().join(EARLY_FILE), b"aa\n\xff\xfe\nbb\n").unwrap();
+        let damaged = read_early(dir.path()).expect("read");
+        assert!(damaged.contains("aa") && damaged.contains("bb"));
+        assert_eq!(damaged.len(), 3);
+    }
+
+    /// Only a missing early list reads as an empty one. A list that cannot
+    /// be read (held by another program here) stays unread, told once: the
+    /// title starts nothing early from it, a save writes the library but not
+    /// the list over the file, and what the run noted meanwhile is kept and
+    /// joined to the file's keys at the first save that reads it.
+    #[test]
+    fn an_early_list_that_cannot_be_read_is_not_written_over() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(EARLY_FILE);
+        std::fs::write(&file, "aa\nbb\n").unwrap();
+        // No sharing: every other open fails (a scanner holding it, say).
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&file).unwrap();
+        let failed = read_early(dir.path()).expect_err("held");
+        assert_ne!(failed.kind(), std::io::ErrorKind::NotFound);
+        // The title's first use: nothing to start early, but what it notes
+        // is kept.
+        let early = Mutex::new(Early::default());
+        {
+            let mut e = early.lock().unwrap();
+            assert!(!e.take(Err(failed), &file));
+            assert!(e.warned, "told");
+            assert!(e.listed.is_none());
+            assert!(!e.wanted("aa"));
+            assert!(e.note("cc"));
+            assert!(!e.note("cc"), "noted once");
+            assert!(e.wanted("cc"));
+        }
+        // A save: the library is written, the list is left as it is.
+        assert_eq!(early_to_write(&early, dir.path()), None);
+        write_files(dir.path(), b"library", None).unwrap();
+        assert_eq!(std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap(), b"library");
+        drop(held);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "aa\nbb\n", "not written over");
+        // Readable again: the file's keys and the run's.
+        let mut keys = early_to_write(&early, dir.path()).expect("read now");
         keys.sort();
-        assert_eq!(keys, ["aa", "bb"]);
-        assert!(never_read.is_some(), "read once, kept");
-        let mut read = Some(HashSet::from(["cc".to_owned()]));
-        assert_eq!(listed_or_read(&mut read, Some(dir.path())), &HashSet::from(["cc".to_owned()]));
-        let mut nothing = None;
-        assert!(listed_or_read(&mut nothing, Some(&dir.path().join("none"))).is_empty());
-        assert!(listed_or_read(&mut None, None).is_empty());
+        assert_eq!(keys, ["aa", "bb", "cc"]);
+        write_files(dir.path(), b"library", Some(keys.as_slice())).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "aa\nbb\ncc");
+        assert!(early.lock().unwrap().wanted("aa"));
+        // A failure after it was read changes nothing.
+        let mut e = early.lock().unwrap();
+        assert!(e.take(Err(std::io::Error::other("late")), &file));
+        assert_eq!(e.listed.as_ref().map(HashSet::len), Some(3));
+        // A missing file is an empty list, read.
+        let mut fresh = Early::default();
+        assert!(fresh.take(read_early(&dir.path().join("none")), &file));
+        assert_eq!(fresh.listed, Some(HashSet::new()));
     }
 
     #[test]

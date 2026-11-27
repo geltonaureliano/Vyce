@@ -936,7 +936,7 @@ fn local_lds(
     let g = LaneGraph::of(st)?;
     let varying = if checks {
         let written = super::local_waves::loads_of_written_memory(native, p, res);
-        super::local_waves::host_wave_varying(p, st, &g, &written)
+        super::local_waves::host_wave_varying(p, st, &g, &written, None)
     } else {
         Vec::new()
     };
