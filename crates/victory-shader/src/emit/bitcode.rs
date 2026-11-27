@@ -5,6 +5,10 @@
 //! it is written: functions, then constants (all at module level), then the
 //! instructions of `main` in block order.
 
+// clean-up passes: begin (fingerprinted apart: ../../fingerprint.rs)
+pub mod opt;
+
+// clean-up passes: end
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

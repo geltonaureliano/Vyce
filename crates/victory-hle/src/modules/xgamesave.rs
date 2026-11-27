@@ -177,6 +177,36 @@ fn parse_manifest(bytes: &[u8]) -> Option<Vec<String>> {
     (out.len() >= 2).then_some(out)
 }
 
+/// Whether a version left over that cannot be removed fails the read of
+/// the container (`VICTORY_SAVE_STRICT=1`, as before upstream Belobug's
+/// 705a2d0): by default it stays, said once, and the newest is read.
+fn strict_versions() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SAVE_STRICT").is_some_and(|v| v == "1"))
+}
+
+/// Removes a version a crash or an older commit left in a container.
+///
+/// One that does not go must not hide the newest: the title then started
+/// as if it had no settings at all, each time (upstream Belobug's 705a2d0:
+/// a version in a folder the host shows through another one, which refuses
+/// the removal, error 4395, 2026-11-25). It is tried again at the next read.
+fn remove_left_over(path: &Path) -> std::io::Result<()> {
+    let Err(e) = std::fs::remove_dir_all(path) else {
+        return Ok(());
+    };
+    if strict_versions() {
+        return Err(e);
+    }
+    static SAID: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if !said.iter().any(|p| p == path) {
+        tracing::warn!(path = %path.display(), %e, "a save version left over stays; the newest is read");
+        said.push(path.to_owned());
+    }
+    Ok(())
+}
+
 /// The container's newest committed version, if any. Removes what a crash
 /// left: unfinished versions and older ones.
 fn current(dir: &Path) -> std::io::Result<Option<Version>> {
@@ -185,7 +215,7 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
-            std::fs::remove_dir_all(entry.path())?;
+            remove_left_over(&entry.path())?;
         } else if let Some(n) = file.strip_prefix('v').and_then(|n| n.parse::<u64>().ok()) {
             committed.push(n);
         }
@@ -195,7 +225,7 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         return Ok(None);
     };
     for old in &committed[..committed.len() - 1] {
-        std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+        remove_left_over(&dir.join(format!("v{old}")))?;
     }
     let version = dir.join(format!("v{number}"));
     let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
@@ -233,6 +263,27 @@ enum Source<'a> {
     Kept(PathBuf),
 }
 
+/// The folder to write version `number` in: `v<N>.new`, or, while an
+/// unfinished one left there cannot be removed ([`remove_left_over`]; the
+/// number is the newest's plus one, so every later update of the container
+/// would fail on it), the first `v<N>.<k>.new` free. `current` removes any
+/// of them as unfinished.
+fn staging(dir: &Path, number: u64) -> std::io::Result<PathBuf> {
+    for k in 0..64 {
+        let staged = match k {
+            0 => dir.join(format!("v{number}.new")),
+            k => dir.join(format!("v{number}.{k}.new")),
+        };
+        if staged.exists() {
+            remove_left_over(&staged)?;
+        }
+        if !staged.exists() {
+            return Ok(staged);
+        }
+    }
+    Err(std::io::Error::other("every staging folder of the version is held"))
+}
+
 /// Writes version `number` of the container in `dir` and commits it.
 fn commit(
     dir: &Path,
@@ -241,10 +292,7 @@ fn commit(
     display: &str,
     blobs: &[(&str, Source<'_>)],
 ) -> std::io::Result<()> {
-    let staged = dir.join(format!("v{number}.new"));
-    if staged.exists() {
-        std::fs::remove_dir_all(&staged)?;
-    }
+    let staged = staging(dir, number)?;
     std::fs::create_dir_all(&staged)?;
     let write = |path: PathBuf, data: &[u8]| -> std::io::Result<()> {
         let mut file = std::fs::File::create(path)?;
@@ -1323,5 +1371,56 @@ mod tests {
         assert!(found.is_empty());
         close_container(this, container);
         close_provider(this, provider);
+    }
+
+    /// An older version, or an unfinished one, that cannot be removed (a
+    /// file of it held open without sharing its deletion) does not hide
+    /// the newest: the container is still listed and read whole, an update
+    /// whose own staging folder is the one held stages beside it, and the
+    /// left-overs go at a later read once they can.
+    #[cfg(windows)]
+    #[test]
+    fn a_version_that_cannot_go_does_not_hide_the_newest() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const SHARE_READ: u32 = 1;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let slot = container_dir(root, "Slot");
+        assert_eq!(update(root, "one", &[("a", Some("old a"))]), S_OK);
+        // Readable by others, but not to be deleted while held.
+        let hold = |path: PathBuf| std::fs::OpenOptions::new().read(true).share_mode(SHARE_READ).open(path).unwrap();
+        let held = hold(slot.join("v1").join(MANIFEST));
+        // The update's own removal of v1 fails, and so does the next read's.
+        assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK);
+        assert!(slot.join("v1").exists(), "the held version stays");
+        // Unfinished versions held: one above the newest, and the one the
+        // next update (v3) would stage in.
+        let unfinished = |name: &str| {
+            let staged = slot.join(name);
+            std::fs::create_dir_all(&staged).unwrap();
+            std::fs::write(staged.join("0"), b"half").unwrap();
+            let held = hold(staged.join("0"));
+            (staged, held)
+        };
+        let (far, held_far) = unfinished("v7.new");
+        let (next, held_next) = unfinished("v3.new");
+        let newest = Some(("two".into(), vec![("a".into(), "new a".into())]));
+        assert_eq!(state(root), newest);
+        assert_eq!(containers(root).len(), 1, "still listed");
+        assert_eq!(update(root, "three", &[("b", Some("b"))]), S_OK);
+        let three = Some(("three".into(), vec![("a".into(), "new a".into()), ("b".into(), "b".into())]));
+        assert_eq!(state(root), three);
+        let mut left: Vec<String> = std::fs::read_dir(&slot)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["v1", "v3", "v3.new", "v7.new"], "committed beside the held v3.new");
+        // And the update after it too.
+        assert_eq!(update(root, "four", &[("c", Some("c"))]), S_OK);
+        drop((held, held_far, held_next));
+        let four = vec![("a".into(), "new a".into()), ("b".into(), "b".into()), ("c".into(), "c".into())];
+        assert_eq!(state(root), Some(("four".into(), four)));
+        assert!(!slot.join("v1").exists() && !far.exists() && !next.exists(), "gone once they can go");
     }
 }

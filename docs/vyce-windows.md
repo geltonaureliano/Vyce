@@ -38,7 +38,10 @@ sessão vai para logs\<data>.settings.xml.
 
 | Opção | Efeito |
 | --- | --- |
-| -OutputSize 1920x1080 | Tamanho da imagem do jogo (a cena é 1/1,5 dele); keep deixa como está |
+| -OutputSize 1920x1080 | Tamanho da imagem do jogo, no arquivo e no código do jogo (abaixo); keep deixa os dois como estão |
+| -RenderScale 0.5 a 1.0 | Parte da largura e da altura da imagem que a cena tem; sem ela, os 2/3 do próprio jogo (cena de 1280x720 em 1920x1080); 1.0 dá cena de 1920x1080 |
+| -NoTitlePatch | Não muda o código do jogo (tamanho, escala e upscaler ficam os dele); o arquivo continua sendo escrito |
+| -ConsoleProfile series-s | Perfil do Series S, com o upscaler do próprio jogo no lugar do FidelityFX |
 | -TitleSettings light | Desliga o que mais pesa numa placa de PC: filas assíncronas, borrão de movimento, menos detalhe ao longe e reflexos menores |
 | -TitleSettings keep | Não muda nada além do tamanho |
 | -TitleSettings original | Volta o arquivo como o jogo o criou |
@@ -47,6 +50,31 @@ sessão vai para logs\<data>.settings.xml.
 Ainda não se viu o jogo respeitar cada valor do arquivo: compare uma
 sessão com -OutputSize keep -TitleSettings keep e procure no log as linhas
 "presenting to a window" e "twins made".
+
+### Tamanho da imagem no código do jogo
+
+No perfil Series X o jogo ignora o tamanho do arquivo: monta uma cena de
+2560x1440 numa imagem de 3840x2160. Por isso o launcher também muda o
+código do jogo ao carregá-lo, antes de qualquer parte dele rodar:
+
+| Variável | Efeito |
+| --- | --- |
+| VICTORY_OUTPUT=1920x1080 | Tamanho da imagem: um dos modos do jogo (1280x720, 1664x936, 1920x1080, 2560x1440, 3840x2160). Vem de -OutputSize |
+| VICTORY_RENDER_SCALE=0.5 a 1.0 | Escala da cena no upscaler do próprio jogo (2/3 sem ela; abaixo de 2/3 o maior tamanho de cena do jogo fica em 2/3). Vem de -RenderScale |
+| VICTORY_UPSCALER=6 ou 7 | Upscaler escolhido: 6 o do jogo, 7 o FidelityFX. O launcher põe 6 no Series S, que sozinho escolhe o FidelityFX (outros forks na NVIDIA viram o mundo preto com ele) |
+
+Cada lugar do código é comparado byte a byte antes: só a versão 1.0.2.1
+(blake3 b99f876b...) tem esses bytes. Se um lugar pedido difere, nenhum é
+mudado, e o log diz "resolution: not patched"; com tudo certo ele diz
+"resolution: patched" para cada lugar. Uma variável já definida no
+processo que chama o launcher vale no lugar da do launcher
+(VICTORY_OUTPUT=off deixa o tamanho como o jogo quer). O FidelityFX tem
+uma escala própria no fork de origem (VICTORY_FFX_SCALE), que não veio:
+em 0,5 o jogo dividiu por zero 49 s depois.
+
+Imagem de 1920x1080 em vez de 3840x2160: a cópia para a janela, a
+composição das duas camadas do Series S, o FPS no canto e o tamanho da
+janela seguem o tamanho que o jogo apresenta.
 
 ### Cache pronto antes de jogar
 
@@ -216,6 +244,28 @@ late_signals, late_waits, landed e landed_here (submissões encerradas, e
 as encerradas por quem precisou antes da thread própria), ecl_calls,
 host_lists, watch_asks, watch_ms e watch_ahead (perguntas ao kernel e
 respostas do grupo), copies_joined, flights_max.
+
+### O que veio do Belobug (belobug/main até 4f62c2a)
+
+A linha antiga do Belobug, a mesma memória no lugar do Vyce, entrou por
+merge. Cada mudança tem a sua chave para voltar ao de antes (no processo
+que chama o launcher):
+
+| Variável | Efeito |
+| --- | --- |
+| VICTORY_AMBIENT_SKY=off | A luz ambiente volta a ser a constante de VICTORY_AMBIENT. Por padrão ela segue o céu que o jogo desenha para os reflexos: nível gain * média^power + least, com a cor do céu, de dia e de noite; gain,least,power muda os três (0.36,0.05,0.4) |
+| VICTORY_AMBIENT=nível | Com o céu seguido, escala essa luz: 0.6, o padrão, deixa como o céu dá, 1.2 dobra, 0 desliga. Sem o céu, é a constante de antes |
+| VICTORY_PROBE_RAYS=1 | Roda o programa que escolhe os raios das sondas de tela (CS_ScreenProbes_ActivateRays), deixado de fora enquanto não há raios: rodando sem raios atrás, a imagem toda perdeu luz, sombras e reflexos |
+| VICTORY_PLAN_WRITES=1 | Um slot que só escreve outra faixa volta a contar como algo que falta ao plano de descritores; com VYCE_PLAN_EXTRA=0 o plano inteiro volta a ser refeito por ele |
+| VICTORY_LOD_CLAMP=0 | A vista de uma textura posicionada com nível mínimo de detalhe volta a montar a textura com todos os mips |
+| VICTORY_COMPILE_HOLD=20,150,3,0 | O vigia das compilações sem fim volta aos limites de antes. Hoje 60,300,8,2: segundos até suspeitar, segundos até parar de qualquer jeito, GiB que o processo cresce, e GiB livres da máquina (os 32 GB daqui) abaixo dos quais para logo uma compilação com mais de 20 s, se o processo cresceu 1 GiB ou mais desde que ela começou. Essa fica de fora só nesta sessão e nunca vai para a lista dos deixados de fora: o jogo, no mesmo processo, também cresce gigabytes carregando o mundo. Se o processo cresceu menos, a falta de memória não é dela: o log avisa e ela segue. Só o tempo (300 s) e o crescimento (8 GiB depois de 60 s) põem um pipeline na lista |
+| VICTORY_SAVE_STRICT=1 | Uma versão de save que não pode ser apagada volta a impedir a leitura do container (o jogo então começava sem as configurações) |
+| VICTORY_SHADER_OPT=all | Liga as passadas de limpeza dos shaders traduzidos (desligadas aqui: na RTX 2070 SUPER davam 0,2 % de código a menos por 2,3 vezes o tempo de tradução). Desligadas, o cache de shaders é o mesmo de antes delas; ligadas, a primeira sessão traduz tudo de novo. Um número escolhe as passadas (1, 2, 4, 8, 16), e VICTORY_SHADER_OPT_TRACE=1 mostra o que a de código morto tira |
+
+Na compilação diag, VICTORY_SHADER_DUMP também salva os shaders dos
+pipelines que o driver recusa, e a cada 30 s o log conta as texturas
+posicionadas (quantas, quanto da memória do jogo cobrem, o que o pool e o
+host guardam).
 
 Para abrir o painel de uma sessão já em execução sem reiniciar o jogo,
 execute scripts\vyce-monitor.ps1 e passe -GamePid, -StdoutLog e -StderrLog.

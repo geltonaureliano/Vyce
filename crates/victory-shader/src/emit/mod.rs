@@ -139,6 +139,52 @@ pub fn loop_limit() -> u32 {
     static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref()))
 }
+// clean-up passes: begin (fingerprinted apart: ../../fingerprint.rs)
+
+/// The clean-up passes that run over a translated program before it is
+/// written (`bitcode::opt`, upstream Belobug's ae75a66, from the VIctory
+/// fork at ba8697aa): a set of that module's pass bits. Every pass is exact,
+/// so the switch is for telling a translator fault from a clean-up fault,
+/// and for measuring what the clean-up is worth. `VICTORY_SHADER_OPT`:
+/// - unset, empty or `0`: none (the module as the lowering made it).
+/// - `all`: every pass.
+/// - a number (decimal or `0x` hex): those passes; 1 dead code, 2 constants
+///   and identities, 4 one instruction for one value, 8 what a branch taken
+///   says about its condition, 16 one read for one place within a block.
+///
+/// Off by default here (upstream runs them all): measured on the RTX 2070
+/// SUPER, they left 0.2 % less of NVIDIA's compiled code for 2.3 times the
+/// translation time. Part of the translation while they run: the shader
+/// cache keys on them then (`victory-gpu`'s does), and on nothing of them
+/// while they are off, so a build with them off keeps the translations a
+/// build without them made.
+pub fn shader_opt() -> u32 {
+    static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+}
+
+/// `VICTORY_SHADER_OPT`'s value; none when it is unset or unreadable.
+/// Pure, for testing.
+fn parse_shader_opt(value: Option<&str>) -> u32 {
+    let value = value.map(str::trim).unwrap_or_default();
+    if value.eq_ignore_ascii_case("all") {
+        return bitcode::opt::ALL;
+    }
+    let parsed = match value.strip_prefix("0x") {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => value.parse().ok(),
+    };
+    parsed.map_or(0, |n| n & bitcode::opt::ALL)
+}
+
+/// A fingerprint of the clean-up passes' sources, which [`crate::SOURCES`]
+/// leaves out (`fingerprint.rs`): the shader cache keys on it while they
+/// run.
+pub const CLEANUP_SOURCES: &str = env!("VICTORY_SHADER_CLEANUP_SOURCES");
+
+#[cfg(test)]
+mod cleanup_tests;
+// clean-up passes: end
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.

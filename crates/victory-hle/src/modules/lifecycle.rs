@@ -341,6 +341,17 @@ mod tests {
         };
         assert_eq!(fit_into(&area, 3840, 2160), (1848, 1040));
         assert_eq!(fit_into(&area, 1280, 720), (1280, 720));
+        // A 1080p output (`VICTORY_OUTPUT`) on a 1080p screen with its task
+        // bar, and on a larger one.
+        assert_eq!(fit_into(&area, 1920, 1080), (1848, 1040));
+        let wide = RECT {
+            left: 0,
+            top: 0,
+            right: 2560,
+            bottom: 1392,
+        };
+        assert_eq!(fit_into(&wide, 1920, 1080), (1920, 1080));
+        assert_eq!(fit_into(&wide, 3840, 2160), (2474, 1392));
         assert_eq!(
             fit_into(&area, wm::CW_USEDEFAULT, 0),
             (wm::CW_USEDEFAULT, 0)

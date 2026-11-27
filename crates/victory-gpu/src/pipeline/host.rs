@@ -574,6 +574,7 @@ impl HostPipeline {
                 Err(e) => {
                     tracing::warn!(error = %e, name = name.as_str(), ?shaders, "host pipeline refused");
                     host.log_messages();
+                    super::dump_all(shaders);
                     return None;
                 }
             };
@@ -622,6 +623,7 @@ impl HostPipeline {
                 Err(e) => {
                     tracing::warn!(error = %e, name = name.as_str(), ?shaders, "host mesh pipeline refused");
                     host.log_messages();
+                    super::dump_all(shaders);
                     return None;
                 }
             };
@@ -718,6 +720,7 @@ impl HostPipeline {
             Err(e) => {
                 tracing::warn!(error = %e, name = name.as_str(), ?shaders, "host pipeline refused");
                 host.log_messages();
+                super::dump_all(shaders);
                 return None;
             }
         };

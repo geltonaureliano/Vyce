@@ -20,10 +20,14 @@
 //! 5. initialise the title's DLLs, then run TLS callbacks and the entry
 //!    point on a thread with the stack size the image asks for; from then
 //!    on, pass every thread start and end on to the attached images.
+//!
+//! Between 4 and 5, places of the title's code may be changed when a switch
+//! asks for it and their bytes are the ones expected ([`resolution`]).
 
 #[cfg(windows)]
 mod crash;
 pub mod prepare;
+pub mod resolution;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;

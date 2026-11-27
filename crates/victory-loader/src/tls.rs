@@ -75,7 +75,7 @@ pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
 
 /// Rewrites each `mov r64, gs:[0x58]` in `code` (at address `at`) as
 /// `call thunks[r]; nop4`. `thunks` must be within 2 GiB of `code`.
-fn patch(code: &mut [u8], at: usize, thunks: usize) -> usize {
+pub(crate) fn patch(code: &mut [u8], at: usize, thunks: usize) -> usize {
     let mut count = 0;
     let mut i = 0;
     // The scan jumps between offsets that start like a load instead of
