@@ -237,14 +237,46 @@ e os oito arquivos mais lidos.
 
 Os pipelines prontos ficam em Vyce-data\cache\pipelines\host-pipelines.bin e
 são carregados na sessão seguinte. Isso agora vale também para os de mesh
-shader (cerca de 550), que antes eram compilados de novo em toda sessão. Os
-já guardados por builds anteriores continuam valendo. Um driver novo rejeita
-o arquivo inteiro e a biblioteca recomeça vazia.
+shader (cerca de 550 de cada sessão), que antes eram compilados de novo em
+toda sessão: sem o tipo de primitiva na descrição, a biblioteca não devolvia
+nenhum, nem o que ela mesma tinha guardado (testado na RTX 2070 SUPER, driver
+621.40). Os já guardados por builds anteriores continuam valendo, com os
+mesmos nomes. Um driver novo rejeita o arquivo inteiro e a biblioteca
+recomeça vazia.
 
-O arquivo passa de 150 MB e é escrito inteiro. A escrita acontece em segundo
-plano, com a menor prioridade de disco: três minutos depois do primeiro
-pipeline novo, ao fim de um carregamento e ao sair do jogo. Se o jogo travar,
-os pipelines criados nos últimos minutos são criados de novo na vez seguinte.
+O arquivo passa de 150 MB e é escrito inteiro, por uma thread própria, só
+quando há pipelines novos: três minutos depois do primeiro que não está no
+arquivo, ao fim de um carregamento e ao sair do jogo. Ela escreve em pedaços
+de 1 MiB, com a menor prioridade de disco, para não disputar o disco com as
+leituras do jogo (antes as escritas, a cada 20 s, coincidiam com quadros de
+um a dois segundos). Se o jogo travar, os pipelines criados nos últimos
+minutos são criados de novo na vez seguinte. A linha "host pipeline library
+saved" do log traz os segundos da escrita e locked_ms, o tempo em que os
+trabalhadores esperaram pela biblioteca.
+
+Um pipeline que um desenho pediu entra logo na lista dos que a sessão
+seguinte começa a criar durante o carregamento (early-pipelines.txt), mesmo
+que a sessão acabe antes de ele ficar pronto; um que não pôde ser criado
+(shader sem tradução, recusado pelo driver) sai dela. Os que levaram 1 s ou
+mais de processador para ficar prontos ficam em slow-pipelines.txt; na
+sessão seguinte, no máximo um quarto dos trabalhadores cuida deles enquanto
+nenhum desenho os pede, e os rápidos vão primeiro. Os trabalhadores rodam
+abaixo das threads de carregamento do jogo, e o processo roda acima do
+normal e fora do modo de eficiência do Windows, para que uma compilação ou
+um antivírus não atrase o carregamento.
+
+Chaves para voltar ao comportamento de antes (no processo que chama o
+launcher):
+
+| Variável | Efeito |
+| --- | --- |
+| VYCE_MESH_TOPOLOGY=0 | Pipelines de mesh descritos sem o tipo de primitiva: compilados de novo em toda sessão |
+| VYCE_LIBRARY_SAVER=0 | Os trabalhadores escrevem a biblioteca inteira a cada 20 s, sempre que algo mudou |
+| VYCE_EARLY_AT_ONCE=0 | Um pipeline só entra na lista da sessão seguinte depois de pronto, e nenhum sai dela |
+| VICTORY_PIPELINE_SLOW=0 | Os pipelines demorados são criados na ordem em que o jogo os cria, por todos os trabalhadores |
+| VICTORY_PIPELINE_LOWEST=0 | Trabalhadores com prioridade abaixo do normal, iguais à thread de carregamento do jogo |
+| VICTORY_PROCESS_PRIORITY=normal | O processo fica com a prioridade normal |
+| VICTORY_EFFICIENCY_MODE=1 | O Windows pode pôr o processo no modo de eficiência quando a janela não está na frente |
 
 ## Campos novos de VYCE_TELEMETRY
 

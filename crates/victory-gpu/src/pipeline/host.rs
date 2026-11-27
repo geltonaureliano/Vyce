@@ -604,18 +604,13 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            let ms = MeshStream::new(code(0));
-            let made = match depth_with_bounds {
-                Some(depth) => stream_pipeline(
-                    &host.device, &root, ms, code(1), g,
-                    Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth),
-                    (&name, shaders),
-                ),
-                None => stream_pipeline(
-                    &host.device, &root, ms, code(1), g,
-                    Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
-                    (&name, shaders),
-                ),
+            let named = (name.as_str(), shaders);
+            let made = if mesh_topology() {
+                let ms = MeshStream::new(code(0));
+                mesh_pipeline(&host.device, &root, ms, code(1), g, depth_with_bounds, named)
+            } else {
+                let ms = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, code(0));
+                mesh_pipeline(&host.device, &root, ms, code(1), g, depth_with_bounds, named)
             };
             let pso = match made {
                 Ok(pso) => pso,
@@ -764,13 +759,48 @@ struct VertexStream {
 /// A mesh pipeline's first stage. The type of primitive is what the host
 /// derives from the mesh shader anyway, given: a pipeline library keeps it
 /// with the pipeline and compares it, so that a stream without it loads
-/// nothing, not even what it made itself, and every mesh pipeline was
-/// compiled again in every run. What was stored so loads with it: a mesh
-/// pipeline's name in the library stays what it was.
+/// nothing, not even what it made itself, and every mesh pipeline (545 of a
+/// run's 547) was compiled again in every run. What was stored before loads
+/// with it (`mesh_pipelines_load_from_a_library`, RTX 2070 SUPER, driver
+/// 621.40): a mesh pipeline's name in the library stays what it was.
+/// After github.com/DexNom/VIctory (9c58a1c).
 #[repr(C)]
 struct MeshStream {
     ms: Sub<D3D12_SHADER_BYTECODE>,
     topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+}
+
+/// Whether mesh pipelines are described with their type of primitive
+/// ([`MeshStream`]). `VYCE_MESH_TOPOLOGY=0`: without, as before; the
+/// library then loads none of them.
+fn mesh_topology() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VYCE_MESH_TOPOLOGY").map_or(true, |v| v != "0"))
+}
+
+/// A mesh pipeline from its first stage `ms`, and with the depth state its
+/// bounds need, if they are tested.
+fn mesh_pipeline<S>(
+    device: &ID3D12Device,
+    root: &ID3D12RootSignature,
+    ms: S,
+    ps: D3D12_SHADER_BYTECODE,
+    g: &GraphicsState,
+    depth_with_bounds: Option<D3D12_DEPTH_STENCIL_DESC1>,
+    named: (&str, &[Arc<Shader>]),
+) -> windows::core::Result<ID3D12PipelineState> {
+    match depth_with_bounds {
+        Some(depth) => stream_pipeline(
+            device, root, ms, ps, g,
+            Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth),
+            named,
+        ),
+        None => stream_pipeline(
+            device, root, ms, ps, g,
+            Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
+            named,
+        ),
+    }
 }
 
 impl MeshStream {
@@ -1131,7 +1161,10 @@ mod tests {
     }
 
     /// Mesh pipelines come back from a library and from its bytes, by the
-    /// streams they were made from.
+    /// streams they were made from, and so do those stored by runs before,
+    /// from streams without a topology. Those streams load nothing, not even
+    /// what they stored (E_INVALIDARG on an RTX 2070 SUPER, driver 621.40):
+    /// printed, not asserted, as another driver may.
     #[test]
     fn mesh_pipelines_load_from_a_library() {
         use windows::core::{HSTRING, PCWSTR};
@@ -1179,10 +1212,12 @@ mod tests {
         let without = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, bytecode(&ms));
         let mut without = Stream::new(&root, without, bytecode(&ps), &color, depth(&color));
         // SAFETY: as above.
-        unsafe {
+        let own: windows::core::Result<ID3D12PipelineState> = unsafe {
             let pso: ID3D12PipelineState = device.CreatePipelineState(&without.desc()).unwrap();
             library.StorePipeline(windows::core::w!("before"), &pso).unwrap();
-        }
+            library.LoadPipeline(windows::core::w!("before"), &without.desc())
+        };
+        eprintln!("a stream without a topology, loaded as stored: {:?}", own.as_ref().map(|_| ()));
         // SAFETY: a buffer of the size the library asks for.
         let bytes = unsafe {
             let mut bytes = vec![0u8; library.GetSerializedSize()];
@@ -1199,5 +1234,13 @@ mod tests {
                 unsafe { next_run.LoadPipeline(PCWSTR(wide.as_ptr()), &stream.desc()) };
             loaded.unwrap_or_else(|e| panic!("{name}: {e}"));
         }
+        // SAFETY: as above.
+        let old: windows::core::Result<ID3D12PipelineState> =
+            unsafe { next_run.LoadPipeline(windows::core::w!("color"), &without.desc()) };
+        eprintln!(
+            "a stream without a topology, in the next run: {:?} (driver {})",
+            old.as_ref().map(|_| ()),
+            crate::host::driver()
+        );
     }
 }

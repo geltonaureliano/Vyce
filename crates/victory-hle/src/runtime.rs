@@ -186,12 +186,21 @@ pub fn use_console_timers() {
     use windows_sys::Win32::Media::timeBeginPeriod;
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
-        ProcessPowerThrottling, SetProcessInformation,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling, SetProcessInformation,
+    };
+    // Also: the system does not run the process at reduced speed (its
+    // efficiency mode, EcoQoS) while its window is not the one in front.
+    // The console has no such mode. From github.com/avatarmanz/VIctory-7900XTX
+    // (51d3f4d). `VICTORY_EFFICIENCY_MODE=1` leaves the system its choice.
+    let execution = if std::env::var("VICTORY_EFFICIENCY_MODE").is_ok_and(|v| v == "1") {
+        0
+    } else {
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED
     };
     let keep = PROCESS_POWER_THROTTLING_STATE {
         Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION | execution,
         StateMask: 0,
     };
     // SAFETY: plain process settings; `keep` outlives the call.
@@ -204,6 +213,27 @@ pub fn use_console_timers() {
         );
         timeBeginPeriod(1);
     }
+    ahead_of_other_programs();
+}
+
+/// The title's streaming thread runs below normal priority (on the console
+/// nobody else wants its core) and does all of its loading: a program that
+/// keeps the processors busy at normal priority (a build, a scan) starved
+/// it, and loading took 40 to 60 s instead of 28 to 33. So the process runs
+/// above normal for as long as it runs; our pipeline workers stay below the
+/// title's threads. From github.com/avatarmanz/VIctory-7900XTX (c278c67).
+/// `VICTORY_PROCESS_PRIORITY=normal` (or `0`): as it was started.
+#[cfg(windows)]
+fn ahead_of_other_programs() {
+    use windows_sys::Win32::System::Threading::{
+        ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass,
+    };
+    if std::env::var("VICTORY_PROCESS_PRIORITY").is_ok_and(|v| v == "normal" || v == "0") {
+        return;
+    }
+    // SAFETY: a plain process setting.
+    let set = unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) } != 0;
+    tracing::info!(set, "the process runs above normal (VICTORY_PROCESS_PRIORITY=normal: not)");
 }
 
 #[cfg(test)]

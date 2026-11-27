@@ -17,12 +17,15 @@
 //!
 //! The library is one file of 150 MB and more, on the disk the title
 //! streams from, and is written whole. So a thread of its own writes it,
-//! slowly and at the lowest priority for the disk: some minutes after the
-//! first pipeline that is not in the file, when a load of the title's ends,
-//! and (at once) when the process does. A crash loses what those minutes
-//! made.
+//! slowly and at the lowest priority for the disk, and only when pipelines
+//! were added: some minutes after the first pipeline that is not in the
+//! file, when a load of the title's ends, and (at once) when the process
+//! does. A crash loses what those minutes made. Written by the workers up
+//! to every 20 s, at full speed, most frames of one to two seconds in the
+//! world fell in its writes. `VYCE_LIBRARY_SAVER=0` has the workers write
+//! it as before.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -89,9 +92,13 @@ fn library() -> Option<&'static Mutex<Library>> {
                 && let Some(dir) = DIR.get()
             {
                 remove_left_over(dir);
-                let thread = std::thread::Builder::new().name("victory-library".into()).spawn(saver);
-                if let Err(e) = thread {
-                    tracing::warn!(error = %e, "pipelines are kept only as the run ends");
+                if saver_on() {
+                    let thread = std::thread::Builder::new()
+                        .name("victory-library".into())
+                        .spawn(saver);
+                    if let Err(e) = thread {
+                        tracing::warn!(error = %e, "pipelines are kept only as the run ends");
+                    }
                 }
             }
             library.map(Mutex::new)
@@ -581,6 +588,14 @@ pub(crate) fn save_soon() {
     DUE_CHANGED.notify_one();
 }
 
+/// Whether the library's own thread writes the cache, as above
+/// (`VYCE_LIBRARY_SAVER=0`: the pipeline workers write the library whole
+/// whenever a pipeline or a list changed, at most every 20 s, as before).
+fn saver_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VYCE_LIBRARY_SAVER").map_or(true, |v| v != "0"))
+}
+
 /// The process ends: a write under way is given up, and no other begun.
 static ENDING: AtomicBool = AtomicBool::new(false);
 
@@ -588,15 +603,32 @@ static ENDING: AtomicBool = AtomicBool::new(false);
 pub(crate) fn save_now() {
     ENDING.store(true, Ordering::Relaxed);
     // A run that made nothing does not open the library for this.
-    if MADE.load(Ordering::Relaxed) > 0 || USED_CHANGED.load(Ordering::Relaxed) {
-        save(|path, bytes| std::fs::write(path, bytes));
+    if MADE.load(Ordering::Relaxed) > 0 || lists_changed() {
+        save(!saver_on(), |path, bytes| std::fs::write(path, bytes));
     }
+}
+
+/// A worker made a pipeline or ran out of work. With the saver off
+/// ([`saver_on`]) the cache is written from here as before: at most every
+/// 20 s, and a worker that ends a pipeline while another writes waits.
+pub(crate) fn worker_done() {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    const EVERY: Duration = Duration::from_secs(20);
+    if saver_on() || DIR.get().is_none() {
+        return;
+    }
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.is_some_and(|t| t.elapsed() < EVERY) {
+        return;
+    }
+    *last = Some(Instant::now());
+    save(true, |path, bytes| std::fs::write(path, bytes));
 }
 
 /// Writes the cache when it is due, as long as the process runs.
 fn saver() {
     // The workers that make pipelines wait while the library serialises:
-    // at their priority.
+    // not below them.
     // SAFETY: a plain call on our own thread.
     unsafe {
         use windows::Win32::System::Threading::*;
@@ -610,7 +642,8 @@ fn saver() {
                 // What is added from here on is for the next write.
                 *waiting = Due::NOTHING;
                 drop(waiting);
-                if !save(|path, bytes| write_slowly(path, bytes, &ENDING)) {
+                // What was not written is tried again minutes later.
+                if !save(false, |path, bytes| write_slowly(path, bytes, &ENDING)) {
                     changed();
                 }
                 due()
@@ -623,94 +656,138 @@ fn saver() {
     }
 }
 
-/// The library's bytes, and how many pipelines they hold that its file does
-/// not; `None` if there are none, or they do not serialise.
-fn serialized(library: &Mutex<Library>) -> Option<(Vec<u8>, u64)> {
+/// What a library serialised to: its bytes, how many pipelines they hold
+/// that its file does not, and how long the workers' loads and stores
+/// waited for it.
+struct Serialized {
+    bytes: Vec<u8>,
+    added: u64,
+    locked: Duration,
+}
+
+/// The library's bytes; `None` if it holds no pipeline its file does not
+/// (and not `anyway`). `Err` if they do not serialise (a lost device, no
+/// memory for them).
+fn serialized(library: &Mutex<Library>, anyway: bool) -> Result<Option<Serialized>, ()> {
     /// Room for what is added while the buffer is made.
     const SPARE: usize = 4 << 20;
     let lock = || library.lock().unwrap_or_else(|e| e.into_inner());
     let size = {
         let l = lock();
-        if l.added == 0 {
-            return None;
+        if l.added == 0 && !anyway {
+            return Ok(None);
         }
         // SAFETY: a plain query.
         unsafe { l.library.GetSerializedSize() }
     };
+    let no_memory = |e: std::collections::TryReserveError, size: usize| {
+        tracing::warn!(error = %e, size, "no memory to serialise the host pipeline library");
+    };
     // Made and touched outside the lock: the page faults of 150 MB.
     let mut bytes: Vec<u8> = Vec::new();
     if let Err(e) = bytes.try_reserve_exact(size + SPARE) {
-        tracing::warn!(error = %e, size, "no memory to serialise the host pipeline library");
-        return None;
+        no_memory(e, size);
+        return Err(());
     }
     bytes.resize(size + SPARE, 0);
     let l = lock();
+    let locked = Instant::now();
+    // SAFETY: a plain query.
+    let size = unsafe { l.library.GetSerializedSize() };
+    if let Err(e) = bytes.try_reserve_exact(size.saturating_sub(bytes.len())) {
+        no_memory(e, size);
+        return Err(());
+    }
+    bytes.resize(size, 0);
     // SAFETY: a buffer of the size the library asks for.
-    let done = unsafe {
-        bytes.resize(l.library.GetSerializedSize(), 0);
-        l.library.Serialize(&mut bytes)
-    };
-    match done {
-        Ok(()) => Some((bytes, l.added)),
+    match unsafe { l.library.Serialize(&mut bytes) } {
+        Ok(()) => Ok(Some(Serialized { bytes, added: l.added, locked: locked.elapsed() })),
         Err(e) => {
             tracing::warn!(error = %e, "host pipeline library not serialised");
-            None
+            Err(())
         }
     }
 }
 
-/// Writes the library if pipelines were added (with `write`, to a file it is
-/// given) and the early list if that changed; false if one was not written.
-fn save(write: impl Fn(&std::path::Path, &[u8]) -> std::io::Result<()>) -> bool {
-    // Held over serialisation and both writes, so overlapping saves cannot
+/// Whether the early or the slow list is not on disk.
+fn lists_changed() -> bool {
+    USED_CHANGED.load(Ordering::Relaxed) || SLOW_CHANGED.load(Ordering::Relaxed)
+}
+
+/// Writes the library if pipelines were added (with `whole`, also if only a
+/// list changed, as before), with `write` to a file it is given, and the
+/// lists that changed; false if something was not written.
+fn save(whole: bool, write: impl Fn(&std::path::Path, &[u8]) -> std::io::Result<()>) -> bool {
+    // Held over serialisation and the writes, so overlapping saves cannot
     // replace files under each other.
     static ONE: Mutex<()> = Mutex::new(());
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return true };
     let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
     let started = Instant::now();
-    let blob = serialized(library);
+    // Taken before the lists are read: what changes after is for the next save.
     let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
-    if blob.is_none() && !used_changed {
+    let slow_changed = SLOW_CHANGED.swap(false, Ordering::Relaxed);
+    let keep_dirty = || {
+        USED_CHANGED.fetch_or(used_changed, Ordering::Relaxed);
+        SLOW_CHANGED.fetch_or(slow_changed, Ordering::Relaxed);
+    };
+    let Ok(blob) = serialized(library, whole && (used_changed || slow_changed)) else {
+        keep_dirty();
+        return false;
+    };
+    if blob.is_none() && !used_changed && !slow_changed {
         return true;
     }
     let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    let slow: Vec<String> = SLOW
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .flatten()
+        .map(|(key, ms)| format!("{key} {ms}"))
+        .collect();
     let written = std::fs::create_dir_all(dir)
         .and_then(|()| match &blob {
-            Some((bytes, _)) => publish(&dir.join(LIBRARY_FILE), |file| write(file, bytes)),
+            Some(s) => publish(&dir.join(LIBRARY_FILE), |file| write(file, &s.bytes)),
             None => Ok(()),
         })
         .and_then(|()| match used_changed {
             true => write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()),
             false => Ok(()),
+        })
+        .and_then(|()| match slow_changed {
+            true => write_atomically(&dir.join(SLOW_FILE), slow.join("\n").as_bytes()),
+            false => Ok(()),
         });
     match (written, blob) {
-        (Ok(()), Some((bytes, added))) => {
+        (Ok(()), Some(s)) => {
             let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
             // Keep pipelines stored while the files were being written.
-            l.added = l.added.saturating_sub(added);
+            l.added = l.added.saturating_sub(s.added);
             drop(l);
             tracing::info!(
-                bytes = bytes.len(),
-                added,
+                bytes = s.bytes.len(),
+                added = s.added,
                 early = used.len(),
+                slow = slow.len(),
                 made = MADE.load(Ordering::Relaxed),
                 loaded = LOADED.load(Ordering::Relaxed),
                 started_early = EARLY.load(Ordering::Relaxed),
                 seconds = started.elapsed().as_secs_f64(),
+                locked_ms = s.locked.as_millis() as u64,
                 "host pipeline library saved"
             );
             true
         }
         (Ok(()), None) => {
-            tracing::info!(early = used.len(), "title pipelines to start early saved");
+            let (early, slow) = (used.len(), slow.len());
+            tracing::info!(early, slow, "title pipelines to start early saved");
             true
         }
         (Err(e), _) => {
-            // At least one cache file was not published. Keep the counters
+            // At least one cache file was not published. Keep the lists
             // dirty for the next save.
-            if used_changed {
-                USED_CHANGED.store(true, Ordering::Relaxed);
-            }
+            keep_dirty();
             if e.kind() == std::io::ErrorKind::Interrupted {
                 tracing::info!("a slow write of the host pipeline library given up");
             } else {
@@ -855,6 +932,76 @@ pub(crate) fn note_used(key: &str) {
     }
 }
 
+/// The title pipeline with `key` has no host pipeline (a shader does not
+/// translate, the host refuses it): not started early again.
+pub(crate) fn note_unused(key: &str) {
+    let mut used = used();
+    if used.as_mut().is_some_and(|set| set.remove(key)) {
+        drop(used);
+        USED_CHANGED.store(true, Ordering::Relaxed);
+        changed();
+    }
+}
+
+/// Title pipelines that took long to make, by key, with the most
+/// milliseconds of a worker's processor time one took, in this run or an
+/// earlier one: started early, they are made by a quarter of the workers
+/// at most ([`super::make`]). After github.com/avatarmanz/VIctory-7900XTX
+/// (a30829c), which counted wall time; on this machine the workers run
+/// below the title's loading threads, which keep every processor busy.
+const SLOW_FILE: &str = "slow-pipelines.txt";
+/// A pipeline that takes this long is one ([`slow`]).
+pub(crate) const SLOW_MS: u64 = 1000;
+static SLOW: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+static SLOW_CHANGED: AtomicBool = AtomicBool::new(false);
+
+fn slow_ones() -> std::sync::MutexGuard<'static, Option<HashMap<String, u64>>> {
+    let mut slow = SLOW.lock().unwrap_or_else(|e| e.into_inner());
+    if slow.is_none() {
+        let listed = DIR
+            .get()
+            .and_then(|d| std::fs::read_to_string(d.join(SLOW_FILE)).ok())
+            .unwrap_or_default();
+        *slow = Some(parse_slow(&listed));
+    }
+    slow
+}
+
+/// The slow list's lines, `key ms`; what is not one is left out.
+fn parse_slow(text: &str) -> HashMap<String, u64> {
+    text.lines()
+        .filter_map(|line| line.split_once(' '))
+        .filter_map(|(key, ms)| Some((key.to_owned(), ms.trim().parse::<u64>().ok()?)))
+        .filter(|(key, ms)| !key.is_empty() && *ms >= SLOW_MS)
+        .take(EARLY_MAX)
+        .collect()
+}
+
+/// Whether making the title pipeline with `key` took [`SLOW_MS`] or more,
+/// in this run or an earlier one.
+pub(crate) fn slow(key: &str) -> bool {
+    slow_ones().as_ref().is_some_and(|s| s.contains_key(key))
+}
+
+/// Making the title pipeline with `key` took `ms` of a worker's time.
+pub(crate) fn note_time(key: &str, ms: u64) {
+    if ms < SLOW_MS {
+        return;
+    }
+    let mut slow = slow_ones();
+    let all = slow.get_or_insert_with(HashMap::new);
+    if all.len() >= EARLY_MAX && !all.contains_key(key) {
+        return;
+    }
+    let known = all.entry(key.to_owned()).or_insert(0);
+    if ms > *known {
+        *known = ms;
+        drop(slow);
+        SLOW_CHANGED.store(true, Ordering::Relaxed);
+        changed();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -981,6 +1128,23 @@ mod tests {
         due.changed(at(200));
         due.soon();
         assert_eq!(due.wait(at(201)), Some(Duration::ZERO));
+    }
+
+    /// The slow list's file: what is not a line of a key and its time, or
+    /// is quicker than a slow one, is left out; a key keeps its longest time.
+    #[test]
+    fn the_slow_list_keeps_what_took_long() {
+        let listed = parse_slow("a 1500\nb 999\n 2000\nc x\nd 3000 more\ne  1200\n\nf 2500\r\n");
+        let mut keys: Vec<(&str, u64)> = listed.iter().map(|(k, ms)| (k.as_str(), *ms)).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, [("a", 1500), ("e", 1200), ("f", 2500)]);
+        let key = "a pipeline of the slow list (test)";
+        note_time(key, SLOW_MS - 1);
+        assert!(!slow(key));
+        note_time(key, 1200);
+        note_time(key, 1100);
+        assert!(slow(key) && SLOW_CHANGED.load(Ordering::Relaxed));
+        assert_eq!(SLOW.lock().unwrap().as_ref().unwrap()[key], 1200);
     }
 
     #[test]

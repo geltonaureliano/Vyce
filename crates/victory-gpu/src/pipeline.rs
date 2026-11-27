@@ -177,8 +177,8 @@ impl std::fmt::Debug for Shader {
     }
 }
 
-/// The name of the title's temporal resolve (Grand Theft Auto VI), which runs
-/// in groups of 8 by 8 pixels.
+/// The name of the title's temporal resolve, which runs in groups of 8 by 8
+/// pixels.
 #[cfg(windows)]
 const RESOLVE: &[u8] = b"CS_TAA2_Resolve";
 
@@ -477,7 +477,13 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
         return None;
     }
-    make::ready(&pipeline(this).host)
+    let p = pipeline(this);
+    // Never made, and never listed for the next run's early start (a draw
+    // that asks lists its pipeline at once, `make::ready`).
+    if p.left_out.is_some() {
+        return None;
+    }
+    make::ready(&p.host)
 }
 
 /// Inspects the already published pipeline without scheduling or waiting.
@@ -546,6 +552,12 @@ pub fn warm(
                                 Some(_) => one.pipelines = 1,
                                 None => one.failed = 1,
                             }
+                            // What is stored is written minutes later by the
+                            // library's own thread (here only with
+                            // `VYCE_LIBRARY_SAVER=0`): a compile that crashes
+                            // or never ends parks its thread, and this scope
+                            // never ends then.
+                            library::worker_done();
                         }
                     }
                     let mut t = total.lock().unwrap_or_else(|e| e.into_inner());
@@ -928,6 +940,27 @@ mod tests {
         assert_eq!(super::left_out_program(&named("CS_ScreenProbes_TemporalResolve"), hash), None);
         assert_eq!(super::left_out_program(&named("CS_BatchCullMeshlets"), hash), None);
         assert_eq!(super::left_out_program(b"no name at all", hash), None);
+    }
+
+    /// A pipeline left out of the picture is never made, nor listed for the
+    /// next run's early start when a draw asks for it.
+    #[test]
+    #[cfg(windows)]
+    fn left_out_pipelines_are_not_listed_early() {
+        let code = b"  dx_CS_InterpolateStrands_1a2b3c4d_Wrapped  (listed early test)".to_vec();
+        let desc = ComputeHead {
+            root: std::ptr::null(),
+            stage: Bytecode {
+                code: code.as_ptr(),
+                size: code.len(),
+            },
+        };
+        let mut p = std::ptr::null();
+        assert_eq!(create_compute(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p), S_OK);
+        assert_eq!(left_out(p), Some("hair strands"));
+        assert!(host_pipeline(p).is_none());
+        assert!(!library::wanted_early(pipeline(p).host.key()));
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
     }
 
     #[cfg(all(windows, feature = "diagnostics"))]
