@@ -68,6 +68,9 @@ pub(crate) struct HostHeap {
     rewrites_seen: AtomicU64,
     /// The views of memory by address made ([`crate::memory::fill`]).
     memory_seen: Mutex<u64>,
+    /// Tests': plans that made slots.
+    #[cfg(test)]
+    plans_made: AtomicU64,
 }
 
 /// The dword of the stride table the element counts start at.
@@ -244,6 +247,11 @@ struct Bindless {
     bounce_chunks: Vec<(ID3D12Resource, usize, u64, u64)>,
     /// Slots written since the plan was made: only they are made again.
     dirty: BTreeSet<u32>,
+    /// The last plan left slots of `dirty` unmade that were dirty before it
+    /// (over its time budget, or past what a plan takes at once): the
+    /// submission it was made for may read them
+    /// ([`HostHeap::bindless_plan_with`]).
+    carried: bool,
     /// Slots of `dirty` in the order the title wrote them (some may be made
     /// since): the last ones are the tables of the work being submitted.
     recent: Vec<u32>,
@@ -507,29 +515,68 @@ unsafe impl Send for BindlessPlan {}
 unsafe impl Sync for BindlessPlan {}
 
 impl BindlessPlan {
-    /// Copies the misaligned constant buffers into their bounce slices.
+    /// Which misaligned constant buffers are to be copied into their bounce
+    /// slices ([`BindlessPlan::copy_slices`], which the caller does before
+    /// any list of the submission runs, after the flights before have landed
+    /// if it is prepared under them: the slices are the slots', which they
+    /// may read, `crate::tail`): those of the whole plan (`Some(true)`) or the
+    /// new ones (`Some(false)`).
     ///
     /// shortcut: all of them once a frame, else only for a plan not copied
     /// yet: the title writes constants before it points a slot at them.
-    /// Returns the title memory to bring up to date, by the same rule, in two
-    /// lists, and whether it is all of it (and may be looked at less often
-    /// where it does not change) rather than what is new.
-    pub(crate) fn copy_constants(&self) -> ([&[(Arc<crate::shadow::Shadow>, usize, usize)]; 2], bool) {
+    /// Returns besides the title memory to bring up to date, by the same
+    /// rule, in two lists, and whether it is all of it (and may be looked at
+    /// less often where it does not change) rather than what is new.
+    pub(crate) fn constants_due(
+        &self,
+    ) -> ([&[(Arc<crate::shadow::Shadow>, usize, usize)]; 2], bool, Option<bool>) {
         let frame = crate::queue::presented() + 1;
         // Counted for all plans: each is the one before with a few changes.
         static FRAME: AtomicU64 = AtomicU64::new(0);
         let all = FRAME.swap(frame, Ordering::AcqRel) != frame;
         let fresh = self.copied_in.swap(frame, Ordering::AcqRel) == 0;
         if all || in_test() {
-            let (planned, extra) = self.all_bounces();
-            copy_lists(&[&planned, extra]);
-            return ([&self.reads, &self.extra_reads], all);
+            return ([&self.reads, &self.extra_reads], all, Some(true));
         }
         if fresh {
-            copy_lists(&[&self.fresh]);
-            return ([&self.fresh_reads, &[]], false);
+            return ([&self.fresh_reads, &[]], false, Some(false));
         }
-        ([&[], &[]], false)
+        ([&[], &[]], false, None)
+    }
+
+    /// Tests': a plan of only misaligned constant buffers (bounce slice,
+    /// title address, bytes) and unordered access ranges, which the heap's
+    /// submissions then take.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        heap: &HostHeap,
+        bounces: Vec<(usize, u64, u32)>,
+        writes: Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
+    ) {
+        let plan = Arc::new(BindlessPlan {
+            reads: Arc::default(),
+            writes: Arc::new(writes),
+            bounces: Arc::new(bounces),
+            fresh: Vec::new(),
+            fresh_reads: Vec::new(),
+            extra_reads: Arc::default(),
+            extra_bounces: Arc::default(),
+            copied_in: AtomicU64::new(0),
+            _retained: Arc::default(),
+            _extra: Vec::new(),
+        });
+        heap.bindless.lock().unwrap().plan = Some(plan);
+    }
+
+    /// Copies the misaligned constant buffers of the whole plan (`whole`) or
+    /// the new ones into their bounce slices.
+    pub(crate) fn copy_slices(&self, whole: bool) {
+        if whole {
+            let (planned, extra) = self.all_bounces();
+            copy_lists(&[&planned, extra]);
+        } else {
+            copy_lists(&[&self.fresh]);
+        }
     }
 
     /// The misaligned constant buffers of all slots: the whole plan's, but
@@ -762,6 +809,19 @@ fn in_test() -> bool {
     false
 }
 
+/// Tests': this thread's plans are made as the game's are (`on`), and what
+/// shaders write through their unordered access slots is not copied back.
+#[cfg(test)]
+pub(crate) fn as_in_game(on: bool) {
+    AS_IN_GAME.set(on);
+}
+
+/// Whether what shaders write through a plan's unordered access slots goes
+/// back to title memory: in tests only, unless as in the game.
+pub(crate) fn plan_writes_back() -> bool {
+    cfg!(test) && in_test()
+}
+
 /// A plan built some frames ago may read memory no slot views any more:
 /// for at most this many frames.
 ///
@@ -987,6 +1047,8 @@ impl HostHeap {
             recheck_at: AtomicU64::new(u64::MAX),
             rewrites_seen: AtomicU64::new(0),
             memory_seen: Mutex::new(0),
+            #[cfg(test)]
+            plans_made: AtomicU64::new(0),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -2135,13 +2197,63 @@ impl HostHeap {
         due
     }
 
+    /// Tests': whether the last plan left slots unmade that the title had
+    /// written before it.
+    #[cfg(test)]
+    pub(crate) fn carried(&self) -> bool {
+        let b = self.bindless.lock().unwrap();
+        b.carried && !b.dirty.is_empty()
+    }
+
+    /// Tests': the last plan left slot `index` unmade.
+    #[cfg(test)]
+    pub(crate) fn carry_for_test(&self, index: u32) {
+        let mut b = self.bindless.lock().unwrap();
+        b.dirty.insert(index);
+        b.carried = true;
+    }
+
+    /// Tests': how many plans made slots so far.
+    #[cfg(test)]
+    pub(crate) fn plans_made(&self) -> u64 {
+        self.plans_made.load(Ordering::Acquire)
+    }
+
+    /// Tests': the next plan's look finds slot `index` (one of unmapped
+    /// memory, perhaps mapped since) to make anew.
+    #[cfg(test)]
+    pub(crate) fn look_for_test(&self, index: u32) {
+        let mut b = self.bindless.lock().unwrap();
+        b.uses.insert(index, SlotUse { unmapped: true, ..SlotUse::default() });
+        b.unmapped_slots.insert(index);
+        b.looked[0] = 0;
+        b.checked = (u64::MAX, u64::MAX, u64::MAX);
+    }
+
+    /// Tests': [`HostHeap::bindless_plan_with`], waiting for nothing.
+    #[cfg(test)]
+    pub(crate) fn bindless_plan(&self) -> Option<Arc<BindlessPlan>> {
+        self.bindless_plan_with(&mut || {})
+    }
+
     /// At submission: what the heap's bindless slots need. Only slots
     /// written since the last plan are made again; released views are found
     /// by one look at all slots' generations, and slots of evicted placed
     /// textures (or unmapped memory, once remapped) are made again. With
     /// nothing changed it is the last plan, whose reads the caller
     /// refreshes, which costs little when the title changed nothing.
-    pub(crate) fn bindless_plan(&self) -> Option<Arc<BindlessPlan>> {
+    ///
+    /// `wait` is called, under no lock, before slots are made of which some
+    /// were not written by the title since the plan before: those the plan
+    /// before left unmade (over its time budget, or past what a plan takes
+    /// at once), which the submission it was made for may read with what they
+    /// held, and those the look finds (released views, evicted textures,
+    /// windows of memory mapped anew, unmapped memory perhaps mapped since).
+    /// A submission prepared under a flight waits for it there
+    /// (`crate::tail::Why::Slots`): a descriptor written while the host GPU
+    /// reads it may be read half old, half new. What the title wrote since
+    /// the plan before nothing in flight reads, as on the console.
+    pub(crate) fn bindless_plan_with(&self, wait: &mut dyn FnMut()) -> Option<Arc<BindlessPlan>> {
         if self.sampler {
             return None;
         }
@@ -2158,26 +2270,32 @@ impl HostHeap {
             b.checked.1 != epochs.1 && b.looked[0] != frame
         };
         let live = evictions.then(crate::resource::placed_live);
-        let (mut todo, check, remade, exempt) = {
+        let (mut todo, check, remade, exempt, untaken, older) = {
             let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
             let b = &mut *b;
+            // Slots the plan before left unmade, and those the look below
+            // finds: not written since the plan before.
+            let mut older = b.carried && !b.dirty.is_empty();
             // Released views, evicted textures, and remapped memory are looked for once a frame.
             let look = b.looked[0] != frame && b.checked != epochs;
             let remake = b.full.1 && b.full.0 != frame;
             if b.dirty.is_empty()
                 && !look
                 && !remake
-                && let Some(plan) = &b.plan
+                && let Some(plan) = b.plan.clone()
             {
-                return Some(plan.clone());
+                b.carried = false;
+                return Some(plan);
             }
             if !look
                 && !remake
                 && b.recent.is_empty()
                 && b.budget()[0] == 0
-                && let Some(plan) = &b.plan
+                && let Some(plan) = b.plan.clone()
             {
-                return Some(plan.clone());
+                // None made: what is dirty waits, written before this plan.
+                b.carried = !b.dirty.is_empty();
+                return Some(plan);
             }
             let viewed = look && b.checked.0 != epochs.0;
             let mem_changed = look && b.checked.2 != epochs.2;
@@ -2215,10 +2333,13 @@ impl HostHeap {
             {
                 dirty.insert(i);
             }
+            // Dirty before this plan and not taken by it.
+            let untaken = !b.dirty.is_empty();
             if let Some(l) = live {
                 for (&i, u) in &b.uses {
                     if u.placed.is_some_and(|t| !l.contains(&t)) {
                         dirty.insert(i);
+                        older = true;
                     }
                 }
             }
@@ -2238,6 +2359,7 @@ impl HostHeap {
                         {
                             remade.push(i);
                             dirty.insert(i);
+                            older = true;
                         }
                     }
                     b.direct_slots.len()
@@ -2252,6 +2374,7 @@ impl HostHeap {
                             || mapped.as_ref().is_none_or(|m| meets(m, u.at)))
                     {
                         dirty.insert(i);
+                        older = true;
                     }
                 }
             }
@@ -2277,18 +2400,21 @@ impl HostHeap {
                 .chain(dirty)
                 .map(|i| (i, b.slots.get(&i).copied()))
                 .collect();
-            (todo, check, remade, exempt)
+            (todo, check, remade, exempt, untaken, older)
         };
+        let t = std::time::Instant::now();
+        let stale = stale_views(&check);
+        if !check.is_empty() {
+            plan_note(2, t, check.len(), stale.len());
+        }
+        if older || !stale.is_empty() {
+            wait();
+        }
         if !remade.is_empty() {
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             for i in remade {
                 made[i as usize] = 0;
             }
-        }
-        let t = std::time::Instant::now();
-        let stale = stale_views(&check);
-        if !check.is_empty() {
-            plan_note(2, t, check.len(), stale.len());
         }
         todo.extend(stale.into_iter().map(|(i, v)| (i, Some(v))));
         let (started, left) = (std::time::Instant::now(), self.budget_left(0));
@@ -2310,6 +2436,10 @@ impl HostHeap {
             made_any = true;
             let made = entry.map(|e| (e, self.use_slot(index, e)));
             results.push((index, made));
+        }
+        #[cfg(test)]
+        if made_any {
+            self.plans_made.fetch_add(1, Ordering::AcqRel);
         }
         self.budget_spend(0, started.elapsed().as_micros() as u64);
         plan_note(3, started, count, 0);
@@ -2439,7 +2569,10 @@ impl HostHeap {
         if let Some(index) = over {
             b.dirty.insert(index);
         }
-        b.dirty.extend(todo.map(|(i, _)| i));
+        let rest: Vec<u32> = todo.map(|(i, _)| i).collect();
+        // What the title wrote meanwhile is not this plan's to make.
+        b.carried = untaken || over.is_some() || !rest.is_empty();
+        b.dirty.extend(rest);
         BACKLOG[0].store(b.dirty.len() as u64, Ordering::Relaxed);
         BACKLOG[1].store(b.record_pending.len() as u64, Ordering::Relaxed);
         b.full.1 |= made_any && changed

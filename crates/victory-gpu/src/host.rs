@@ -2,8 +2,9 @@
 //! window to present on.
 //!
 //! The title's submissions return before the host GPU has run them
-//! (`crate::flight`).
-//! shortcut: the next one is prepared only once they are finished.
+//! (`crate::flight`), and the next one is prepared while the one before
+//! runs, waiting for it only before its own lists go to the host queue
+//! (`crate::tail`).
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1584,9 +1585,10 @@ enum Step {
     /// intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Work that may write title memory.
-    Run(Box<dyn Fn() + Send>),
-    /// Work that writes host memory only.
-    Host(Box<dyn Fn() + Send>),
+    Run(Arc<dyn Fn() + Send + Sync>),
+    /// Work that writes host memory only (it may read title memory; shared,
+    /// as a submission prepared under a flight does it later).
+    Host(Arc<dyn Fn() + Send + Sync>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date and, when dirty, copies
@@ -1818,6 +1820,11 @@ impl Host {
         *submitted += 1;
         flight.fence = *submitted;
         flight.timed = timed.map(|(_, pair)| pair);
+        if marked() {
+            let at = flight.writes.iter().map(|&(at, _, bytes)| (at, at + bytes)).collect();
+            let marks = crate::flight::Marks::new(flight.fence, at, Vec::new(), Vec::new());
+            flight.marks = Arc::new(marks);
+        }
         self.line.send(flight);
     }
 
@@ -1848,10 +1855,10 @@ impl Host {
     ///
     /// Such a submission is finished (its shaders' writes put back, its
     /// read-backs and bottom-of-pipe writes done) once the host GPU has run
-    /// it (`crate::flight`), at the latest before the next submission's own
-    /// preparation. Meanwhile the next submission's buffer copies are
-    /// brought up to date, so the processor and the card work at the same
-    /// time for that long.
+    /// it (`crate::flight`), at the latest before the next submission's
+    /// lists go to the host queue (`crate::tail`; with `VYCE_TAIL_DRAIN=0`
+    /// before its preparation). Meanwhile the next submission is prepared,
+    /// so the processor and the card work at the same time for that long.
     pub(crate) fn execute_title(&self, runs: &[std::sync::Arc<HostList>]) {
         let lists: Vec<&HostList> = runs.iter().map(|l| &**l).collect();
         self.execute_inner(&lists, Some(runs));
@@ -1861,7 +1868,9 @@ impl Host {
     /// submission before still runs: the same refreshes as the lists'
     /// steps make, early. The ranges that submission's shaders write are
     /// left alone (`Shadow::update` goes around them), and the steps in
-    /// their order do it all again after the wait, finding little left.
+    /// their order do it all again after the wait for it, finding little
+    /// left. A submission prepared under the flight (`crate::tail`) does
+    /// without, unless `VYCE_TAIL_PREWARM=1`.
     fn prewarm(&self, runs: &[&HostList]) {
         let started = std::time::Instant::now();
         let mut batch = Batch::default();
@@ -1876,66 +1885,179 @@ impl Host {
         PREWARM_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
+    /// Whether submissions of the title's may be prepared under flights at
+    /// all (`crate::tail`): they return before the host GPU ran them, a
+    /// queue's signal goes behind them, they are one call each (whose lists
+    /// end with what the next lists rely on), their copies are kept and
+    /// compared in one pass, no tile is given back at presents, nothing is
+    /// waited for list by list, and the GPU works.
+    fn can_tail(&self, each: bool, works: bool) -> bool {
+        let switches = async_submit()
+            && crate::flight::late_signal()
+            && one_ecl()
+            && crate::shadow::pass::on()
+            && !crate::shadow::sweeping();
+        if !switches && crate::tail::mode() != crate::tail::Mode::Old {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::info!(
+                    "the tail drain is off: it needs VICTORY_ASYNC_SUBMIT, VYCE_LATE_SIGNAL, \
+                     VYCE_ONE_ECL and VYCE_ONE_PASS on and VICTORY_SWEEP_TILES at 0"
+                );
+            });
+        }
+        switches && !each && works && self.overlap.load(Ordering::Relaxed)
+    }
+
+    /// Why a title submission waits before it is prepared although the
+    /// tail drain could take it.
+    fn held_back(&self, runs: &[&HostList]) -> Option<crate::tail::Old> {
+        if runs.iter().any(|l| !self.line.landed_up_to(l.last_fence.load(Ordering::Acquire))) {
+            return Some(crate::tail::Old::List);
+        }
+        let card = |l: &&HostList| {
+            let steps = l.deferred();
+            steps.copies.iter().any(|s| matches!(s, Step::GpuWrite(shadow, ..) if shadow.is_card()))
+        };
+        runs.iter().any(card).then_some(crate::tail::Old::Card)
+    }
+
+    /// Whether this title submission is prepared while the flights before
+    /// it are in the air, waiting for them at its tail (`crate::tail`):
+    /// what they write, and whether every refresh waits.
+    fn tail_drain(
+        &self,
+        runs: &[&HostList],
+        keep: Option<&[Arc<HostList>]>,
+        each: bool,
+        works: bool,
+    ) -> Option<(crate::tail::Air, bool)> {
+        use crate::tail::Mode;
+        if keep.is_none() || !self.can_tail(each, works) {
+            return None;
+        }
+        let mode = crate::tail::mode();
+        crate::telemetry::note(
+            crate::telemetry::Gauge::TailMode,
+            match mode {
+                Mode::Old => 0,
+                Mode::Tail => 1,
+                Mode::Strict => 2,
+            },
+        );
+        if mode == Mode::Old || !self.line.busy() {
+            return None;
+        }
+        if let Some(why) = self.held_back(runs) {
+            crate::tail::old(why, false);
+            return None;
+        }
+        let air = crate::tail::Air::new(self.line.air(), self.line.clone(), false);
+        Some((air, mode == Mode::Strict))
+    }
+
+    /// For a title submission that waits before it is prepared, the tail
+    /// drain off and measurements on: what the tail drain would have done
+    /// (`crate::tail::dry`).
+    fn dry_run(
+        &self,
+        runs: &[&HostList],
+        keep: Option<&[Arc<HostList>]>,
+        each: bool,
+        works: bool,
+    ) -> Option<crate::tail::Dry> {
+        if !crate::tail::dry()
+            || crate::tail::mode() != crate::tail::Mode::Old
+            || keep.is_none()
+            || !self.line.busy()
+            || !self.can_tail(each, works)
+        {
+            return None;
+        }
+        if let Some(why) = self.held_back(runs) {
+            crate::tail::old(why, true);
+            return None;
+        }
+        let air = crate::tail::Air::new(self.line.air(), self.line.clone(), true);
+        Some(crate::tail::Dry::new(air))
+    }
+
     fn execute_inner(&self, runs: &[&HostList], keep: Option<&[std::sync::Arc<HostList>]>) {
         #[cfg(feature = "diagnostics")]
         let _inside = crate::profile::here();
         if runs.is_empty() {
             return;
         }
-        // One submission at a time from preparation to copy-back: snapshots
-        // and the ranges shaders write are per host copy, not per submission.
+        // One submission at a time from preparation to sending (and, when
+        // waited for, to copy-back).
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        // Wait for any previous async submission before mutating shared Shadow
-        // buffers in `prepare`. During the gap between submissions, the GPU
-        // ran in parallel with the title's CPU command-list recording, and
-        // runs on while this submission's buffer copies are refreshed.
-        if keep.is_some() && self.line.busy() {
+        // The value signalled behind this submission (nothing else adds to
+        // `submitted` before it is sent): the ranges its shaders write carry
+        // it, and its landing opens those alone.
+        let fence = crate::tail::tag(*submitted + 1);
+        #[cfg(feature = "diagnostics")]
+        let each = timing();
+        #[cfg(not(feature = "diagnostics"))]
+        let each = false;
+        // Diagnostics: everything but the GPU's work, to look at the order of
+        // the title's submissions.
+        #[cfg(feature = "diagnostics")]
+        let works = !no_work();
+        #[cfg(not(feature = "diagnostics"))]
+        let works = true;
+        // Prepared while the flight before is in the air, waiting for it at
+        // the tail (`crate::tail`); or once everything in flight has landed.
+        let under = self.tail_drain(runs, keep, each, works);
+        let mut dry = None;
+        if under.is_none() {
+            dry = self.dry_run(runs, keep, each, works);
+        }
+        let draining = std::time::Instant::now();
+        // The GPU ran in parallel with the title's CPU command-list
+        // recording, and runs on while this submission's buffer copies are
+        // refreshed. Under the tail drain the preparation does that itself
+        // (`VYCE_TAIL_PREWARM=1`: the prewarm too, as before).
+        if keep.is_some() && self.line.busy() && (under.is_none() || crate::tail::prewarm()) {
             self.prewarm(runs);
         }
-        self.line.drain(Count::WaitExecute);
+        if under.is_none() {
+            // Wait for any previous async submission before mutating shared
+            // Shadow buffers in `prepare`.
+            if keep.is_some() {
+                self.line.about_to_wait();
+            }
+            self.line.drain(Count::WaitExecute);
+            if let Some(dry) = &mut dry {
+                dry.begin(draining.elapsed());
+            }
+        }
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
-        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
-        // Where each run's lists start in `lists`.
-        let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
-        let mut early = Early::default();
+        let mut prep = Prep::new(runs, fence, under, dry, started);
         // The textures waiting are the process's host's.
         let process = line().is_some_and(|l| Arc::ptr_eq(l, &self.line));
         if process {
-            early.take(&mut batch, runs, false);
+            prep.early_take(false);
         }
-        // Textures the runs' shaders write that go back into title memory,
-        // in the runs' order ([`crate::texback`]).
-        let mut textures: Vec<Arc<crate::texback::Back>> = Vec::new();
-        for list in runs {
-            let uploads = list.run_deferred(&mut batch);
-            firsts.push(lists.len());
-            // A recording submitted again after other tables took the slots
-            // it, or another part of its title's list, lent: its commands
-            // would read their descriptors. Only what it leaves its
-            // textures in is done.
-            // shortcut: its draws and dispatches are lost until the title
-            // resets the list.
-            let skip = list.skipped();
-            let recording = crate::telemetry::start();
-            if let Some(prelude) = list.prelude(&uploads, skip) {
-                lists.push(Some(prelude));
-                crate::telemetry::stop(Count::PreludeTime, recording);
-                crate::telemetry::count(Count::Preludes, 1);
-            }
-            if !skip {
-                lists.push(list.list.cast().ok());
-                // Its copies run only with its commands.
-                textures.extend(list.texture_backs());
-            }
+        for (i, list) in runs.iter().enumerate() {
+            list.run_deferred(&mut prep, i);
+            prep.prelude(i);
         }
-        batch.prepare_bindless();
+        prep.prepare_bindless();
         if process {
-            early.take(&mut batch, runs, true);
+            prep.early_take(true);
         }
+        // The flights before have landed from here on: what waited for them
+        // is done.
+        let waited = prep.tail();
+        let (lists, firsts, mut textures) = prep.lists();
+        // Lists that do not run copy nothing.
+        if !works {
+            textures.clear();
+        }
+        let Prep { mut batch, early, .. } = prep;
         // The textures live (in `early`) until the submission is done.
         let first = early.record(self);
         // The refreshes are done and the lists have not run.
@@ -1969,25 +2091,13 @@ impl Host {
             };
         crate::telemetry::stop(Count::Card, recording);
         let prepared = std::time::Instant::now();
-        #[cfg(feature = "diagnostics")]
-        let each = timing();
-        #[cfg(not(feature = "diagnostics"))]
-        let each = false;
+        // The preparing, without its waits for the flights before.
+        let preparing = (prepared - started).saturating_sub(waited);
         let can_async = self.overlap.load(Ordering::Relaxed)
             && keep.is_some()
             && !each
             && async_submit()
             && card_writes.is_empty();
-        // Diagnostics: everything but the GPU's work, to look at the order of
-        // the title's submissions.
-        #[cfg(feature = "diagnostics")]
-        let works = !no_work();
-        #[cfg(not(feature = "diagnostics"))]
-        let works = true;
-        // Lists that do not run copy nothing.
-        if !works {
-            textures.clear();
-        }
         // Not around runs that are waited for one by one.
         let timed = (works && !each)
             .then(|| self.telemetry_clock())
@@ -2036,7 +2146,8 @@ impl Host {
             crate::telemetry::count(Count::Ecls, 1);
             crate::telemetry::count(Count::HostLists, lists.len() as u64);
             // SAFETY: closed lists, none of them running: every submission
-            // before this one is finished.
+            // before this one has landed (a list in the air takes the old
+            // drain, and the tail drain waited for the rest above).
             unsafe { self.queue.ExecuteCommandLists(lists) };
         };
         let submitting = crate::telemetry::start();
@@ -2081,15 +2192,24 @@ impl Host {
         }
         if works && can_async {
             if let Some(plan) = card_plan {
-                plan.clear_pending();
+                plan.clear_pending(fence);
             }
-            SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+            SUBMISSION_US[0].fetch_add(preparing.as_micros() as u64, Ordering::Relaxed);
             *submitted += 1;
             let mut flight = Flight::new(this_submission, keep.map(<[_]>::to_vec).unwrap_or_default());
             flight.fence = *submitted;
+            debug_assert!(
+                crate::tail::tag(flight.fence) == fence,
+                "a submission's ranges carry its fence value"
+            );
+            flight.writes = take_writes(runs);
+            if marked() {
+                let unlisted = std::mem::take(&mut batch.unlisted);
+                let marks = marks(flight.fence, runs, &cpu_back, &textures, &flight.writes, unlisted);
+                flight.marks = Arc::new(marks);
+            }
             flight.back = cpu_back;
             flight.textures = textures;
-            flight.writes = take_writes(runs);
             flight.timed = timed.map(|(_, pair)| pair);
             flight.sent = sent;
             flight._used = Box::new((early.copies, batch.plans));
@@ -2111,7 +2231,7 @@ impl Host {
         drop(early);
         finished(this_submission);
         let gpu = prepared.elapsed();
-        SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+        SUBMISSION_US[0].fetch_add(preparing.as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         gpu_waits(gpu, runs);
@@ -2144,17 +2264,17 @@ impl Host {
             if card_after_ran {
                 if let Some(engine_lock) = self.card_engine() {
                     let mut engine = engine_lock.lock().unwrap_or_else(|e| e.into_inner());
-                    let written = engine.finish_back(self, plan, &mut submitted);
+                    let written = engine.finish_back(self, plan, &mut submitted, fence);
                     COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
                 } else {
-                    plan.clear_pending();
+                    plan.clear_pending(fence);
                 }
             } else {
-                plan.clear_pending();
+                plan.clear_pending(fence);
             }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
-        finish(&self.queue, runs, &cpu_back, &textures, &take_writes(runs));
+        finish(&self.queue, runs, &cpu_back, &textures, &take_writes(runs), fence);
         // Waited for, under the submission's lock: nothing sent since.
         for list in runs {
             list.landed(u64::MAX);
@@ -2421,24 +2541,64 @@ fn take_writes(runs: &[&HostList]) -> Vec<Write> {
     writes
 }
 
+/// Whether flights carry what their landings write (`crate::tail` uses it,
+/// or counts what it would do).
+fn marked() -> bool {
+    crate::tail::mode() != crate::tail::Mode::Old || crate::tail::dry()
+}
+
+/// What the landing of a flight of `runs` (fence value `fence`) writes in
+/// title memory ([`finish`]): what its shaders wrote (`back`), its
+/// read-backs, the textures it copies back (`textures`, [`crate::texback`])
+/// and its bottom-of-pipe writes; the copies that are not sparse its
+/// shaders write; and what its shaders may write in copies unlisted.
+fn marks(
+    fence: u64,
+    runs: &[&HostList],
+    back: &[Range],
+    textures: &[Arc<crate::texback::Back>],
+    writes: &[Write],
+    unlisted: Vec<(usize, usize)>,
+) -> crate::flight::Marks {
+    let mut at: Vec<(usize, usize)> =
+        back.iter().map(|(_, address, len)| (*address, address + len)).collect();
+    for list in runs {
+        for rb in &list.deferred().readbacks {
+            if rb.lines > 0 {
+                at.push((rb.dst, rb.dst + (rb.lines - 1) * rb.dst_pitch + rb.row_bytes));
+            }
+        }
+    }
+    // The whole of each texture's title memory: which elements the landing
+    // writes is known only once it compares its copies.
+    #[cfg(test)]
+    let textures = if crate::tail::mutated(crate::tail::Mutation::Textures) { &[] } else { textures };
+    at.extend(textures.iter().map(|t| t.range()));
+    at.extend(writes.iter().map(|&(address, _, bytes)| (address, address + bytes)));
+    let dense =
+        back.iter().filter(|r| !r.0.is_sparse()).map(|r| Arc::as_ptr(&r.0) as usize).collect();
+    crate::flight::Marks::new(fence, at, dense, unlisted)
+}
+
 /// After a submission of `runs` ran on `queue`: what its shaders wrote
-/// (`back`) goes back into title memory, then its read-backs, then the
-/// textures its shaders wrote that the title reads on the CPU (`textures`,
-/// [`crate::texback`]), then the bottom-of-pipe writes that tell the title
-/// the GPU is done.
+/// (`back`, ranges that carry `fence`, its fence value) goes back into
+/// title memory, then its read-backs, then the textures its shaders wrote
+/// that the title reads on the CPU (`textures`, [`crate::texback`]), then
+/// the bottom-of-pipe writes that tell the title the GPU is done.
 pub(crate) fn finish(
     queue: &ID3D12CommandQueue,
     runs: &[&HostList],
     back: &[Range],
     textures: &[Arc<crate::texback::Back>],
     writes: &[Write],
+    fence: u64,
 ) {
     let copying = std::time::Instant::now();
     if crate::shadow::pass::on() {
-        let written = crate::shadow::pass::copy_back(back);
+        let written = crate::shadow::pass::copy_back(back, fence);
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
     } else {
-        copy_back_each(back);
+        copy_back_each(back, fence);
     }
     for list in runs {
         for rb in &list.deferred().readbacks {
@@ -2488,9 +2648,9 @@ pub(crate) fn finish(
 }
 
 /// [`finish`]'s copy-back with a pass for every range (`VYCE_ONE_PASS=0`).
-fn copy_back_each(back: &[Range]) {
+fn copy_back_each(back: &[Range], fence: u64) {
     let one = |(shadow, address, len): &Range| {
-        let written = shadow.copy_back(*address, *len);
+        let written = shadow.copy_back(*address, *len, fence);
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
     };
     // Group by Shadow pointer so distinct shadows run in parallel across CPU
@@ -3094,8 +3254,10 @@ impl HostList {
             return None;
         }
         let (allocator, list) = self.prelude_list();
-        // SAFETY: the prelude is not executing (every submission before this
-        // one is finished); the textures and staging buffers are live.
+        // SAFETY: the prelude is not executing: its list is in no flight
+        // (`crate::tail` takes the old drain for one in the air), and it is
+        // recorded once every submission before this one has landed; the
+        // textures and staging buffers are live.
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
@@ -3628,7 +3790,7 @@ impl HostList {
         if !deferred.budget_zeroed {
             if let Some(at) = budget.mapped {
                 // SAFETY: the list's own mapped word, written before it runs.
-                deferred.copies.push(Step::Host(Box::new(move || unsafe {
+                deferred.copies.push(Step::Host(Arc::new(move || unsafe {
                     (at as *mut u32).write_volatile(0);
                 })));
             } else {
@@ -3681,9 +3843,9 @@ impl HostList {
 
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
-    pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
+    pub(crate) fn defer(&self, work: impl Fn() + Send + Sync + 'static) {
         let mut deferred = self.deferred();
-        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.copies.push(Step::Run(Arc::new(work)));
         deferred.refreshed.clear();
         deferred.gpu_written.clear();
         deferred.filled.clear();
@@ -3715,8 +3877,8 @@ impl HostList {
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
-    pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Host(Box::new(work)));
+    pub(crate) fn defer_host(&self, work: impl Fn() + Send + Sync + 'static) {
+        self.deferred().copies.push(Step::Host(Arc::new(work)));
     }
 
     /// Brings a texture's staging buffer up to date when the list is
@@ -3732,23 +3894,20 @@ impl HostList {
             .push(Step::Texture(staging, texture));
     }
 
-    /// Runs the list's submission-time steps; refreshes go into `batch`
-    /// (the title's big buffers, a 174 MB one among them, are read by most
-    /// lists of a submission, through many ranges). Returns the textures
-    /// whose staging buffers changed and must be copied onto the prelude.
-    fn run_deferred(
-        &self,
-        batch: &mut Batch,
-    ) -> Vec<(
-        std::sync::Arc<crate::texture::Staging>,
-        std::sync::Arc<crate::resource::HostTexture>,
-    )> {
+    /// Runs the list's submission-time steps, the list being `index` of the
+    /// preparation's runs; refreshes go into its batch (the title's big
+    /// buffers, a 174 MB one among them, are read by most lists of a
+    /// submission, through many ranges), and the textures whose staging
+    /// buffers changed into its uploads for the list's prelude. Prepared
+    /// under a flight (`crate::tail`), steps that read title memory into
+    /// memory of ours wait for its landing, and title copies wait for it
+    /// where they stand.
+    fn run_deferred(&self, prep: &mut Prep, index: usize) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        let mut uploads = Vec::new();
         let deferred = self.deferred();
         for (heap, writes) in &deferred.bindless {
-            batch.bindless(heap, *writes);
+            prep.batch.bindless(heap, *writes);
         }
         // Title copies, then fills: how many, bytes, microseconds.
         let (mut copies, mut fills) = ([0u64; 3], [0u64; 3]);
@@ -3771,12 +3930,20 @@ impl HostList {
                     {
                         copy_count += 1;
                     }
+                    // A flight in the air may read the destination (or a
+                    // copy of it a refresh would bring up to date), write
+                    // it at its landing, or the source.
+                    prep.flush_point(crate::tail::Why::Copy);
                     let started = std::time::Instant::now();
-                    batch.title_written();
+                    prep.batch.title_written();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     add_to(&mut copies, len, started);
                 }
                 &Step::Fill(dst, src, len) => {
+                    if prep.under() {
+                        prep.queue(Queued::Fill(dst, src, len));
+                        continue;
+                    }
                     #[cfg(feature = "diagnostics")]
                     {
                         copy_count += 1;
@@ -3784,6 +3951,7 @@ impl HostList {
                     let started = std::time::Instant::now();
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     add_to(&mut fills, len, started);
+                    prep.dry_queued(started);
                 }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -3791,13 +3959,19 @@ impl HostList {
                         refresh_count += 1;
                         refresh_bytes += *len as u64;
                     }
-                    batch.add(shadow, *address, *len);
+                    prep.batch.add(shadow, *address, *len);
                 }
                 Step::Run(work) | Step::Host(work) => {
-                    #[cfg(feature = "diagnostics")]
+                    let run = matches!(step, Step::Run(_));
+                    if run {
+                        prep.flush_point(crate::tail::Why::Run);
+                    } else if prep.under() {
+                        prep.queue(Queued::Host(work.clone()));
+                        continue;
+                    }
                     let started = std::time::Instant::now();
-                    if matches!(step, Step::Run(_)) {
-                        batch.title_written();
+                    if run {
+                        prep.batch.title_written();
                     }
                     let working = crate::telemetry::start();
                     work();
@@ -3807,29 +3981,39 @@ impl HostList {
                         add(C::Runs, 1);
                         add(C::RunUs, started.elapsed().as_micros() as u64);
                     }
+                    if !run {
+                        prep.dry_queued(started);
+                    }
                 }
                 Step::GpuWrite(shadow, address, len) => {
                     declared += 1;
-                    let new = batch.declare(shadow, *address, *len);
+                    let new = prep.batch.declare(shadow, *address, *len);
+                    if let Some(dry) = prep.dry() {
+                        dry.declared(*address, *len);
+                    }
                     // The shaders start from the title's data.
                     if crate::shadow::pass::on() && shadow.is_sparse() {
                         // Its bytes are kept with the others', once every
                         // list's steps are done.
                         if new {
-                            batch.flush_over(shadow, *address, *len);
-                            shadow.close_to_refreshes(*address, *len);
+                            prep.batch.flush_over(shadow, *address, *len);
+                            shadow.close_to_refreshes(*address, *len, prep.batch.fence);
                         }
                     } else {
-                        batch.flush();
-                        let started = crate::telemetry::start();
-                        shadow.writing(*address, *len);
-                        crate::telemetry::stop(Count::Snapshots, started);
+                        prep.batch.flush();
+                        prep.dense(shadow, *address, *len);
                     }
                 }
                 Step::Texture(staging, copy) => {
-                    if batch.texture_due(staging) && staging.refresh() {
-                        uploads.push((staging.clone(), copy.clone()));
+                    if prep.under() {
+                        prep.queue(Queued::Texture(index, staging.clone(), copy.clone()));
+                        continue;
                     }
+                    let started = std::time::Instant::now();
+                    if prep.batch.texture_due(staging) && staging.refresh() {
+                        prep.uploads[index].push((staging.clone(), copy.clone()));
+                    }
+                    prep.dry_queued(started);
                 }
             }
         }
@@ -3855,7 +4039,6 @@ impl HostList {
             add(C::Refreshes, refresh_count);
             add(C::RefreshBytes, refresh_bytes);
         }
-        uploads
     }
 }
 
@@ -3884,6 +4067,18 @@ struct Batch {
     /// Their plans, which hold the host resources the slots view until the
     /// submission has run.
     plans: Vec<std::sync::Arc<crate::descriptor::host::BindlessPlan>>,
+    /// The tag of the ranges the submission's shaders write: its fence
+    /// value.
+    fence: u64,
+    /// Title memory its shaders may write in copies without its being copied
+    /// back: the unordered access ranges of the directly indexed heaps it
+    /// uses with shaders that may write (`crate::flight::Marks`).
+    unlisted: Vec<(usize, usize)>,
+    /// Prepared under the flight before (`crate::tail`): the refreshes left
+    /// for after the wait for it.
+    deferring: Option<crate::tail::Deferring>,
+    /// The dry run of the tail drain.
+    dry: Option<crate::tail::Dry>,
 }
 
 /// Pieces of one copy this near each other are refreshed as one.
@@ -3954,7 +4149,7 @@ impl Batch {
             .collect();
         for key in over {
             if let Some((to, shadow)) = self.pieces.remove(&key) {
-                update(&shadow, key.1, to - key.1);
+                self.refresh(vec![(shadow, key.1, to - key.1)]);
             }
         }
     }
@@ -3988,7 +4183,282 @@ impl Batch {
         let mut work: Vec<Range> = self.refreshes.drain(..).map(|(shadow, from, to)| (shadow, from, to - from)).collect();
         let pieces = std::mem::take(&mut self.pieces);
         work.extend(pieces.into_iter().map(|((_, from), (to, shadow))| (shadow, from, to - from)));
+        self.refresh(work);
+    }
+
+    /// Brings `work` up to date now ([`refresh_all`]); prepared under a
+    /// flight, what its landing writes (or memory used in place) after the
+    /// wait for it, in order.
+    fn refresh(&mut self, mut work: Vec<Range>) {
+        if let Some(d) = self.deferring.as_mut() {
+            work.retain(|(shadow, address, len)| {
+                let late = d.is_late(*address, *len);
+                if late {
+                    d.defer(shadow, *address, *len, false, false);
+                }
+                !late
+            });
+        }
+        let started = std::time::Instant::now();
         refresh_all(&work);
+        if let Some(dry) = self.dry.as_mut() {
+            dry.refreshes(work.iter().map(|w| (w.1, w.2)), started.elapsed());
+        }
+    }
+}
+
+/// A texture's staging buffer and its host texture, which a prelude or the
+/// early uploads copy it into.
+type Upload = (Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>);
+
+/// A step of a preparation under a flight left for after the wait for it
+/// (`crate::tail`), in the order the steps came: each reads title memory
+/// into memory of ours, or writes memory a flight in the air may read.
+enum Queued {
+    /// A fill (destination, source, bytes).
+    Fill(usize, usize, usize),
+    /// Work that writes host memory only.
+    Host(Arc<dyn Fn() + Send + Sync>),
+    /// A texture of the run at the index, brought up to date for its prelude.
+    Texture(usize, Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>),
+    /// The prelude of the run at the index.
+    Prelude(usize),
+    /// Uploads before the lists ([`Early::take`]), of these textures.
+    Early(bool, Vec<Upload>),
+    /// A plan's bounces: all of them, or the new ones.
+    Bounces(Arc<crate::descriptor::host::BindlessPlan>, bool),
+    /// The snapshot of a range of a copy that is not sparse.
+    Keep(Arc<crate::shadow::Shadow>, usize, usize),
+}
+
+/// A submission's preparation: its refreshes and declarations, its
+/// uploads, and, prepared while the flight before is still in the air
+/// (`crate::tail`), what waits for that flight to land.
+struct Prep<'a> {
+    runs: &'a [&'a HostList],
+    batch: Batch,
+    early: Early,
+    /// By run: the textures its prelude uploads, and its prelude once
+    /// recorded, with whether the run's own commands are skipped.
+    uploads: Vec<Vec<Upload>>,
+    preludes: Vec<Option<(Option<ID3D12CommandList>, bool)>>,
+    /// Steps left for after the wait, in order.
+    queue: Vec<Queued>,
+}
+
+impl<'a> Prep<'a> {
+    /// `under`: prepared under the flights in the air (what they write, and
+    /// whether every refresh waits); `fence`: the tag of what its shaders
+    /// write; `started`: when the preparation began.
+    fn new(
+        runs: &'a [&'a HostList],
+        fence: u64,
+        under: Option<(crate::tail::Air, bool)>,
+        dry: Option<crate::tail::Dry>,
+        started: std::time::Instant,
+    ) -> Prep<'a> {
+        let batch = Batch {
+            fence,
+            deferring: under
+                .map(|(air, strict)| crate::tail::Deferring::new(air, strict, fence, started)),
+            dry,
+            ..Batch::default()
+        };
+        Prep {
+            runs,
+            batch,
+            early: Early::default(),
+            uploads: vec![Vec::new(); runs.len()],
+            preludes: (0..runs.len()).map(|_| None).collect(),
+            queue: Vec::new(),
+        }
+    }
+
+    /// Whether the preparation is still under the flight before.
+    fn under(&self) -> bool {
+        self.batch.deferring.as_ref().is_some_and(|d| !d.drained)
+    }
+
+    /// The dry run, while the tail drain would still be under the flights.
+    fn dry(&mut self) -> Option<&mut crate::tail::Dry> {
+        self.batch.dry.as_mut().filter(|d| d.under())
+    }
+
+    /// The dry run: a step begun at `started` the tail drain would have
+    /// left for after the wait.
+    fn dry_queued(&mut self, started: std::time::Instant) {
+        if let Some(dry) = self.dry() {
+            dry.queued(started.elapsed());
+        }
+    }
+
+    /// Leaves `item` for after the wait.
+    fn queue(&mut self, item: Queued) {
+        crate::telemetry::count(Count::TailQueued, 1);
+        #[cfg(test)]
+        if crate::tail::mutated(crate::tail::Mutation::Queue) {
+            return self.run_queued(item);
+        }
+        self.queue.push(item);
+    }
+
+    /// A step that waits for the flights before where it stands: their
+    /// landings are done once this returns, and so is what waited for them.
+    fn flush_point(&mut self, why: crate::tail::Why) {
+        #[cfg(test)]
+        if matches!(why, crate::tail::Why::Copy | crate::tail::Why::Run)
+            && crate::tail::mutated(crate::tail::Mutation::Copies)
+        {
+            return;
+        }
+        if self.under() {
+            self.drain(why);
+        } else if let Some(dry) = self.dry() {
+            dry.flush(why);
+        }
+    }
+
+    /// Waits for the flights before, then does what waited for them: the
+    /// refreshes left for later, then the other steps, in order.
+    fn drain(&mut self, why: crate::tail::Why) {
+        let Some(d) = self.batch.deferring.as_mut().filter(|d| !d.drained) else {
+            return;
+        };
+        d.wait(why);
+        let late = std::mem::take(&mut d.late);
+        let fence = d.fence;
+        refresh_late(&late, fence);
+        let started = std::time::Instant::now();
+        for item in std::mem::take(&mut self.queue) {
+            self.run_queued(item);
+        }
+        crate::telemetry::count(Count::TailQueuedTime, started.elapsed().as_micros() as u64);
+    }
+
+    /// At the tail: the wait for the flights before, if the preparation
+    /// was under them; the time it waited for them in all.
+    fn tail(&mut self) -> std::time::Duration {
+        self.drain(crate::tail::Why::Tail);
+        if let Some(dry) = self.batch.dry.as_ref() {
+            dry.finish();
+        }
+        let Some(d) = self.batch.deferring.as_ref() else {
+            return std::time::Duration::ZERO;
+        };
+        d.finish();
+        d.waited
+    }
+
+    fn run_queued(&mut self, item: Queued) {
+        match item {
+            Queued::Fill(dst, src, len) => {
+                let started = std::time::Instant::now();
+                copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                let us = started.elapsed().as_micros() as u64;
+                if crate::telemetry::on() {
+                    crate::telemetry::add(Count::Fills, 1);
+                    crate::telemetry::add(Count::FillBytes, len as u64);
+                    crate::telemetry::add(Count::FillTime, us);
+                }
+                PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                PREPARING[1].fetch_add(len as u64, Ordering::Relaxed);
+            }
+            Queued::Host(work) => {
+                let working = crate::telemetry::start();
+                work();
+                crate::telemetry::stop(Count::Steps, working);
+            }
+            Queued::Texture(index, staging, copy) => {
+                if self.batch.texture_due(&staging) && staging.refresh() {
+                    self.uploads[index].push((staging, copy));
+                }
+            }
+            Queued::Prelude(index) => self.record_prelude(index),
+            Queued::Early(late, first) => {
+                self.early.take_from(&mut self.batch, self.runs, late, first);
+            }
+            Queued::Bounces(plan, whole) => plan.copy_slices(whole),
+            Queued::Keep(shadow, address, len) => {
+                let keeping = crate::telemetry::start();
+                shadow.keep_dense(address, len);
+                crate::telemetry::stop(Count::Snapshots, keeping);
+            }
+        }
+    }
+
+    /// After the steps of the run at `index`: its prelude, now or after the
+    /// wait.
+    fn prelude(&mut self, index: usize) {
+        if self.under() {
+            return self.queue(Queued::Prelude(index));
+        }
+        let started = std::time::Instant::now();
+        self.record_prelude(index);
+        self.dry_queued(started);
+    }
+
+    fn record_prelude(&mut self, index: usize) {
+        let list = self.runs[index];
+        // A recording submitted again after other tables took the slots
+        // it, or another part of its title's list, lent: its commands
+        // would read their descriptors. Only what it leaves its
+        // textures in is done.
+        // shortcut: its draws and dispatches are lost until the title
+        // resets the list.
+        let skip = list.skipped();
+        let recording = crate::telemetry::start();
+        let prelude = list.prelude(&self.uploads[index], skip);
+        if prelude.is_some() {
+            crate::telemetry::stop(Count::PreludeTime, recording);
+            crate::telemetry::count(Count::Preludes, 1);
+        }
+        self.preludes[index] = Some((prelude, skip));
+    }
+
+    /// The textures waiting for their first upload, taken now; brought up
+    /// to date now or after the wait. `late`: after the lists' preludes
+    /// took the textures' states ([`Early::take`]).
+    fn early_take(&mut self, late: bool) {
+        let first = crate::texture::take_first();
+        if first.is_empty() {
+            return;
+        }
+        if self.under() {
+            return self.queue(Queued::Early(late, first));
+        }
+        let started = std::time::Instant::now();
+        self.early.take_from(&mut self.batch, self.runs, late, first);
+        self.dry_queued(started);
+    }
+
+    /// Shaders write `[address, address + len)` of a copy that is not
+    /// sparse (or of any, with one pass per range off), after the
+    /// refreshes before it: its snapshot. Under a flight, if the flight's
+    /// shaders write the copy too, after a wait for it (the copy has one
+    /// snapshot, the flight's); else later, as nothing writes the range in
+    /// between.
+    fn dense(&mut self, shadow: &Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        let fence = self.batch.fence;
+        if self.under() {
+            #[cfg(test)]
+            let shared = shadow.has_other_pending(fence)
+                && !crate::tail::mutated(crate::tail::Mutation::Dense);
+            #[cfg(not(test))]
+            let shared = shadow.has_other_pending(fence);
+            if shared || shadow.is_sparse() || shadow.is_card() {
+                self.drain(crate::tail::Why::Dense);
+            } else {
+                shadow.close(address, len, fence);
+                return self.queue(Queued::Keep(shadow.clone(), address, len));
+            }
+        } else if let Some(dry) = self.dry()
+            && dry.air.holds(Arc::as_ptr(shadow) as usize)
+        {
+            dry.flush(crate::tail::Why::Dense);
+        }
+        let started = crate::telemetry::start();
+        shadow.writing(address, len, fence);
+        crate::telemetry::stop(Count::Snapshots, started);
     }
 
     /// After every list's steps (no title copy follows): each directly
@@ -3996,21 +4466,63 @@ impl Batch {
     /// draws use it. What they read is refreshed (unchanged pages cost only
     /// the write-watch's answer); their unordered access ranges are kept
     /// for copy-back only when a shader that may write memory uses the heap.
+    /// Under a flight, the slots the title wrote since the plan before are
+    /// made now (the title rewrites only slots nothing in flight reads, as
+    /// on the console); the plan waits for the flight first where it makes
+    /// others, which the flight may read (a flush point,
+    /// [`crate::descriptor::host::HostHeap::bindless_plan_with`]). What a
+    /// landing in the air writes is refreshed after the wait, and the
+    /// bounces are copied after it (their slices are the slots', which the
+    /// flight reads).
     fn prepare_bindless(&mut self) {
-        self.flush();
-        for (heap, writes) in std::mem::take(&mut self.bindless) {
-            let started = std::time::Instant::now();
-            let plan = heap.bindless_plan();
-            BINDLESS_US[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        self.batch.flush();
+        for (heap, writes) in std::mem::take(&mut self.batch.bindless) {
+            #[cfg(test)]
+            let wait = !crate::tail::mutated(crate::tail::Mutation::Slots);
+            #[cfg(not(test))]
+            let wait = true;
+            let waited = |prep: &Self| prep.batch.deferring.as_ref().map_or(std::time::Duration::ZERO, |d| d.waited);
+            let (started, before) = (std::time::Instant::now(), waited(self));
+            let plan = heap.bindless_plan_with(&mut || {
+                if wait {
+                    self.flush_point(crate::tail::Why::Slots);
+                }
+            });
+            // The plan's time, without a wait for the flights in it.
+            let took = started.elapsed().saturating_sub(waited(self) - before);
+            BINDLESS_US[0].fetch_add(took.as_micros() as u64, Ordering::Relaxed);
             let Some(plan) = plan else {
                 continue;
             };
-            let (reads, all) = plan.copy_constants();
+            let bouncing = std::time::Instant::now();
+            let (reads, all, bounces) = plan.constants_due();
+            if let Some(whole) = bounces {
+                if self.under() {
+                    self.queue(Queued::Bounces(plan.clone(), whole));
+                } else {
+                    plan.copy_slices(whole);
+                    self.dry_queued(bouncing);
+                }
+            }
             for reads in reads.into_iter().filter(|r| !r.is_empty()) {
                 let started = std::time::Instant::now();
                 let copied = AtomicU64::new(0);
-                let _ahead = ask_ahead(reads);
-                in_parallel(reads, 8, |reads| {
+                let now: std::borrow::Cow<'_, [Range]> = match self.batch.deferring.as_mut() {
+                    Some(d) if !d.drained => {
+                        let mut now = Vec::with_capacity(reads.len());
+                        for (shadow, address, len) in reads {
+                            if d.is_late(*address, *len) {
+                                d.defer(shadow, *address, *len, all, true);
+                            } else {
+                                now.push((shadow.clone(), *address, *len));
+                            }
+                        }
+                        std::borrow::Cow::Owned(now)
+                    }
+                    _ => std::borrow::Cow::Borrowed(reads),
+                };
+                let _ahead = ask_ahead(&now);
+                in_parallel(&now, 8, |reads| {
                     for (shadow, address, len) in reads {
                         #[cfg(feature = "diagnostics")]
                         {
@@ -4025,22 +4537,97 @@ impl Batch {
                 let us = started.elapsed().as_micros() as u64;
                 PREPARING[0].fetch_add(us, Ordering::Relaxed);
                 PREPARING[1].fetch_add(copied.into_inner(), Ordering::Relaxed);
-                crate::telemetry::count(Count::PlanReads, reads.len() as u64);
+                crate::telemetry::count(Count::PlanReads, now.len() as u64);
                 crate::telemetry::count(Count::PlanReadTime, us);
+                if let Some(dry) = self.batch.dry.as_mut() {
+                    dry.refreshes(reads.iter().map(|r| (r.1, r.2)), started.elapsed());
+                }
             }
             // shortcut: what shaders write through directly indexed slots into
             // copied memory stays in the copy (title memory used in place
             // needs no copy back); copying all of it back cost ~0.3 s a frame.
-            if writes && cfg!(test) {
+            // A submission prepared while this one is in the air brings those
+            // ranges up to date after it has landed, as before.
+            // shortcut: not the slots made since the plan was last built
+            // whole, nor those larger than its cap (`VYCE_TAIL_DRAIN_STRICT=1`
+            // waits for every refresh).
+            #[cfg(test)]
+            let writes_unlisted = writes && !crate::tail::mutated(crate::tail::Mutation::Unlisted);
+            #[cfg(not(test))]
+            let writes_unlisted = writes;
+            if writes_unlisted {
+                let ranges = plan.writes.iter().map(|(_, address, len)| (*address, address + len));
+                self.batch.unlisted.extend(ranges);
+            }
+            if writes && crate::descriptor::host::plan_writes_back() {
                 for (shadow, address, len) in plan.writes.iter() {
-                    if self.declare(shadow, *address, *len) {
-                        shadow.writing(*address, *len);
+                    if self.batch.declare(shadow, *address, *len) {
+                        self.flush_point(crate::tail::Why::Dense);
+                        shadow.writing(*address, *len, self.batch.fence);
                     }
                 }
             }
-            self.plans.push(plan);
+            self.batch.plans.push(plan);
         }
     }
+
+    /// The lists to give the host queue (each run's prelude, if any, then
+    /// the run unless its commands are skipped), where each run's begin, and
+    /// the textures the runs' shaders write that go back into title memory
+    /// ([`crate::texback`]), in the runs' order.
+    fn lists(
+        &mut self,
+    ) -> (Vec<Option<ID3D12CommandList>>, Vec<usize>, Vec<Arc<crate::texback::Back>>) {
+        let mut lists = Vec::with_capacity(2 * self.runs.len());
+        let mut firsts = Vec::with_capacity(self.runs.len());
+        let mut textures = Vec::new();
+        for (i, list) in self.runs.iter().enumerate() {
+            firsts.push(lists.len());
+            let (prelude, skip) = self.preludes[i].take().unwrap_or_else(|| (None, list.skipped()));
+            lists.extend(prelude.map(Some));
+            if !skip {
+                lists.push(list.list.cast().ok());
+                // Its copies run only with its commands.
+                textures.extend(list.texture_backs());
+            }
+        }
+        (lists, firsts, textures)
+    }
+}
+
+/// Brings up to date the refreshes a preparation under a flight left for
+/// after the wait for it (`crate::tail`), as one group: each around what it
+/// went around in its turn, and as early (as lazy) as it was.
+fn refresh_late(late: &[crate::tail::Late], fence: u64) {
+    if late.is_empty() {
+        return;
+    }
+    let ranges: Vec<Range> = late.iter().map(|l| (l.shadow.clone(), l.address, l.len)).collect();
+    let _ahead = ask_ahead(&ranges);
+    let started = std::time::Instant::now();
+    let one = |l: &crate::tail::Late| {
+        let began = std::time::Instant::now();
+        let copied = l.shadow.update_around(l.address, l.len, l.lazy, &l.around, fence);
+        let us = began.elapsed().as_micros() as u64;
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::range(l.address, l.len, us, 0);
+        if crate::telemetry::on() {
+            let (n, time) = if l.plan {
+                (Count::PlanReads, Count::PlanReadTime)
+            } else {
+                (Count::Updates, Count::UpdateTime)
+            };
+            crate::telemetry::add(n, 1);
+            crate::telemetry::add(time, us);
+        }
+        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+    };
+    if !wide_refresh() || late.len() < WIDE_LEAST {
+        late.iter().for_each(one);
+    } else {
+        in_parallel(late, 1, |chunk| chunk.iter().for_each(one));
+    }
+    PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
 /// Uploads before a submission's lists ([`crate::texture::upload_first`]).
@@ -4055,10 +4642,10 @@ struct Early {
 }
 
 impl Early {
-    /// Takes the textures waiting; `late`: after the lists' preludes took
-    /// the textures' states, so not those the lists use (they upload them).
-    fn take(&mut self, batch: &mut Batch, runs: &[&HostList], late: bool) {
-        let first = crate::texture::take_first();
+    /// Takes the textures waiting `first` (`crate::texture::take_first`);
+    /// `late`: after the lists' preludes took the textures' states, so not
+    /// those the lists use (they upload them).
+    fn take_from(&mut self, batch: &mut Batch, runs: &[&HostList], late: bool, first: Vec<Upload>) {
         if first.is_empty() {
             return;
         }
@@ -4089,8 +4676,9 @@ impl Early {
         }
     }
 
-    /// The list with the uploads, if there are any. A submission is prepared
-    /// once those before it are finished, so there is one list.
+    /// The list with the uploads, if there are any. It is recorded once every
+    /// submission before has landed (`crate::tail` waits for them first), so
+    /// there is one list.
     fn record(&self, host: &Host) -> Option<ID3D12CommandList> {
         if self.copies.is_empty() {
             return None;

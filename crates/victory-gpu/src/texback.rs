@@ -979,6 +979,109 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(second);
     }
 
+    /// A title submission prepared while the flight before it is in the air
+    /// (`crate::tail`) refreshes a copy of title memory that the flight's
+    /// landing copies a texture back into, and does it after that landing,
+    /// as the old drain did: the flight's marks hold the texture's memory.
+    /// Without that (`Mutation::Textures`) the refresh is done at once and
+    /// the copy keeps what was there before the flight ran, for that
+    /// submission's shaders to read. On WARP and on the machine's own GPU.
+    #[test]
+    fn a_refresh_of_a_texture_copied_back_waits_for_its_landing() {
+        use crate::tail::{Event, Mutation, Why};
+        let _one = one();
+        let mut hosts: Vec<&'static Host> = flying().into_iter().collect();
+        if crate::flight::late_signal() {
+            hosts.extend(Host::new_hardware().map(Host::overlapping));
+        }
+        let (width, height) = (64u32, 64u32);
+        let layout = console(width, height, 1);
+        let fill = vec![0xa5u8; layout.size as usize];
+        // The flight's pass writes the left half, salt 1; the title writes an
+        // element of the right half while it is in the air.
+        let right = layout.offset(0, 40, 7, 0).unwrap() as usize;
+        let mut landed = expected(&layout, &fill, width / 2, 1);
+        landed[right..right + 8].fill(9);
+        let mut before = fill.clone();
+        before[right..right + 8].fill(9);
+        for host in hosts {
+            let (seen, copy) = refreshed_under(host, &layout, (width, height), right, None);
+            assert_eq!(seen, [Event::Under, Event::Late, Event::Waited(Why::Tail)]);
+            assert!(copy == landed, "refreshed before the landing, or without the title's element");
+            let rule = Some(Mutation::Textures);
+            let (seen, copy) = refreshed_under(host, &layout, (width, height), right, rule);
+            assert_eq!(seen, [Event::Under, Event::Waited(Why::Tail)]);
+            assert!(copy == before, "the rule is needed: without it the copy is refreshed at once");
+        }
+    }
+
+    /// [`a_refresh_of_a_texture_copied_back_waits_for_its_landing`]'s run:
+    /// a flight whose pass writes the left half of a `size` texture of
+    /// `layout` (title memory 0xa5), held behind a gate, its marks made with
+    /// `rule` off; the title writes 9 into the element at `right`; a title
+    /// submission prepared under the flight refreshes a copy of the
+    /// texture's title memory. What that preparation did, and the copy once
+    /// its lists went to the host queue.
+    fn refreshed_under(
+        host: &'static Host,
+        layout: &Layout,
+        size: (u32, u32),
+        right: usize,
+        rule: Option<crate::tail::Mutation>,
+    ) -> (Vec<crate::tail::Event>, Vec<u8>) {
+        use crate::tail::{Mode, events, force, force_prewarm, mutate};
+        const UNORDERED: u32 = 0x8;
+        let len = layout.size as usize;
+        let page = crate::watch::PAGE;
+        // Title memory, as long as the copies may write it.
+        let memory = Box::leak(vec![0xa5u8; len + page].into_boxed_slice());
+        let at = (memory.as_mut_ptr() as usize).next_multiple_of(page);
+        let (shadow, _) = crate::shadow::Shadow::for_test(host, at, len as u64);
+        let line = host.line();
+        let copy = uav_texture(host, size.0, size.1, 1);
+        let first = host.new_list().unwrap();
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: a plain query of the list's device.
+        unsafe { first.list.GetDevice(&mut device).unwrap() };
+        let back = Back::make(&device.unwrap(), at, copy.clone(), layout.clone(), at).expect("copies back");
+        first.texture_back(Arc::new(back));
+        first.settle(&copy, UNORDERED);
+        write_pattern(&first, &copy.texture, size, size.0 / 2, 1);
+        first.close();
+        let gate = Gate(host.gate());
+        force(Some(Mode::Tail));
+        mutate(rule);
+        host.execute_title(&[Arc::new(first)]);
+        mutate(None);
+        // SAFETY: inside the leaked title memory, which the flight's landing
+        // writes only in the left half.
+        unsafe { std::ptr::write_bytes((at + right) as *mut u8, 9, 8) };
+        let second = host.new_list().unwrap();
+        shadow.refresh(&second, at as u64, len as u64);
+        second.count_work();
+        second.close();
+        let second = Arc::new(second);
+        let waits = line.waits_begun();
+        let sent = std::thread::spawn(move || {
+            force(Some(Mode::Tail));
+            force_prewarm(Some(false));
+            host.execute_title(&[second]);
+            force_prewarm(None);
+            force(None);
+            events()
+        });
+        until(|| line.waits_begun() > waits);
+        std::thread::sleep(Duration::from_millis(30));
+        drop(gate);
+        let seen = sent.join().unwrap();
+        // SAFETY: the copy's mapping; what the GPU ran of it is done.
+        let held = unsafe { std::slice::from_raw_parts(shadow.view_for_test(at), len) }.to_vec();
+        line.drain(Count::WaitHeld);
+        force(None);
+        events();
+        (seen, held)
+    }
+
     /// Of title textures shaders write, only those of a kind copied back
     /// get copies; one that is not keeps its title memory as it was, and
     /// the one that is gets its texels, through the title's own objects.

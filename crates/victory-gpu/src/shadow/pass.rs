@@ -86,11 +86,13 @@ impl Root<'_> {
 
 impl Shadow {
     /// [`Shadow::writing`] of a sparse copy without the snapshot, which
-    /// [`keep_before`] takes for the whole submission: no refresh touches the
-    /// range from here on. The refreshes before it must be done.
-    pub(crate) fn close_to_refreshes(&self, address: usize, len: usize) {
+    /// [`keep_before`] takes for the whole submission (fence value `fence`):
+    /// no refresh touches the range from here on. The refreshes before it
+    /// must be done, or left for after the wait for the flights before
+    /// (`crate::tail`, which knows they come before the range was closed).
+    pub(crate) fn close_to_refreshes(&self, address: usize, len: usize, fence: u64) {
         if let Some((root, _)) = self.sparse_root() {
-            let range = (address, address + len);
+            let range = (address, address + len, fence);
             root.pending.lock().unwrap_or_else(|e| e.into_inner()).push(range);
         }
     }
@@ -152,9 +154,10 @@ pub(crate) fn keep_before(ranges: &[Range]) {
 }
 
 /// After a submission ran: [`Shadow::copy_back`] of all the ranges its
-/// shaders write, each byte once. Returns the bytes written to title memory.
-pub(crate) fn copy_back(ranges: &[Range]) -> usize {
-    let mut written = dense(ranges);
+/// shaders write, each byte once; `fence`, its fence value, which its
+/// ranges carry. Returns the bytes written to title memory.
+pub(crate) fn copy_back(ranges: &[Range], fence: u64) -> usize {
+    let mut written = dense(ranges, fence);
     let mut roots = roots(ranges);
     if roots.is_empty() {
         return written;
@@ -224,22 +227,21 @@ pub(crate) fn copy_back(ranges: &[Range]) -> usize {
         }
     });
     written += put.into_inner();
-    // Every list that declared them is done with the ranges (one submission
-    // is prepared at a time, and only when all before it have come here),
-    // and the snapshots with the last range.
+    // Every list of the submission that declared them is done with the
+    // ranges, and the snapshots with them. The next submission, prepared
+    // meanwhile (`crate::tail`), may have declared some again: its ranges
+    // carry its own fence value and stay, with the tiles they touch.
     for ((root, mut before), declared) in roots.values().zip(held).zip(declared) {
         let mut pending = root.copy.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|r| !declared.contains(r));
-        if pending.is_empty() {
-            super::give_back_tiles(before.drain().map(|(_, kept)| kept));
-        }
+        pending.retain(|&(a, b, f)| !(super::ours(f, fence) && declared.contains(&(a, b))));
+        root.copy.give_back_kept(&mut before, &pending, &root.ranges);
     }
     written
 }
 
 /// [`copy_back`] for copies that are not sparse: their ranges one by one,
 /// different copies on several threads.
-fn dense(ranges: &[Range]) -> usize {
+fn dense(ranges: &[Range], fence: u64) -> usize {
     let mut copies: Vec<Vec<&Range>> = Vec::new();
     for range in ranges.iter().filter(|r| r.0.sparse.is_none()) {
         match copies.iter_mut().find(|c| Arc::ptr_eq(&c[0].0, &range.0)) {
@@ -250,7 +252,7 @@ fn dense(ranges: &[Range]) -> usize {
     let written = AtomicUsize::new(0);
     crate::host::in_parallel(&copies, 8, |chunk| {
         for (shadow, address, len) in chunk.iter().flatten().copied() {
-            written.fetch_add(shadow.copy_back(*address, *len), Ordering::Relaxed);
+            written.fetch_add(shadow.copy_back(*address, *len, fence), Ordering::Relaxed);
         }
     });
     written.into_inner()
@@ -398,19 +400,19 @@ mod tests {
 
         let all: Vec<Range> = RANGES.iter().map(|r| one.range(r.0, r.1)).collect();
         for (shadow, address, len) in &all {
-            shadow.close_to_refreshes(*address, *len);
+            shadow.close_to_refreshes(*address, *len, 1);
         }
         keep_before(&all);
         one.write();
-        let written = copy_back(&all);
+        let written = copy_back(&all, 1);
 
         for &(from, to) in &RANGES {
-            each.shadow.writing(each.base + from, to - from);
+            each.shadow.writing(each.base + from, to - from, 1);
         }
         each.write();
         let mut passes = 0;
         for &(from, to) in &RANGES {
-            passes += each.shadow.copy_back(each.base + from, to - from);
+            passes += each.shadow.copy_back(each.base + from, to - from, 1);
         }
         assert!(one.title() == each.title(), "the same title bytes");
         assert!(written > 0 && passes > 0, "{written} bytes in one pass, {passes} in a pass each");
@@ -448,17 +450,17 @@ mod tests {
                 .collect();
             let all: Vec<Range> = ranges.iter().map(|r| one.range(r.0, r.1)).collect();
             for (shadow, address, len) in &all {
-                shadow.close_to_refreshes(*address, *len);
+                shadow.close_to_refreshes(*address, *len, 1);
             }
             keep_before(&all);
             one.write();
-            copy_back(&all);
+            copy_back(&all, 1);
             for &(from, to) in &ranges {
-                each.shadow.writing(each.base + from, to - from);
+                each.shadow.writing(each.base + from, to - from, 1);
             }
             each.write();
             for &(from, to) in &ranges {
-                each.shadow.copy_back(each.base + from, to - from);
+                each.shadow.copy_back(each.base + from, to - from, 1);
             }
             assert!(one.title() == each.title(), "round {round}: {ranges:?}");
             assert!(one.shadow.pending.lock().unwrap().is_empty());
@@ -470,10 +472,10 @@ mod tests {
     #[test]
     fn copies_share_a_pass() {
         let (Some(a), Some(b)) = (Copied::new(), Copied::new()) else { return };
-        b.shadow.close_to_refreshes(b.base + 10 * PAGE, 64);
+        b.shadow.close_to_refreshes(b.base + 10 * PAGE, 64, 1);
         let all = [a.range(0, 2 * PAGE), b.range(PAGE, 4 * PAGE), a.range(PAGE, 3 * PAGE)];
         for (shadow, address, len) in &all {
-            shadow.close_to_refreshes(*address, *len);
+            shadow.close_to_refreshes(*address, *len, 1);
         }
         keep_before(&all);
         for (copied, at) in [(&a, PAGE + 9), (&b, PAGE + 9), (&a, 3 * PAGE + 1), (&b, 3 * PAGE + 1)] {
@@ -481,7 +483,7 @@ mod tests {
             unsafe { copied.host(at).write(copied.title()[at] ^ 0xff) };
         }
         let before = [a.title(), b.title()];
-        copy_back(&all);
+        copy_back(&all, 1);
         let changed = [vec![PAGE + 9], vec![PAGE + 9, 3 * PAGE + 1]];
         for ((copied, before), changed) in [&a, &b].into_iter().zip(&before).zip(changed) {
             let now = copied.title();
@@ -489,7 +491,8 @@ mod tests {
             assert_eq!(differ, changed);
         }
         assert!(a.shadow.pending.lock().unwrap().is_empty());
-        assert_eq!(*b.shadow.pending.lock().unwrap(), [(b.base + 10 * PAGE, b.base + 10 * PAGE + 64)]);
+        let closed = (b.base + 10 * PAGE, b.base + 10 * PAGE + 64, 1);
+        assert_eq!(*b.shadow.pending.lock().unwrap(), [closed]);
     }
 
     /// Refreshed early, memory nothing watches is refreshed again in its
@@ -527,22 +530,22 @@ mod tests {
         for _ in 0..rounds {
             let t = std::time::Instant::now();
             for (shadow, address, len) in &all {
-                shadow.writing(*address, *len);
+                shadow.writing(*address, *len, 1);
             }
             took[0] += t.elapsed();
             let t = std::time::Instant::now();
             for (shadow, address, len) in &all {
-                shadow.copy_back(*address, *len);
+                shadow.copy_back(*address, *len, 1);
             }
             took[1] += t.elapsed();
             let t = std::time::Instant::now();
             for (shadow, address, len) in &all {
-                shadow.close_to_refreshes(*address, *len);
+                shadow.close_to_refreshes(*address, *len, 1);
             }
             keep_before(&all);
             took[2] += t.elapsed();
             let t = std::time::Instant::now();
-            copy_back(&all);
+            copy_back(&all, 1);
             took[3] += t.elapsed();
         }
         println!(
