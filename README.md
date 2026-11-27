@@ -153,6 +153,19 @@ victory run <game_scarlett_master.exe> --execute --console series-x
 The first launch after a build translates every shader and builds about
 2,500 pipelines; the loading screen can stay frozen, with sound, for minutes.
 
+On Vyce's machine (RTX 2070 SUPER) the game is started with
+`scripts\vyce.ps1 -Action Run` ([guide](docs/vyce-windows.md)). On the
+Series X profile the title ignores its settings file's resolution (a
+2560x1440 scene into 3840x2160), so the launcher also patches the title's
+own output size at load, after comparing the bytes it changes (build
+1.0.2.1 only; another build is left alone and the log says so):
+`-OutputSize 1920x1080`, the default, sets `VICTORY_OUTPUT`;
+`-RenderScale <0.5..1.0>` sets `VICTORY_RENDER_SCALE` (without it the
+title's own 2/3, a 1280x720 scene at 1080p); the Series S profile gets
+`VICTORY_UPSCALER=6`, the title's own upscaler instead of FidelityFX;
+`-NoTitlePatch` leaves the code alone. Taken from Belobug's a-publier
+line, without its FidelityFX scale (`VICTORY_FFX_SCALE`).
+
 ### Known problems
 
 - With the in-game phone out the world is unlit (see the table).

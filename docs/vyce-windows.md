@@ -38,7 +38,10 @@ sessão vai para logs\<data>.settings.xml.
 
 | Opção | Efeito |
 | --- | --- |
-| -OutputSize 1920x1080 | Tamanho da imagem do jogo (a cena é 1/1,5 dele); keep deixa como está |
+| -OutputSize 1920x1080 | Tamanho da imagem do jogo, no arquivo e no código do jogo (abaixo); keep deixa os dois como estão |
+| -RenderScale 0.5 a 1.0 | Parte da largura e da altura da imagem que a cena tem; sem ela, os 2/3 do próprio jogo (cena de 1280x720 em 1920x1080); 1.0 dá cena de 1920x1080 |
+| -NoTitlePatch | Não muda o código do jogo (tamanho, escala e upscaler ficam os dele); o arquivo continua sendo escrito |
+| -ConsoleProfile series-s | Perfil do Series S, com o upscaler do próprio jogo no lugar do FidelityFX |
 | -TitleSettings light | Desliga o que mais pesa numa placa de PC: filas assíncronas, borrão de movimento, menos detalhe ao longe e reflexos menores |
 | -TitleSettings keep | Não muda nada além do tamanho |
 | -TitleSettings original | Volta o arquivo como o jogo o criou |
@@ -47,6 +50,31 @@ sessão vai para logs\<data>.settings.xml.
 Ainda não se viu o jogo respeitar cada valor do arquivo: compare uma
 sessão com -OutputSize keep -TitleSettings keep e procure no log as linhas
 "presenting to a window" e "twins made".
+
+### Tamanho da imagem no código do jogo
+
+No perfil Series X o jogo ignora o tamanho do arquivo: monta uma cena de
+2560x1440 numa imagem de 3840x2160. Por isso o launcher também muda o
+código do jogo ao carregá-lo, antes de qualquer parte dele rodar:
+
+| Variável | Efeito |
+| --- | --- |
+| VICTORY_OUTPUT=1920x1080 | Tamanho da imagem: um dos modos do jogo (1280x720, 1664x936, 1920x1080, 2560x1440, 3840x2160). Vem de -OutputSize |
+| VICTORY_RENDER_SCALE=0.5 a 1.0 | Escala da cena no upscaler do próprio jogo (2/3 sem ela; abaixo de 2/3 o maior tamanho de cena do jogo fica em 2/3). Vem de -RenderScale |
+| VICTORY_UPSCALER=6 ou 7 | Upscaler escolhido: 6 o do jogo, 7 o FidelityFX. O launcher põe 6 no Series S, que sozinho escolhe o FidelityFX (outros forks na NVIDIA viram o mundo preto com ele) |
+
+Cada lugar do código é comparado byte a byte antes: só a versão 1.0.2.1
+(blake3 b99f876b...) tem esses bytes. Se um lugar pedido difere, nenhum é
+mudado, e o log diz "resolution: not patched"; com tudo certo ele diz
+"resolution: patched" para cada lugar. Uma variável já definida no
+processo que chama o launcher vale no lugar da do launcher
+(VICTORY_OUTPUT=off deixa o tamanho como o jogo quer). O FidelityFX tem
+uma escala própria no fork de origem (VICTORY_FFX_SCALE), que não veio:
+em 0,5 o jogo dividiu por zero 49 s depois.
+
+Imagem de 1920x1080 em vez de 3840x2160: a cópia para a janela, a
+composição das duas camadas do Series S, o FPS no canto e o tamanho da
+janela seguem o tamanho que o jogo apresenta.
 
 ### Cache pronto antes de jogar
 

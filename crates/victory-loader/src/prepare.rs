@@ -118,7 +118,7 @@ const IMPORT_DESCRIPTOR_SIZE: u32 = 20;
 
 /// Every `IMAGE_REL_BASED_DIR64` base relocation: (file offset of its entry,
 /// RVA it patches). Empty if the image has no readable relocation table.
-fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
+pub(crate) fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
     const DIR64: u16 = 10;
     let mut out = Vec::new();
     let Some(d) = layout::data_directory_offset(bytes, dir::BASERELOC) else {

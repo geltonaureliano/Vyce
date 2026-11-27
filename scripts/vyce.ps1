@@ -15,9 +15,20 @@ param(
     [ValidateRange(0, 1048576)]
     [int]$ShaderLoopLimit = 0,
 
-    # The picture size the title renders for (its scene is 1/1.5 of it). 'keep' leaves its settings file alone.
+    # The title's output size: written into its settings file and, when it is one of the title's modes
+    # (1280x720, 1664x936, 1920x1080, 2560x1440, 3840x2160), patched into its code at load (VICTORY_OUTPUT),
+    # since on Series X it renders 3840x2160 whatever the file says. 'keep' leaves both alone.
     [ValidatePattern('^(keep|\d{3,4}x\d{3,4})$')]
     [string]$OutputSize = '1920x1080',
+
+    # The scene's share of the output's width and height, 0.5 to 1.0 (VICTORY_RENDER_SCALE). 0, the default,
+    # leaves the title's own 2/3: a 1280x720 scene at 1920x1080; 1.0 renders 1920x1080.
+    [ValidateScript({ $_ -eq 0 -or ($_ -ge 0.5 -and $_ -le 1.0) })]
+    [double]$RenderScale = 0,
+
+    # Leaves the title's code as it is: no output size, render scale or upscaler patched (the settings file
+    # is still written).
+    [switch]$NoTitlePatch,
 
     # 'light' turns off what costs most on a PC card, 'keep' changes nothing, 'original' restores the title's file.
     [ValidateSet('light', 'keep', 'original')]
@@ -194,6 +205,37 @@ if ($showMonitor) {
 }
 if ($Action -eq 'Run' -and $ShaderLoopLimit -gt 0) {
     $settings.VICTORY_SHADER_LOOP_LIMIT = [string]$ShaderLoopLimit
+}
+# The title's output size, render scale and upscaler, patched into its code at load after its bytes are
+# compared (build 1.0.2.1; another build is left alone, said so in the log). A value the caller's
+# environment already gives wins (VICTORY_OUTPUT=off leaves the size alone).
+$titleModes = @('1280x720', '1664x936', '1920x1080', '2560x1440', '3840x2160')
+if ($Action -eq 'Run' -and -not $NoTitlePatch) {
+    $patch = [ordered]@{}
+    if ($OutputSize -ne 'keep') {
+        if ($titleModes -contains $OutputSize) {
+            $patch.VICTORY_OUTPUT = $OutputSize.ToLowerInvariant()
+        } else {
+            Write-Warning "-OutputSize $OutputSize is not one of the title's modes ($($titleModes -join ', ')): only its settings file gets it."
+        }
+    }
+    if ($RenderScale -gt 0) {
+        $patch.VICTORY_RENDER_SCALE = $RenderScale.ToString([Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($ConsoleProfile -eq 'series-s') {
+        # The title's own upscaler: on Series S the title picks FidelityFX, which other NVIDIA forks saw
+        # draw a black world.
+        $patch.VICTORY_UPSCALER = '6'
+    }
+    foreach ($key in $patch.Keys) {
+        $given = [Environment]::GetEnvironmentVariable($key, 'Process')
+        if ($given) {
+            Write-Host "Title patch: $key=$given, as the caller set it."
+        } else {
+            $settings[$key] = $patch[$key]
+            Write-Host "Title patch: $key=$($patch[$key])"
+        }
+    }
 }
 
 if ($Action -eq 'Build') {
