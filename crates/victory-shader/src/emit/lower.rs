@@ -22,6 +22,9 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
 
+#[path = "paired.rs"]
+mod paired;
+
 /// How an interpolation evaluates an input channel.
 #[derive(Debug, Clone, Copy)]
 enum Eval {
@@ -143,6 +146,10 @@ pub(crate) struct Parts<'a> {
     /// Each host wave of 32 lanes as a console wave of its own
     /// ([`super::local_waves`]).
     pub local: bool,
+    /// Paired lanes ([`super::paired`]): a console wave64 compute program on
+    /// a host of 32-lane waves, each console wave one host wave whose
+    /// threads run two of its lanes each; with [`Parts::console_cf`].
+    pub paired: bool,
 }
 
 #[cfg(test)]
@@ -622,6 +629,18 @@ struct Lower<'a> {
     lane_paths: Vec<(usize, V)>,
     /// Heap index phis of per-lane joins with predecessors lowered later.
     pending_paths: Vec<PendingPath>,
+    /// Paired lanes ([`Parts::paired`]): what is kept per console lane for
+    /// the thread's other lane ([`paired::LaneState`]), swapped in for each
+    /// vector instruction, and whether the lane being lowered is the upper
+    /// one (its console lane the host lane plus 32).
+    twin: Option<Box<paired::LaneState>>,
+    upper: bool,
+    /// Paired lanes: whether the IR block's last LDS access wrote (none at
+    /// its start), for the fences between accesses.
+    lds_last: Option<bool>,
+    /// Paired lanes: the console's thread group, the one thread ids are
+    /// counted in (the host's has 32 threads a console wave).
+    console_group: Option<[u32; 3]>,
 }
 
 /// A heap index phi of a [`Source::Paths`], filled once every predecessor is
@@ -1644,6 +1663,16 @@ impl<'a> Lower<'a> {
             } else if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
             }
+            if x.paired {
+                // A host wave of 32 for each console wave (`paired`); the
+                // caller checked that the console's waves are full.
+                s.threads = Some([32 * threads.div_ceil(64), 1, 1]);
+                s.wave_size = Some(32);
+                console_lanes = true;
+                (split, lockstep) = (false, false);
+                (sync_split_lds, wants_console_flow) = (false, false);
+                lds_meet = None;
+            }
         }
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
@@ -1786,6 +1815,13 @@ impl<'a> Lower<'a> {
             lane_paths: Vec::new(),
             pending_paths: Vec::new(),
             dead,
+            twin: x.paired.then(Box::default),
+            upper: false,
+            lds_last: None,
+            console_group: match &x.native.io {
+                StageIo::Cs(cs) if x.paired => Some(cs.threads),
+                _ => None,
+            },
         }
     }
 
@@ -2153,7 +2189,7 @@ impl<'a> Lower<'a> {
         }
         for j in start + 1..end {
             if plain[j - start] {
-                self.inst(b, j)?;
+                self.lane_inst(b, j)?;
             }
             for &(_, w) in &insts[j].writes {
                 let shapes = &self.sections[&b][&start].shapes;
@@ -2166,6 +2202,10 @@ impl<'a> Lower<'a> {
                 {
                     shape = Some(sh);
                     self.one_lane.insert(w);
+                }
+                if self.twin.is_some() {
+                    self.paired_section_value(w, shape, plain[j - start], UNKNOWN);
+                    continue;
                 }
                 let val = match (shape.map(|sh| self.shape(sh)), plain[j - start]) {
                     (Some(Ok(x)), _) => Val::I32(x),
@@ -2532,7 +2572,17 @@ impl<'a> Lower<'a> {
         self.find_loop_exits();
         self.cur = self.s.entry;
         self.find_sections();
+        if self.twin.is_some() {
+            // (each thread's two console lanes, before an input reads them)
+            self.paired_entry();
+        }
         self.inputs()?;
+        if self.twin.is_some() {
+            self.swap_lanes();
+            let r = self.inputs();
+            self.swap_lanes();
+            r?;
+        }
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
@@ -2568,26 +2618,17 @@ impl<'a> Lower<'a> {
                 .filter(|&q| self.block[q].is_some())
                 .collect();
             self.exported[b] = !preds.is_empty() && preds.iter().all(|&q| self.exported_out(q));
-            for (i, phi) in p.blocks[b].phis.iter().enumerate() {
-                let val = match phi.reg {
-                    Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
-                    _ if self.bad.contains_key(&phi.value) => Val::Missing(self.bad[&phi.value]),
-                    Reg::Scc => {
-                        let v = self.s.m.phi(self.cur, self.s.t.i1);
-                        self.data_phis.push((v, b, i));
-                        Val::Bit(v)
-                    }
-                    _ => {
-                        let v = self.s.m.phi(self.cur, self.s.t.i32);
-                        self.data_phis.push((v, b, i));
-                        Val::I32(v)
-                    }
-                };
-                self.vals.insert(phi.value, val);
+            self.block_phis(b);
+            if self.twin.is_some() {
+                self.swap_lanes();
+                self.block_phis(b);
+                self.swap_lanes();
             }
             // Compute programs only: their host waves are the console's, so a
-            // wave's value is the console wave's.
-            if self.mask_data == MaskData::Console {
+            // wave's value is the console wave's. (Paired lanes: every thread
+            // of a host wave comes the console wave's way, so its scalars are
+            // the wave's already.)
+            if self.mask_data == MaskData::Console && self.twin.is_none() {
                 self.leave_loops(b);
                 if !self.loop_exits.contains_key(&b) {
                     self.join_scalars(b);
@@ -2600,9 +2641,10 @@ impl<'a> Lower<'a> {
             if meet.0 {
                 self.lds_meeting();
             }
+            self.lds_last = None;
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
-                self.inst(b, i)?;
+                self.lane_inst(b, i)?;
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     // (no meeting inside a whole-wave section)
                     let insts = &p.blocks[b].insts;
@@ -2628,6 +2670,9 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        if self.twin.is_some() {
+            self.paired_fill_phis()?;
+        }
         if self.s.pixel {
             settle_position_mode(&mut self.s.inputs);
             settle_row_modes(&mut self.s.inputs, true).map_err(|w| unsupported(0, w))?;
@@ -2637,6 +2682,38 @@ impl<'a> Lower<'a> {
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         Ok(user_data)
+    }
+
+    /// The DXIL phis of IR block `b`'s joins (the lane being lowered's).
+    fn block_phis(&mut self, b: usize) {
+        let p = self.x.p;
+        for (i, phi) in p.blocks[b].phis.iter().enumerate() {
+            let val = match phi.reg {
+                Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
+                _ if self.bad.contains_key(&phi.value) => Val::Missing(self.bad[&phi.value]),
+                Reg::Scc => {
+                    let v = self.s.m.phi(self.cur, self.s.t.i1);
+                    self.data_phis.push((v, b, i));
+                    Val::Bit(v)
+                }
+                _ => {
+                    let v = self.s.m.phi(self.cur, self.s.t.i32);
+                    self.data_phis.push((v, b, i));
+                    Val::I32(v)
+                }
+            };
+            self.vals.insert(phi.value, val);
+        }
+    }
+
+    /// Instruction `i` of IR block `b`, in paired lanes for both lanes of
+    /// each thread ([`Self::paired_inst`]).
+    fn lane_inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
+        if self.twin.is_some() {
+            self.paired_inst(b, i)
+        } else {
+            self.inst(b, i)
+        }
     }
 
     fn exported_out(&self, b: usize) -> bool {
@@ -3582,8 +3659,12 @@ impl<'a> Lower<'a> {
                 Some(&b) if b == self.cur_ir => self.cur,
                 Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
             };
-            let bit = self.boolean(m, at)?;
-            let xy = self.console_ballot(at, bit);
+            let xy = if self.twin.is_some() {
+                self.paired_ballot(at, m)?
+            } else {
+                let bit = self.boolean(m, at)?;
+                self.console_ballot(at, bit)
+            };
             self.ballots.insert(lo, xy);
             return Ok(xy);
         }
@@ -4775,7 +4856,9 @@ impl<'a> Lower<'a> {
     }
 
     fn lds_read_dword(&mut self, byte: V, guard: Option<V>) -> V {
-        if self.sync_split_lds && guard.is_some() {
+        // (paired lanes: a lane outside EXEC reads no LDS at an address it
+        // never set, past the group's memory on the host)
+        if (self.sync_split_lds || self.twin.is_some()) && guard.is_some() {
             let place = self.begin_guarded(guard);
             let data = self.lds_load_dword(byte);
             let zero = self.s.m.i32(0);
@@ -4873,7 +4956,7 @@ impl<'a> Lower<'a> {
         if !self.console_lanes {
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }
-        let [x, y, _] = self.s.threads.expect("compute");
+        let [x, y, _] = self.console_group.or(self.s.threads).expect("compute");
         let e = self.s.entry;
         let f = self.console_flat();
         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
@@ -13712,8 +13795,12 @@ impl<'a> Lower<'a> {
     /// Console flow: whether `m` holds in some lane of the console wave.
     fn any_lane(&mut self, m: Bool) -> Result<V, Why> {
         let c = self.cur;
-        let bit = self.boolean(m, c)?;
-        let (lo, hi) = self.console_ballot(c, bit);
+        let (lo, hi) = if self.twin.is_some() {
+            self.paired_ballot(c, m)?
+        } else {
+            let bit = self.boolean(m, c)?;
+            self.console_ballot(c, bit)
+        };
         let or = self.s.m.bin(c, Bin::Or, lo, hi);
         let z = self.s.m.i32(0);
         Ok(self.s.m.cmp(c, pred::NE, or, z))
@@ -14363,6 +14450,7 @@ mod tests {
             console_cf: false,
             per_lane_only: false,
             local: false,
+            paired: false,
         };
         lower(&parts).map(|l| l.dxil)
     }
@@ -14439,6 +14527,7 @@ mod tests {
             console_cf: false,
             per_lane_only: false,
             local: false,
+            paired: false,
         })
     }
 
@@ -15482,6 +15571,7 @@ mod tests {
             console_cf: false,
             per_lane_only: false,
             local: false,
+            paired: false,
         })
         .map(|l| l.dxil)
     }
@@ -15563,6 +15653,7 @@ mod tests {
             console_cf: false,
             per_lane_only: false,
             local: false,
+            paired: false,
         };
         let bad = HashMap::new();
         let mut l = super::Lower::new(&parts, &bad, false);
@@ -15646,6 +15737,7 @@ mod tests {
             console_cf: false,
             per_lane_only: false,
             local: false,
+            paired: false,
         })
         .map(|_| ())
     }
@@ -15743,6 +15835,7 @@ mod tests {
             console_cf: false,
             per_lane_only: false,
             local: false,
+            paired: false,
         })
         .unwrap();
 
@@ -15987,6 +16080,7 @@ mod tests {
                 console_cf: false,
                 per_lane_only: false,
                 local: false,
+                paired: false,
             })
         };
 
@@ -16077,6 +16171,7 @@ mod tests {
                 console_cf: false,
                 per_lane_only: false,
                 local: false,
+                paired: false,
             });
             // Cube (3) and MSAA (6, 7) descriptor_data() all lower without failing
             // on "an image dimension (cube or MSAA)".
@@ -16150,6 +16245,7 @@ mod tests {
                 console_cf: false,
                 per_lane_only: false,
                 local: false,
+                paired: false,
             })
             .unwrap();
         }
@@ -16223,6 +16319,7 @@ mod tests {
                 console_cf: false,
                 per_lane_only: false,
                 local: false,
+                paired: false,
             })
             .unwrap();
         }
@@ -16291,6 +16388,7 @@ mod tests {
                 console_cf: false,
                 per_lane_only: false,
                 local: false,
+                paired: false,
             })
             .unwrap();
         }

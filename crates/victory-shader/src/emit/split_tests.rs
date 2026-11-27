@@ -577,7 +577,9 @@ fn waves_of_a_group_loop_in_step() {
 }
 
 /// A scalar branch on what differs between waves keeps a program of several
-/// waves per group out of the lockstep form.
+/// waves per group out of the lockstep form: it takes paired lanes, a host
+/// wave of 32 for each console wave (`paired_tests` runs it), and without
+/// them (`VICTORY_WAVE_PAIRS=0`) nothing.
 #[test]
 fn waves_that_branch_apart_do_not_run_in_step() {
     let body = [
@@ -596,7 +598,14 @@ fn waves_that_branch_apart_do_not_run_in_step() {
         exact_views: false,
     };
     assert!(emit_for(&program(&body, 64), nvidia).is_ok());
-    assert!(emit_for(&program(&body, 128), nvidia).is_err());
+    let apart = program(&body, 128);
+    let off = super::with_switch(super::Switch::WavePairs, false, || emit_for(&apart, nvidia));
+    assert!(off.is_err());
+    let paired = emit_for(&apart, nvidia).expect("paired lanes");
+    let psv = crate::Container::parse(&paired.dxil).expect("a container");
+    let psv = psv.part(crate::FourCC::PSV0).expect("PSV0").data;
+    assert_eq!(crate::dxbc::u32_at(psv, 4 + 36), Ok(64), "not in step: 32 threads a console wave");
+    assert_eq!(wave_size(&paired.dxil), Some(32));
 }
 
 /// A loop lane t runs t times, with a lane read of the other half in
@@ -1152,6 +1161,7 @@ fn local_lowered_with(
         console_cf: false,
         per_lane_only: false,
         local: true,
+        paired: false,
     };
     super::with_switch(super::Switch::LocalMeetChecks, checks, || super::lower::lower(&parts))
 }
