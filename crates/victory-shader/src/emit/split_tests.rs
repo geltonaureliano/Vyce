@@ -1173,26 +1173,31 @@ fn local_waves_of_programs_by_address_do_not_meet() {
 /// loop their lanes leave after different numbers of turns, not inside a
 /// branch on the slots each host wave reserved, on a lane read of an
 /// accumulator of lane values or of a select by a constant mask, or on a
-/// flag loaded from memory the dispatch writes (with `glc`, or through the
-/// view it stores to). The translation's group barriers are then met as
-/// often on every way through the program, and none sits between a loop's
-/// header and its back edge; the fork's meetings
+/// flag loaded from memory written while the dispatch runs (with `glc`, or
+/// through the view it stores to). The translation's group barriers are
+/// then met as often on every way through the program, and none sits
+/// between a loop's header and its back edge; the fork's meetings
 /// (`VICTORY_LOCAL_MEET_CHECKS=0`) failed them all, and 1952aaf's analysis
 /// (`VICTORY_HOST_WAVE_READS=0`) the accumulator, the mask and the flags
-/// (checked here without the card: run there they could hang it).
+/// (checked here without the card: run there they could hang it). The
+/// production path takes these local waves, but for the accumulator's
+/// branch, which a lane read alone parts: the console flow
+/// (`VICTORY_LANE_READ_BRANCHES=0`: these local waves).
 #[test]
 fn local_waves_meet_only_where_both_host_waves_run_as_often() {
     let nvidia = super::Target { lanes_min: 32, lanes_max: 32, exact_views: false };
     let flags = (lds_flag(true), lds_flag(false));
+    // (what, the program, read beside the operands or loaded, the console
+    // flow first)
     let cases = [
-        ("a loop lanes leave apart", LDS_LOOP, false),
-        ("a branch on the reserved base", LDS_BASE, false),
-        ("a branch on a lane read of an accumulator", LDS_FMAC, true),
-        ("a branch on a lane read of a constant mask's select", LDS_MASK, true),
-        ("a branch on a flag loaded with glc", &flags.0[..], true),
-        ("a branch on a flag of the view it stores to, of no declared kind", &flags.1[..], true),
+        ("a loop lanes leave apart", LDS_LOOP, false, false),
+        ("a branch on the reserved base", LDS_BASE, false, false),
+        ("a branch on a lane read of an accumulator", LDS_FMAC, true, true),
+        ("a branch on a lane read of a constant mask's select", LDS_MASK, true, false),
+        ("a branch on a flag loaded with glc", &flags.0[..], true, false),
+        ("a branch on a flag of the view it stores to", &flags.1[..], true, false),
     ];
-    for (label, body, read) in cases {
+    for (label, body, read, console_first) in cases {
         let p = with_lds(body);
         let l = local_lowered(&p, nvidia, true);
         assert_eq!(l.barriers.0, 0, "{label}: no barrier inside a loop");
@@ -1201,9 +1206,18 @@ fn local_waves_meet_only_where_both_host_waves_run_as_often() {
         // The loop's block is in its own region, the branch's body in its:
         // no block there is a meeting place.
         assert_eq!(l.all_lane, Some(vec![true, false, true]), "{label}");
-        // The production path takes this very translation.
+        // The production path takes this very translation, or the console
+        // flow where a lane read alone parts the branch.
         let emitted = emit_for(&p, nvidia).expect("translates");
-        assert_eq!(emitted.dxil, l.dxil, "{label}: emit gives the local waves checked here");
+        let switch = |s, on| super::with_switch(s, on, || emit_for(&p, nvidia));
+        let before = switch(super::Switch::LaneReadBranches, false).expect("translates");
+        assert_eq!(before.dxil, l.dxil, "{label}: local waves first, as before");
+        if console_first {
+            let console = switch(super::Switch::LdsLocal, false).expect("the console flow");
+            assert_eq!(emitted.dxil, console.dxil, "{label}: the console flow first");
+        } else {
+            assert_eq!(emitted.dxil, l.dxil, "{label}: emit gives the local waves checked here");
+        }
         assert_eq!(wave_size(&emitted.dxil), Some(32));
         let fork = local_lowered(&p, nvidia, false);
         assert!(
@@ -1236,7 +1250,7 @@ fn branches_apart(p: &crate::ir::Program, written: &std::collections::HashSet<(u
     use crate::structure::{Atom, LaneExit};
     let st = crate::structure::structure(p).expect("structure");
     let g = super::lower::LaneGraph::of(&st).expect("graph");
-    let varying = super::local_waves::host_wave_varying(p, &st, &g, written);
+    let varying = super::local_waves::host_wave_varying(p, &st, &g, written, None);
     (0..st.exits.len())
         .filter_map(|b| match st.exits[b] {
             LaneExit::Branch { when, .. } => match st.bools.support(when)[..] {
@@ -1442,13 +1456,15 @@ fn host_waves_hold_lane_reads_and_reserved_slots_apart() {
     assert_eq!(old(&carry), [false]);
 }
 
-/// A uniform branch on a scalar load of memory the dispatch itself writes
-/// may part the two host waves (a write can land between their two loads):
-/// with `glc` or `dlc` always; in a program that stores to memory, through
-/// an unordered-access view, a view of no declared kind or a root view of
-/// either; never through a constant buffer or shader resource view, nor in
-/// a program that writes no memory. 1952aaf (`VICTORY_HOST_WAVE_READS=0`)
-/// took every one as alike.
+/// A uniform branch on a scalar load of memory that may be written while
+/// the dispatch runs may part the two host waves (a write can land between
+/// their two loads): with `glc` or `dlc` always; through an unordered-access
+/// view, a view of no declared kind or a root view of either, also in a
+/// program that writes no memory itself (another dispatch may);
+/// never through a constant buffer or shader resource view. 5c99db2
+/// (`VICTORY_VIEW_LOADS_APART=0`) took those views' loads as apart only in
+/// a program that stores to memory, and 1952aaf
+/// (`VICTORY_HOST_WAVE_READS=0`) every load as alike.
 #[test]
 fn host_waves_may_load_written_memory_apart() {
     use crate::native::{ResourceType, UsedResource};
@@ -1532,9 +1548,25 @@ fn host_waves_may_load_written_memory_apart() {
     let first = |bits: u32| [0xF420_0502 | bits, 0xFA00_4000];
     assert_eq!(apart(&first(0), true, kinds(uav, None, None)), [true], "the view it stores to");
     assert_eq!(apart(&first(0), true, kinds(None, None, None)), [true], "a view of no declared kind");
-    assert_eq!(apart(&first(0), false, kinds(uav, None, None)), [false], "a program that writes no memory");
     assert_eq!(apart(&first(1 << 16), false, kinds(cbv, None, None)), [true], "glc");
     assert_eq!(apart(&first(1 << 14), false, kinds(cbv, None, None)), [true], "dlc");
+    // 5c99db2 (`VICTORY_VIEW_LOADS_APART=0`): such a view's loads only in a
+    // program that stores to memory.
+    let stored_here = |load: &[u32], stores: bool, used: Vec<UsedResource>| {
+        super::with_switch(super::Switch::ViewLoadsApart, false, || apart(load, stores, used))
+    };
+    // In a program that writes no memory itself.
+    for (used, now, before, what) in [
+        (kinds(uav, None, None), true, false, "an unordered-access view"),
+        (kinds(None, None, None), true, false, "a view of no declared kind"),
+        (kinds(cbv, None, None), false, false, "a constant buffer"),
+        (kinds(srv, None, None), false, false, "a shader resource view"),
+    ] {
+        assert_eq!(apart(&first(0), false, used.clone()), [now], "{what}");
+        assert_eq!(stored_here(&first(0), false, used), [before], "{what}: 5c99db2");
+    }
+    assert_eq!(stored_here(&first(0), true, kinds(uav, None, None)), [true], "5c99db2: stored to");
+    assert_eq!(stored_here(&first(1 << 16), false, kinds(cbv, None, None)), [true], "5c99db2: glc");
     // The table's second view, which the program only reads.
     let second = |glc: bool| {
         [
@@ -1548,6 +1580,9 @@ fn host_waves_may_load_written_memory_apart() {
     assert_eq!(apart(&second(false), true, kinds(uav, cbv, None)), [false], "a constant buffer");
     assert_eq!(apart(&second(false), true, kinds(uav, srv, None)), [false], "a shader resource view");
     assert_eq!(apart(&second(false), true, kinds(uav, uav, None)), [true], "another unordered-access view");
+    // Only read, in a program that writes no memory itself.
+    assert_eq!(apart(&second(false), false, kinds(uav, uav, None)), [true], "only read");
+    assert_eq!(stored_here(&second(false), false, kinds(uav, uav, None)), [false], "5c99db2");
     assert_eq!(apart(&second(true), true, kinds(uav, cbv, None)), [true], "a constant buffer with glc");
     // By address, from the root view in s[8:9].
     let root = [
@@ -1557,6 +1592,10 @@ fn host_waves_may_load_written_memory_apart() {
     assert_eq!(apart(&root, true, kinds(uav, None, cbv)), [false], "a root constant buffer");
     assert_eq!(apart(&root, true, kinds(uav, None, uav)), [true], "a root unordered-access view");
     assert_eq!(apart(&root, true, kinds(uav, None, None)), [true], "a root view of no declared kind");
+    // In a program that writes no memory itself.
+    assert_eq!(apart(&root, false, kinds(uav, None, uav)), [true], "a root view, not stored to");
+    assert_eq!(apart(&root, false, kinds(uav, None, cbv)), [false], "a root constant buffer");
+    assert_eq!(stored_here(&root, false, kinds(uav, None, uav)), [false], "5c99db2: a root view");
     // 1952aaf took them all as alike.
     let old = super::with_switch(super::Switch::HostWaveReads, false, || {
         apart(&first(1 << 16), true, kinds(uav, None, None))
@@ -1564,26 +1603,41 @@ fn host_waves_may_load_written_memory_apart() {
     assert_eq!(old, [false]);
 }
 
-/// [`LDS_LOOP`], [`LDS_BASE`], [`LDS_FMAC`], [`LDS_MASK`] and
-/// [`lds_flag`] on every host of 32-lane waves, as local waves and in the
-/// console flow: every lane of a group reads the LDS total its group made,
-/// and the idiom's slots are each lane's own.
+/// [`LDS_LOOP`], [`LDS_BASE`], [`LDS_FMAC`], [`LDS_MASK`], [`lds_flag`]
+/// and a branch on the group's index read first lane ([`GROUP_INDEX`]) on
+/// every host of 32-lane waves, as local waves and in the console flow:
+/// every lane of a group reads the LDS total its group made, and the
+/// idiom's slots are each lane's own. As translated, the accumulator's
+/// branch reads the console's total (its console flow,
+/// [`super::local_waves::parted_by_lane_read`]); its local waves
+/// (`VICTORY_LANE_READ_BRANCHES=0`) read the first host wave's. The group's
+/// index keeps its local waves and reads the console's.
 #[test]
 fn local_waves_of_loops_and_reserved_branches_match_the_console() {
     let nvidia = super::Target { lanes_min: 32, lanes_max: 32, exact_views: false };
-    let local = |p: &crate::NativeProgram| emit_for(p, nvidia).expect("local waves");
+    // Local waves as emit takes them before the console flow (and took them
+    // for a branch a lane read parts, before that took the console flow).
+    let local = |p: &crate::NativeProgram| {
+        let first = || emit_for(p, nvidia);
+        super::with_switch(super::Switch::LaneReadBranches, false, first).expect("local waves")
+    };
     let console = |p: &crate::NativeProgram| {
         super::with_switch(super::Switch::LdsLocal, false, || emit_for(p, nvidia)).expect("console flow")
     };
     let (looped, base, fmac) = (with_lds(LDS_LOOP), with_lds(LDS_BASE), with_lds(LDS_FMAC));
     let (mask, glc, flag) = (with_lds(LDS_MASK), with_lds(&lds_flag(true)), with_lds(&lds_flag(false)));
+    let index = with_lds(&lds_lane_read(GROUP_INDEX));
     // The console flow has no lane read of a constant mask's select (an
     // SCC it does not compute): the mask runs as local waves only.
     assert!(super::with_switch(super::Switch::LdsLocal, false, || emit_for(&mask, nvidia)).is_err());
-    for p in [&looped, &base, &fmac, &mask, &glc, &flag] {
+    for p in [&looped, &base, &fmac, &mask, &glc, &flag, &index] {
         let l = local(p);
         let c = (!std::ptr::eq(p, &mask)).then(|| console(p));
         assert!(c.as_ref().is_none_or(|c| c.dxil != l.dxil), "local waves are not the console flow");
+        // As translated: these local waves, but the accumulator's console flow.
+        let emitted = emit_for(p, nvidia).expect("translates");
+        let want = if std::ptr::eq(p, &fmac) { c.as_ref().expect("the console flow") } else { &l };
+        assert_eq!(emitted.dxil, want.dxil, "the form emit takes");
         // The barriers are checked before anything runs on the card.
         let checked = local_lowered(p, nvidia, true);
         assert_eq!(checked.dxil, l.dxil);
@@ -1633,7 +1687,9 @@ fn local_waves_of_loops_and_reserved_branches_match_the_console() {
             want.sort_unstable();
             assert_eq!(list, want, "{name}: {form}: the slots");
             // The branch on the first lane's t: the whole wave on the
-            // console, the first host wave of each group as local waves.
+            // console, the first host wave of each group as local waves
+            // (which translation no longer takes, but with
+            // `VICTORY_LANE_READ_BRANCHES=0`).
             let out = run_dwords(&host, &make(&fmac), 64, groups, 0).unwrap_or_else(|e| panic!("{name}: {e}"));
             let want = if form == "console" { 64 } else { 32 };
             assert!(out.iter().all(|&x| x == want), "{name}: {form}: the accumulator's branch: {:?}", &out[..64]);
@@ -1650,7 +1706,174 @@ fn local_waves_of_loops_and_reserved_branches_match_the_console() {
                 let lanes = &out[..(64 * groups) as usize];
                 assert!(lanes.iter().all(|&x| x == 64), "{name}: {form}: the {what} flag's branch: {:?}", &out[..64]);
             }
+            // The branch on the group's index: both host waves of group 0
+            // go in, those of the others do not.
+            let out = run_dwords(&host, &make(&index), 64, groups, 0).unwrap_or_else(|e| panic!("{name}: {e}"));
+            for g in 0..groups as usize {
+                let want = if g == 0 { 64 } else { 0 };
+                let lanes = &out[64 * g..64 * (g + 1)];
+                assert!(lanes.iter().all(|&x| x == want), "{name}: {form}: group {g}'s index: {lanes:?}");
+            }
             eprintln!("{name}: loops and reserved branches of one-wave LDS groups exact ({form})");
         }
+        // As translated, the accumulator's branch reads the console's total.
+        let translated = emit_for(&fmac, nvidia).expect("translates");
+        let out = run_dwords(&host, &translated, 64, 8, 0);
+        let out = out.unwrap_or_else(|e| panic!("{name}: {e}"));
+        let lanes = &out[..64];
+        assert!(out.iter().all(|&x| x == 64), "{name}: the accumulator's branch: {lanes:?}");
+    }
+}
+
+/// A one-wave group with LDS whose branch the two host waves of local waves
+/// would take apart only by a lane read of a value the lanes hold apart
+/// takes the console flow first ([`super::local_waves::parted_by_lane_read`]):
+/// the accumulator's lane read. Not the reserved base, the constant mask's
+/// select (which the host waves hold apart by its mask before any lane
+/// read), the flags loaded from memory written while the dispatch runs, a
+/// loop lanes leave apart nor the idiom's sections; nor a branch that a
+/// lane read and a flag part together (apart for the flag too).
+#[test]
+fn branches_a_lane_read_parts_take_the_console_flow_first() {
+    let nvidia = super::Target { lanes_min: 32, lanes_max: 32, exact_views: false };
+    let parted = |native: &crate::NativeProgram| {
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
+        let res = crate::resource::track(&p, &native.layout, native.stage).expect("resources");
+        let st = crate::structure::structure(&p).expect("structure");
+        super::local_waves::parted_by_lane_read(native, &p, &st, &res)
+    };
+    // The offset of `s_cbranch_scc0 +4` in `body` after `program`'s seven
+    // words before it.
+    let branch = |body: &[u32]| body.iter().position(|&w| w == 0xBF84_0004).map(|i| 4 * (7 + i));
+    assert!(branch(LDS_FMAC).is_some());
+    assert_eq!(parted(&with_lds(LDS_FMAC)), branch(LDS_FMAC), "the accumulator");
+    let flags = (lds_flag(true), lds_flag(false));
+    let sections = lds_sections();
+    for (label, body) in [
+        ("the reserved base", LDS_BASE),
+        ("the constant mask's select", LDS_MASK),
+        ("a flag loaded with glc", &flags.0[..]),
+        ("a flag of the view it stores to", &flags.1[..]),
+        ("a loop lanes leave apart", LDS_LOOP),
+        ("shared LDS", LDS_SHARED),
+        ("the idiom", LDS_IDIOM),
+        ("the idiom's sections", &sections[..]),
+    ] {
+        assert_eq!(parted(&with_lds(body)), None, "{label}");
+    }
+    // A lane read compared with a flag of the view it stores to, which
+    // parts the host waves on its own.
+    let both = [
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0xD834_0000,
+        0x0000_0401, // ds_write_b32 v1, v4
+        0xF420_0542,
+        0xFA00_4000, // s_buffer_load_dword s21, s[4:7], 0x4000
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E0C_0D00, // v_cvt_f32_u32 v6, v0
+        0x7E0A_02F2, // v_mov_b32 v5, 1.0
+        0x560C_0A80, // v_fmac_f32 v6, 0, v5
+        0x7E28_0506, // v_readfirstlane_b32 s20, v6
+        0xBF06_1514, // s_cmp_eq_u32 s20, s21
+        0xBF84_0004, // s_cbranch_scc0 +4
+        0x7E18_0281, // v_mov_b32 v12, 1
+        0xD800_0000,
+        0x0000_0C01, // ds_add_u32 v1, v12
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD8D8_0000,
+        0x0200_0001, // ds_read_b32 v2, v1
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    ];
+    assert_eq!(parted(&with_lds(&both)), None, "apart for the flag too");
+    // The console flow first, where it translates; local waves first with
+    // `VICTORY_LANE_READ_BRANCHES=0`.
+    let fmac = with_lds(LDS_FMAC);
+    let switch = |s, on| super::with_switch(s, on, || emit_for(&fmac, nvidia));
+    let console = switch(super::Switch::LdsLocal, false).expect("console flow");
+    assert_eq!(emit_for(&fmac, nvidia).expect("translates").dxil, console.dxil);
+    let before = switch(super::Switch::LaneReadBranches, false).expect("local waves");
+    assert_eq!(before.dxil, local_lowered(&fmac, nvidia, true).dxil);
+    let mask = with_lds(LDS_MASK);
+    let local = local_lowered(&mask, nvidia, true);
+    assert_eq!(emit_for(&mask, nvidia).expect("local waves").dxil, local.dxil);
+}
+
+/// [`LDS_FMAC`] with `value` making v6, the value whose first lane the
+/// branch reads: every lane whose group's read gives 0 adds 1 to LDS[0].
+fn lds_lane_read(value: &[u32]) -> Vec<u32> {
+    let mut words = vec![
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0xD834_0000,
+        0x0000_0401, // ds_write_b32 v1, v4
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    ];
+    words.extend_from_slice(value);
+    words.extend_from_slice(&[
+        0x7E28_0506, // v_readfirstlane_b32 s20, v6
+        0xBF06_8014, // s_cmp_eq_u32 s20, 0
+        0xBF84_0004, // s_cbranch_scc0 +4
+        0x7E18_0281, // v_mov_b32 v12, 1
+        0xD800_0000,
+        0x0000_0C01, // ds_add_u32 v1, v12
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD8D8_0000,
+        0x0200_0001, // ds_read_b32 v2, v1
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    ]);
+    words
+}
+
+/// The group's index from the thread's, `(group << 6 + t) >> 6`: alike in
+/// every lane of the console wave.
+const GROUP_INDEX: &[u32] = &[
+    0xD746_0005,
+    0x0401_0C01, // v_lshl_add_u32 v5, s1, 6, v0
+    0x2C0C_0A86, // v_lshrrev_b32 v6, 6, v5
+];
+
+/// A first-lane read of a value every lane of the console wave holds alike
+/// parts nothing, though the host-wave analysis takes it as apart (it
+/// leaves loads and the thread's index out): the group's index from the
+/// thread's, a load by one index for every lane. Of a value whose low bit
+/// differs between the lanes 0 and 32 (`(group << 6 + t) >> 5`), or of a
+/// load at the lane's own address, the branch takes the console flow first.
+#[test]
+fn lane_reads_of_values_alike_in_every_lane_part_nothing() {
+    let parted = |value: &[u32]| {
+        let native = with_lds(&lds_lane_read(value));
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
+        let names: Vec<&str> = p.blocks.iter().flat_map(|b| &b.insts).map(|i| i.name()).collect();
+        let res = crate::resource::track(&p, &native.layout, native.stage).expect("resources");
+        let st = crate::structure::structure(&p).expect("structure");
+        (super::local_waves::parted_by_lane_read(&native, &p, &st, &res).is_some(), names.join(" "))
+    };
+    let half = [
+        0xD746_0005,
+        0x0401_0C01, // v_lshl_add_u32 v5, s1, 6, v0
+        0x2C0C_0A85, // v_lshrrev_b32 v6, 5, v5
+    ];
+    let one_index = [
+        0x7E0A_0201, // v_mov_b32 v5, s1
+        0xE030_2000,
+        0x8001_0605, // buffer_load_dword v6, v5, s[4:7], 0 idxen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    ];
+    let own_address = [
+        0x340A_0082, // v_lshlrev_b32 v5, 2, v0
+        0xE030_1000,
+        0x8001_0605, // buffer_load_dword v6, v5, s[4:7], 0 offen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    ];
+    for (label, value, apart, has) in [
+        ("the group's index", GROUP_INDEX, false, "v_lshl_add_u32 v_lshrrev_b32"),
+        ("half the group's index", &half[..], true, "v_lshl_add_u32 v_lshrrev_b32"),
+        ("a load by one index", &one_index[..], false, "buffer_load_dword"),
+        ("a load at the lane's own address", &own_address[..], true, "buffer_load_dword"),
+    ] {
+        let (got, names) = parted(value);
+        assert!(names.contains(has), "{label}: {names}");
+        assert_eq!(got, apart, "{label}");
     }
 }

@@ -67,9 +67,27 @@ enum Wave {
 /// Lane masks read as numbers by other instructions and lane reads outside
 /// whole-wave sections are stopped by the lowering itself.
 // shortcut: `v_readfirstlane` of a value that differs between lanes is taken as it is (this
-// host wave's first lane), and a guarded write of a plain value over a wave-dependent one is
+// host wave's first lane; a branch on one takes the console flow instead,
+// [`parted_by_lane_read`]), and a guarded write of a plain value over a wave-dependent one is
 // the only mix of old and new lanes that is looked at.
 pub(crate) fn independent(p: &Program, st: &Structured) -> Result<(), (usize, &'static str)> {
+    kinds(p, st).0
+}
+
+/// The values [`independent`] finds derived from what a first lane's atomic
+/// of the allocation idiom returned: the slots the wave reserved, and what is
+/// made of them ([`Wave::Base`]).
+pub(crate) fn reserved_bases(p: &Program, st: &Structured) -> HashSet<Value> {
+    let (_, kind) = kinds(p, st);
+    kind.into_iter().filter(|&(_, k)| k == Wave::Base).map(|(v, _)| v).collect()
+}
+
+/// [`independent`]'s verdict, and what it found each value to hold (values
+/// it leaves out are [`Wave::Plain`]; complete where the verdict is `Ok`).
+fn kinds(
+    p: &Program,
+    st: &Structured,
+) -> (Result<(), (usize, &'static str)>, HashMap<Value, Wave>) {
     use super::wave::{Op, Shape};
     const FIRST: Why = "a wave's first-lane number used as data";
     const TOTAL: Why = "a count or sum over the wave used as data";
@@ -342,16 +360,20 @@ pub(crate) fn independent(p: &Program, st: &Structured) -> Result<(), (usize, &'
     let mut settled = false;
     for _ in 0..16 {
         let before = (kind.clone(), firsts.len());
-        pass(&mut kind, &mut firsts, false)?;
+        // (a pass that does not check finds nothing wrong)
+        if let Err(e) = pass(&mut kind, &mut firsts, false) {
+            return (Err(e), kind);
+        }
         if (&before.0, before.1) == (&kind, firsts.len()) {
             settled = true;
             break;
         }
     }
     if !settled {
-        return Err((0, MIXED));
+        return (Err((0, MIXED)), kind);
     }
-    pass(&mut kind, &mut firsts, true)
+    let checked = pass(&mut kind, &mut firsts, true);
+    (checked, kind)
 }
 
 /// Whether a vector ALU instruction reads its destination's old value
@@ -398,6 +420,9 @@ fn reads_destination(name: &str, v: &Valu) -> bool {
 /// `VICTORY_HOST_WAVE_READS=0`: 1952aaf's rules, which counted beside the
 /// operands only a partial write's old value, and among the operands a
 /// lane mask only where EXEC or a compare made it.
+/// With `lane_reads`, a lane read of a value the lanes may hold apart is
+/// apart only where [`LaneReads`] says (what is apart without the others,
+/// for [`parted_by_lane_read`]).
 /// shortcut: a scalar load not in `written` reads the same in both host
 /// waves when its address is the same.
 pub(crate) fn host_wave_varying(
@@ -405,6 +430,7 @@ pub(crate) fn host_wave_varying(
     st: &Structured,
     g: &super::lower::LaneGraph,
     written: &HashSet<(usize, usize)>,
+    lane_reads: Option<&LaneReads>,
 ) -> Vec<bool> {
     let reads = super::Switch::HostWaveReads.on();
     let n = p.blocks.len().min(g.succ.len());
@@ -566,9 +592,10 @@ pub(crate) fn host_wave_varying(
             }
         }
     }
-    // Whether what `inst` writes may differ between the host waves, with
-    // `masks_apart` the lane masks they may hold apart.
-    let apart = |inst: &Inst, varying: &[bool], masks_apart: &[bool]| -> bool {
+    // Whether what `inst`, instruction `i` of block `b`, writes may differ
+    // between the host waves, with `masks_apart` the lane masks they may
+    // hold apart.
+    let apart = |at: (usize, usize), inst: &Inst, varying: &[bool], masks_apart: &[bool]| {
         let name = inst.name();
         // the hardware's state, each wave its own
         if matches!(
@@ -586,7 +613,8 @@ pub(crate) fn host_wave_varying(
                     Some(&Operand::Vector { reg, .. }) => inst.read(Reg::V(reg)),
                     _ => None,
                 };
-                if !from.is_some_and(|x| has(&alike, x)) {
+                let counts = lane_reads.is_none_or(|l| l.apart(at, from));
+                if !from.is_some_and(|x| has(&alike, x)) && counts {
                     return true;
                 }
             }
@@ -654,7 +682,7 @@ pub(crate) fn host_wave_varying(
                 }
                 for (i, inst) in block.insts.iter().enumerate() {
                     let loaded = written.contains(&(b, i));
-                    if inside[b] || loaded || apart(inst, &varying, &masks_apart) {
+                    if inside[b] || loaded || apart((b, i), inst, &varying, &masks_apart) {
                         for &(r, w) in &inst.writes {
                             if exec(r) {
                                 continue;
@@ -675,20 +703,22 @@ pub(crate) fn host_wave_varying(
     }
 }
 
-/// Scalar loads (by block and instruction) of memory the dispatch itself
-/// may write while it runs, which the two host waves of a console wave run
-/// as local waves may read apart ([`host_wave_varying`]): on the console
-/// the wave loads once, here each host wave loads on its own, and another
-/// group or the other host wave can land a write between the two. Every
-/// load with `glc` or `dlc` (asking past the scalar cache for what was
-/// written since) and every one other than `s_load_*` and `s_buffer_load_*`;
-/// in a program that stores to memory or adds to it (beside LDS and the
-/// lanes' own scratch), every one of a view the program's resources do not
-/// name a constant buffer or shader resource view
+/// Scalar loads (by block and instruction) of memory that may be written
+/// while the dispatch runs, by the dispatch itself or by another one, which
+/// the two host waves of a console wave run as local waves may read apart
+/// ([`host_wave_varying`]): on the console the wave loads once, here each
+/// host wave loads on its own, and a write (by another group, the other
+/// host wave or a dispatch beside this one) can land between the two.
+/// Every load with `glc` or `dlc` (asking past the scalar cache for what
+/// was written since), every one other than `s_load_*` and
+/// `s_buffer_load_*`, and every one of a view the program's resources do
+/// not name a constant buffer or shader resource view
 /// ([`super::lower::used_entry`]): an unordered-access view, a descriptor
 /// of the heap or one the code makes, a root view of no given kind; not the
 /// descriptors of a table or a heap, nor the constants after the code.
-/// `VICTORY_HOST_WAVE_READS=0`: none.
+/// `VICTORY_VIEW_LOADS_APART=0`: those of such a view only in a program
+/// that stores to memory or adds to it itself (beside LDS and the lanes'
+/// own scratch), as in 5c99db2. `VICTORY_HOST_WAVE_READS=0`: none.
 /// shortcut: a constant buffer or shader resource view is not written while
 /// a dispatch reads it, through another view either (D3D12 keeps a resource
 /// in a read state apart from unordered access).
@@ -706,14 +736,17 @@ pub(crate) fn loads_of_written_memory(
             block.insts.iter().enumerate().map(move |(i, inst)| ((b, i), inst))
         })
     };
-    // Stores and atomics on memory: not on LDS (or GDS), not on the lanes'
-    // own scratch.
-    let writes = sites().any(|(_, inst)| {
-        let name = inst.name();
-        !matches!(inst.fields, Fields::Ds { .. } | Fields::Exp { .. })
-            && !name.starts_with("scratch_")
-            && (name.contains("_store") || name.contains("_atomic"))
-    });
+    // Whether a view that is not read-only may be written while this
+    // dispatch runs: always, since another dispatch may write it as well
+    // (`VICTORY_VIEW_LOADS_APART=0`: only when the program itself stores or
+    // adds to memory, not to LDS (or GDS) nor to the lanes' own scratch).
+    let writes = super::Switch::ViewLoadsApart.on()
+        || sites().any(|(_, inst)| {
+            let name = inst.name();
+            !matches!(inst.fields, Fields::Ds { .. } | Fields::Exp { .. })
+                && !name.starts_with("scratch_")
+                && (name.contains("_store") || name.contains("_atomic"))
+        });
     let scalar: HashMap<Site, Address> = res.scalar.iter().copied().collect();
     // A view the program's resources name a constant buffer or a shader
     // resource view.
@@ -761,4 +794,267 @@ pub(crate) fn loads_of_written_memory(
         }
     }
     out
+}
+
+/// The lane reads [`host_wave_varying`] takes as apart when it is given
+/// these: those of the slots the idiom reserved ([`reserved_bases`]), and
+/// at `kept` those inside whole-wave sections (the idiom's sums and
+/// prefixes, [`super::wave::sections`]) and first-lane reads of a value
+/// every lane holds alike all the same ([`even_values`]: what is apart
+/// there is not what a lane read parts); not the others.
+pub(crate) struct LaneReads {
+    bases: HashSet<Value>,
+    /// Instructions by block and index.
+    kept: HashSet<(usize, usize)>,
+}
+
+impl LaneReads {
+    pub(crate) fn of(native: &NativeProgram, p: &Program, st: &Structured) -> Self {
+        let mut kept = HashSet::new();
+        for b in 0..p.blocks.len() {
+            for (&start, sec) in &super::wave::sections(p, b) {
+                kept.extend((start + 1..sec.end).map(|i| (b, i)));
+            }
+        }
+        let even = even_values(native, p, st);
+        for (b, block) in p.blocks.iter().enumerate() {
+            for (i, inst) in block.insts.iter().enumerate() {
+                let from = match &inst.fields {
+                    Fields::Valu(v) if inst.name() == "v_readfirstlane_b32" => match v.src.first() {
+                        Some(&Operand::Vector { reg, .. }) => inst.read(Reg::V(reg)),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if from.is_some_and(|x| even.contains(&x)) {
+                    kept.insert((b, i));
+                }
+            }
+        }
+        LaneReads { bases: reserved_bases(p, st), kept }
+    }
+
+    /// Whether a lane read of `from` at `at` (block, index) is apart.
+    fn apart(&self, at: (usize, usize), from: Option<Value>) -> bool {
+        self.kept.contains(&at) || from.is_some_and(|v| self.bases.contains(&v))
+    }
+}
+
+/// Bits of a vector value that may differ between the lanes of a console
+/// wave, and bits known to be zero in every lane ([`even_values`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Bits {
+    vary: u32,
+    zero: u32,
+}
+
+impl Bits {
+    /// Nothing known.
+    const ANY: Bits = Bits { vary: u32::MAX, zero: 0 };
+    /// The same in every lane.
+    const EVEN: Bits = Bits { vary: 0, zero: 0 };
+
+    fn constant(x: u32) -> Bits {
+        Bits { vary: 0, zero: !x }
+    }
+
+    /// `self << s`, `s` below 32.
+    fn shl(self, s: u32) -> Bits {
+        Bits { vary: self.vary << s, zero: (self.zero << s) | ((1 << s) - 1) }
+    }
+
+    /// `self >> s`, `s` below 32.
+    fn shr(self, s: u32) -> Bits {
+        Bits { vary: self.vary >> s, zero: (self.zero >> s) | !(u32::MAX >> s) }
+    }
+
+    fn add(self, o: Bits) -> Bits {
+        if self.vary | o.vary == 0 {
+            Bits::EVEN
+        } else if !self.zero & !o.zero == 0 {
+            // No bit set in both: no carry, the sum is the or.
+            Bits { vary: self.vary | o.vary, zero: self.zero & o.zero }
+        } else {
+            // A carry from the lowest bit that may differ goes on up.
+            Bits { vary: u32::MAX << (self.vary | o.vary).trailing_zeros(), zero: 0 }
+        }
+    }
+
+    fn and(self, o: Bits) -> Bits {
+        Bits { vary: (self.vary & !o.zero) | (o.vary & !self.zero), zero: self.zero | o.zero }
+    }
+
+    fn or(self, o: Bits) -> Bits {
+        Bits { vary: self.vary | o.vary, zero: self.zero & o.zero }
+    }
+}
+
+/// Vector values every lane of a console wave that runs their instruction
+/// holds alike, beyond [`host_wave_varying`]'s rules, which leave loads and
+/// the lane's id out: a load (not an atomic, nor a partial write) by an
+/// address every lane holds alike, and integer arithmetic on the lane's id
+/// whose bits that differ between the lanes shift out (`(group << 6 | t) >>
+/// 6`, a 64-thread group's index, with `t` the thread's index in a group
+/// of n x 1 x 1). Unguarded instructions only; phis and the other inputs
+/// are not. For [`LaneReads`]: a first-lane read of one reads what every
+/// lane that ran it holds (a value set in a lane-branch region, or apart
+/// for another reason, stays apart there all the same).
+fn even_values(native: &NativeProgram, p: &Program, st: &Structured) -> HashSet<Value> {
+    let mut bits: HashMap<Value, Bits> = HashMap::new();
+    // The thread's index in a group of n x 1 x 1: in one console wave, the
+    // low 6 bits (fewer below 64 threads) differ, the bits above n's are 0.
+    if let crate::native::StageIo::Cs(cs) = &native.io
+        && p.wave64
+        && cs.threads[1] == 1
+        && cs.threads[2] == 1
+        && let Some(&(_, t)) = p.inputs.iter().find(|i| i.0 == Reg::V(0))
+    {
+        let below = |n: u32| if n <= 1 { 0 } else { u32::MAX >> (n - 1).leading_zeros() };
+        let n = cs.threads[0];
+        bits.insert(t, Bits { vary: below(n.min(64)), zero: !below(n) });
+    }
+    let lanes = ["v_mbcnt", "v_permlane", "v_writelane", "v_interp", "v_movrel", "v_swaprel"];
+    for &b in &crate::ir::reverse_postorder(&p.blocks) {
+        for (i, inst) in p.blocks[b].insts.iter().enumerate() {
+            if st.guards.get(b).and_then(|g| g.get(i)).is_some_and(|g| g.is_some()) {
+                continue;
+            }
+            let name = inst.name();
+            let vgpr = |reg: u8| inst.read(Reg::V(reg)).and_then(|x| bits.get(&x)).copied();
+            let of = |o: &Operand| match *o {
+                Operand::Vector { reg, dwords: 1 } => vgpr(reg).unwrap_or(Bits::ANY),
+                Operand::Scalar { .. } => Bits::EVEN,
+                Operand::Const(c) => crate::resource::inline(c).map_or(Bits::EVEN, Bits::constant),
+                Operand::Literal(x) => Bits::constant(x),
+                _ => Bits::ANY,
+            };
+            let within = |x: u8, o: &Operand| match *o {
+                Operand::Vector { reg, dwords } => (reg..reg.saturating_add(dwords)).contains(&x),
+                _ => false,
+            };
+            // Whether every VGPR the instruction reads is one of `named`
+            // (alike where `even`), or the old value of `written` (which
+            // it writes whole: only lanes that never get there keep it).
+            let reads_only = |named: &[Operand], written: Option<&Operand>, even: bool| {
+                inst.reads.iter().all(|&(r, x)| match r {
+                    Reg::V(c) if named.iter().any(|o| within(c, o)) => {
+                        !even || bits.get(&x).is_some_and(|b| b.vary == 0)
+                    }
+                    Reg::V(c) => written.is_some_and(|w| within(c, w)),
+                    _ => true,
+                })
+            };
+            let load = |named: &[Operand], written: Option<&Operand>| {
+                if reads_only(named, written, true) { Bits::EVEN } else { Bits::ANY }
+            };
+            let result = match &inst.fields {
+                Fields::Valu(v)
+                    if v.dpp.is_none()
+                        && !lanes.iter().any(|l| name.starts_with(l))
+                        && !reads_destination(name, v)
+                        && !matches!(name, "v_cndmask_b32" | "v_div_fmas_f32" | "v_div_fmas_f64")
+                        && !name.contains("_co_ci_")
+                        && matches!(v.dst, Some(Operand::Vector { dwords: 1, .. })) =>
+                {
+                    let src: Vec<Bits> = v.src.iter().map(of).collect();
+                    // A shift amount in the operand's low 5 bits.
+                    let amount = |k: usize| match v.src.get(k) {
+                        Some(&Operand::Const(c)) => crate::resource::inline(c).map(|s| s & 31),
+                        Some(&Operand::Literal(x)) => Some(x & 31),
+                        _ => None,
+                    };
+                    let plain = (v.neg | v.abs) == 0 && !v.clamp && v.omod == 0 && v.sdwa.is_none();
+                    let even = src.iter().all(|b| b.vary == 0);
+                    match (name, &src[..], amount(0), amount(1)) {
+                        _ if !reads_only(&v.src, v.dst.as_ref(), false) => Bits::ANY,
+                        ("v_mov_b32", [a], ..) if plain => *a,
+                        ("v_lshlrev_b32", [_, a], Some(s), _) if plain => a.shl(s),
+                        ("v_lshrrev_b32", [_, a], Some(s), _) if plain => a.shr(s),
+                        ("v_lshl_add_u32", [a, _, c], _, Some(s)) if plain => a.shl(s).add(*c),
+                        ("v_add_nc_u32", [a, c], ..) if plain => a.add(*c),
+                        ("v_and_b32", [a, c], ..) if plain => a.and(*c),
+                        ("v_or_b32", [a, c], ..) if plain => a.or(*c),
+                        _ if even => Bits::EVEN,
+                        _ => Bits::ANY,
+                    }
+                }
+                Fields::Buffer { data, addr, lds: false, tfe: false, .. }
+                    if name.contains("_load") && !name.contains("d16") =>
+                {
+                    load(std::slice::from_ref(addr), data.as_ref())
+                }
+                Fields::Image { data, addr, d16: false, tfe: false, lwe: false, .. }
+                    if name.starts_with("image_load") =>
+                {
+                    load(addr, Some(data))
+                }
+                Fields::Flat { dst, addr: Some(addr), lds: false, .. }
+                    if name.starts_with("global_load") && !name.contains("d16") =>
+                {
+                    load(std::slice::from_ref(addr), dst.as_ref())
+                }
+                _ => continue,
+            };
+            for &(r, w) in &inst.writes {
+                if matches!(r, Reg::V(_)) {
+                    bits.insert(w, result);
+                }
+            }
+        }
+    }
+    bits.into_iter().filter(|(_, b)| b.vary == 0).map(|(v, _)| v).collect()
+}
+
+/// A branch (by the offset of its block's last instruction) of a program
+/// run as local waves that the two host waves may take apart only because a
+/// lane read (`v_readfirstlane_b32`, `v_readlane_b32`) outside the
+/// whole-wave sections took a value the lanes hold apart, other than the
+/// slots the allocation idiom reserved. Each host wave reads a lane of its
+/// own there (the second its lane 32 where the console's wave reads lane 0),
+/// so the program can take another way than on the console
+/// (`split_tests::LDS_FMAC` read 32 where the console reads 64). A uniform
+/// condition of the branch (or of a lane branch's condition, its uniform
+/// part) is apart by [`host_wave_varying`], and none is when such lane reads
+/// are not taken as apart ([`LaneReads`]): a branch apart for another reason
+/// too (a reserved base, a load of written memory, a region it lies in) is
+/// not this one's, nor one on a first-lane read of a value every lane holds
+/// alike, which that analysis leaves out ([`even_values`]: a load by one
+/// address for all, a 64-thread group's index from the thread's). `None` if
+/// there is none, or no lane graph to tell.
+/// shortcut: such a lane read used as data rather than in a branch (stored,
+/// or as an address) is not looked for: it reads this host wave's lane too.
+pub(crate) fn parted_by_lane_read(
+    native: &NativeProgram,
+    p: &Program,
+    st: &Structured,
+    res: &Resources,
+) -> Option<usize> {
+    let g = super::lower::LaneGraph::of(st)?;
+    let written = loads_of_written_memory(native, p, res);
+    let all = host_wave_varying(p, st, &g, &written, None);
+    let has = |set: &[bool], v: Value| set.get(v.0 as usize).copied().unwrap_or(false);
+    let uniform = |b: usize| -> Vec<Value> {
+        match st.exits.get(b) {
+            Some(&LaneExit::Branch { when, .. }) => st
+                .bools
+                .support(when)
+                .iter()
+                .filter_map(|a| match *a {
+                    Atom::Uniform(v) => Some(v),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    // (the second analysis only where a branch is apart at all)
+    let parted: Vec<usize> = (0..st.exits.len())
+        .filter(|&b| uniform(b).iter().any(|&v| has(&all, v)))
+        .collect();
+    if parted.is_empty() {
+        return None;
+    }
+    let others = host_wave_varying(p, st, &g, &written, Some(&LaneReads::of(native, p, st)));
+    let b = parted.into_iter().find(|&b| !uniform(b).iter().any(|&v| has(&others, v)))?;
+    Some(p.blocks.get(b).and_then(|block| block.insts.last()).map_or(0, |i| i.machine.offset))
 }

@@ -100,6 +100,10 @@ struct Free {
     /// The presented frame, the searches in it that found no run of free
     /// slots not lent, and the smallest size they looked for.
     clean_misses: (u64, u64, usize),
+    /// The presented frame, the walks in it that found no run of free slots
+    /// at all (not those of a table trying again), and the smallest size
+    /// they looked for: this heap's own ([`walks_per_heap`]).
+    misses: (u64, u64, usize),
 }
 
 /// A run of dynamic slots a table took: the first's index, how many, and
@@ -125,6 +129,17 @@ const RUNS_A_LOCK: usize = 1024;
 fn across_cursor() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_SLOTS_ACROSS_CURSOR").is_none_or(|v| v != "0"))
+}
+
+/// Whether each heap bounds the walks for free dynamic slots that find
+/// none in a frame on its own ([`Free::misses`], [`HostHeap::take_dynamic`]).
+/// `VICTORY_WALKS_PER_HEAP=0`: the bound counts the walks of every heap
+/// together, as before: the view heap's misses refused the sampler heap's
+/// tables of that size or larger for the rest of the frame, and the other
+/// way round.
+fn walks_per_heap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WALKS_PER_HEAP").is_none_or(|v| v != "0"))
 }
 
 struct StrideTable {
@@ -960,6 +975,7 @@ impl HostHeap {
                 lent_count: 0,
                 no_clean_run: usize::MAX,
                 clean_misses: (u64::MAX, 0, usize::MAX),
+                misses: (u64::MAX, 0, usize::MAX),
             }),
             taken: AtomicU64::new(reserved),
             released: [AtomicU64::new(0), AtomicU64::new(u64::MAX)],
@@ -1137,19 +1153,27 @@ impl HostHeap {
             return None;
         }
         // Releases come all the time and each allows a search again: no
-        // more than a few failed walks a frame for the sizes that failed in
-        // it. (A smaller table may still fit, and is not refused with them.)
+        // more than a few failed walks a frame in this heap for the sizes
+        // that failed in it. (A smaller table may still fit, and is not
+        // refused with them.) `VICTORY_WALKS_PER_HEAP=0`: in all heaps
+        // together ([`walks_per_heap`]).
         static FAILED: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(u64::MAX)];
         const WALKS: u64 = 8;
         let frame = crate::queue::presented();
-        if FAILED[0].swap(frame, Ordering::Relaxed) != frame {
-            FAILED[1].store(0, Ordering::Relaxed);
-            FAILED[2].store(u64::MAX, Ordering::Relaxed);
-        }
-        if !again
-            && FAILED[1].load(Ordering::Relaxed) >= WALKS
-            && n as u64 >= FAILED[2].load(Ordering::Relaxed)
-        {
+        let per_heap = walks_per_heap();
+        let (walked, least) = if per_heap {
+            if free.misses.0 != frame {
+                free.misses = (frame, 0, usize::MAX);
+            }
+            (free.misses.1, free.misses.2 as u64)
+        } else {
+            if FAILED[0].swap(frame, Ordering::Relaxed) != frame {
+                FAILED[1].store(0, Ordering::Relaxed);
+                FAILED[2].store(u64::MAX, Ordering::Relaxed);
+            }
+            (FAILED[1].load(Ordering::Relaxed), FAILED[2].load(Ordering::Relaxed))
+        };
+        if !again && walked >= WALKS && n as u64 >= least {
             return None;
         }
         // Slots lent by a recording the title may submit again are taken
@@ -1204,8 +1228,13 @@ impl HostHeap {
         let Some(first) = found_clean.or(found) else {
             free.no_run = n;
             if !again {
-                FAILED[1].fetch_add(1, Ordering::Relaxed);
-                FAILED[2].fetch_min(n as u64, Ordering::Relaxed);
+                if per_heap {
+                    free.misses.1 += 1;
+                    free.misses.2 = free.misses.2.min(n);
+                } else {
+                    FAILED[1].fetch_add(1, Ordering::Relaxed);
+                    FAILED[2].fetch_min(n as u64, Ordering::Relaxed);
+                }
             }
             return None;
         };
@@ -4023,7 +4052,7 @@ void main() {
             return; // VICTORY_SLOTS_ACROSS_CURSOR=0: the old search
         }
         // (`again`: past the frame's bound on failed walks, which other
-        // tests share.)
+        // tests share with `VICTORY_WALKS_PER_HEAP=0`.)
         fn take(heap: &HostHeap, n: u32) -> Option<Run> {
             let (first, tag) = heap.take_dynamic(n, true)?;
             Some(Run { first, n, tag })
@@ -4109,6 +4138,59 @@ void main() {
         assert_eq!(at(&heap, take(&heap, 4)), Some(1));
         assert_eq!(heap.lent(), 0);
         assert!(!heap.retake(&[again]));
+    }
+
+    /// The bound on walks for free dynamic slots that find none in a frame
+    /// is each heap's own: after eight such walks a heap refuses tables of
+    /// that size or larger for the rest of the frame (smaller ones still
+    /// fit, and a table trying again walks all the same), while another
+    /// heap's tables of the same size are made. With one bound for every
+    /// heap (`VICTORY_WALKS_PER_HEAP=0`) the other heap's were refused too.
+    #[test]
+    fn each_heap_bounds_its_own_failed_walks() {
+        if !walks_per_heap() {
+            // One bound for every heap, other tests' among them: eight
+            // misses here would refuse their tables for the frame.
+            eprintln!("VICTORY_WALKS_PER_HEAP=0: one bound for every heap; not run");
+            return;
+        }
+        // Other tests may present a frame meanwhile, which starts the
+        // bound over: try again in a frame that stays.
+        for _ in 0..16 {
+            let Some((full, slots)) = HostHeap::capped_samplers() else {
+                return; // no host GPU
+            };
+            let Some((other, _)) = HostHeap::capped_samplers() else {
+                return;
+            };
+            let frame = crate::queue::presented();
+            let all = full.take_dynamic(slots, true).expect("every dynamic slot").0;
+            // Eight walks for two slots with one free, a slot given back
+            // before each (which allows a search again).
+            let mut failed = 0;
+            for _ in 0..8 {
+                full.release(all, 1);
+                failed += usize::from(full.take_dynamic(2, false).is_none());
+            }
+            // Four free in a row now: two fit, but the frame's bound for two
+            // or more is spent.
+            full.release(all + 1, 3);
+            let bounded = full.take_dynamic(2, false);
+            let smaller = full.take_dynamic(1, false);
+            let again = full.take_dynamic(2, true);
+            // The other heap's bound is its own.
+            let elsewhere = other.take_dynamic(2, false);
+            if crate::queue::presented() != frame {
+                continue;
+            }
+            assert_eq!(failed, 8, "every walk found no run of two");
+            assert_eq!(bounded, None, "the frame's bound for two or more");
+            assert_eq!(smaller.map(|t| t.0), Some(all), "a smaller table still fits");
+            assert_eq!(again.map(|t| t.0), Some(all + 1), "a table trying again walks");
+            assert_eq!(elsewhere.map(|t| t.0), Some(other.count()), "another heap's table");
+            return;
+        }
+        panic!("a frame was presented during every try");
     }
 
     /// A sampler heap within the limit has a slot per title slot and no

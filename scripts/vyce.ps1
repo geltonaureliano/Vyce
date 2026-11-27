@@ -36,7 +36,11 @@ param(
 
     [string[]]$TitleArguments = @(),
 
-    [switch]$NoDebugWindow
+    [switch]$NoDebugWindow,
+
+    # Build: let Cargo use the network to fetch crates missing from Vyce-data\cargo. Without it the build is
+    # offline (CARGO_NET_OFFLINE=true) and takes the crates Cargo.lock names from that folder only.
+    [switch]$Online
 )
 
 $ErrorActionPreference = 'Stop'
@@ -241,6 +245,9 @@ if ($Action -eq 'Run' -and -not $NoTitlePatch) {
 if ($Action -eq 'Build') {
     $settings.RUSTC = $rustc
     $settings.LIB = $libs -join ';'
+    # Offline unless -Online: nothing is downloaded, whatever the caller's environment or Cargo's own
+    # configuration says.
+    $settings.CARGO_NET_OFFLINE = if ($Online) { 'false' } else { 'true' }
     $settings.CARGO_ENCODED_RUSTFLAGS = @(
         '-C', 'target-feature=+crt-static'
         '-C', 'linker-flavor=lld-link'
@@ -257,10 +264,15 @@ try {
 
     if ($Action -eq 'Build') {
         $features = if ($Profile -eq 'diag') { 'diagnostics,blake3/pure' } else { 'blake3/pure' }
+        $network = if ($Online) { 'online (-Online)' } else { 'offline, crates from Vyce-data\cargo only (-Online to download)' }
+        Write-Host "Build: $network"
         Push-Location -LiteralPath $repo
         try {
             & $cargo build --locked --profile $Profile -p victory --features $features --jobs $Jobs
-            if ($LASTEXITCODE -ne 0) { throw "Cargo exited with code $LASTEXITCODE." }
+            if ($LASTEXITCODE -ne 0) {
+                if (-not $Online) { Write-Warning 'An offline build stops at a crate missing from Vyce-data\cargo; -Online lets Cargo fetch it.' }
+                throw "Cargo exited with code $LASTEXITCODE."
+            }
         } finally {
             Pop-Location
         }
