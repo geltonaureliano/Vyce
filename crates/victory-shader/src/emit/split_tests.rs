@@ -1038,6 +1038,81 @@ const LDS_BASE: &[u32] = &[
     0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
 ];
 
+/// A uniform branch on a lane read of an accumulator (`v_fmac_f32` into the
+/// lane's t as a float, plus 0 * 1.0) around an LDS add, as HLSL's
+/// `if (WaveReadLaneFirst(fma(a, b, t)) == 0)` makes it; every lane reads
+/// LDS[0] after it. On the console the wave reads lane 0: 64 in every group.
+/// As local waves the first host wave reads lane 0 and goes in, the second
+/// reads lane 32 and does not: 32.
+const LDS_FMAC: &[u32] = &[
+    0x7E02_0280, // v_mov_b32 v1, 0
+    0x7E08_0280, // v_mov_b32 v4, 0
+    0xD834_0000,
+    0x0000_0401, // ds_write_b32 v1, v4
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x7E0C_0D00, // v_cvt_f32_u32 v6, v0
+    0x7E0A_02F2, // v_mov_b32 v5, 1.0
+    0x560C_0A80, // v_fmac_f32 v6, 0, v5
+    0x7E28_0506, // v_readfirstlane_b32 s20, v6
+    0xBF06_8014, // s_cmp_eq_u32 s20, 0
+    0xBF84_0004, // s_cbranch_scc0 +4
+    0x7E18_0281, // v_mov_b32 v12, 1
+    0xD800_0000,
+    0x0000_0C01, // ds_add_u32 v1, v12
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xD8D8_0000,
+    0x0200_0001, // ds_read_b32 v2, v1
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+];
+
+/// A uniform branch on a lane read of a select by a constant mask of lane
+/// 0 around an LDS add: on the console the wave reads lane 0 (1), as local
+/// waves the second host wave reads lane 32 (0).
+const LDS_MASK: &[u32] = &[
+    0x7E02_0280, // v_mov_b32 v1, 0
+    0x7E08_0280, // v_mov_b32 v4, 0
+    0xD834_0000,
+    0x0000_0401, // ds_write_b32 v1, v4
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBE8A_0481, // s_mov_b64 s[10:11], 1
+    0xD501_0006,
+    0x0029_0280, // v_cndmask_b32 v6, 0, 1, s[10:11]
+    0x7E28_0506, // v_readfirstlane_b32 s20, v6
+    0xBF06_8014, // s_cmp_eq_u32 s20, 0
+    0xBF84_0004, // s_cbranch_scc0 +4
+    0x7E18_0281, // v_mov_b32 v12, 1
+    0xD800_0000,
+    0x0000_0C01, // ds_add_u32 v1, v12
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xD8D8_0000,
+    0x0200_0001, // ds_read_b32 v2, v1
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+];
+
+/// A uniform branch on a flag loaded with `s_buffer_load_dword ... glc`
+/// through the view the program stores its results to (dword 4096) around
+/// an LDS add: another group, or the other host wave, may write it between
+/// the two host waves' loads.
+const LDS_FLAG: &[u32] = &[
+    0x7E02_0280, // v_mov_b32 v1, 0
+    0x7E08_0280, // v_mov_b32 v4, 0
+    0xD834_0000,
+    0x0000_0401, // ds_write_b32 v1, v4
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xF421_0502,
+    0xFA00_4000, // s_buffer_load_dword s20, s[4:7], 0x4000 glc
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBF06_8014, // s_cmp_eq_u32 s20, 0
+    0xBF84_0004, // s_cbranch_scc0 +4
+    0x7E18_0281, // v_mov_b32 v12, 1
+    0xD800_0000,
+    0x0000_0C01, // ds_add_u32 v1, v12
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xD8D8_0000,
+    0x0200_0001, // ds_read_b32 v2, v1
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+];
+
 /// `native` lowered as local waves, as [`super::emit`] lowers a one-wave
 /// group with LDS, with `VICTORY_LOCAL_MEET_CHECKS` as `checks` says.
 fn local_lowered(native: &crate::NativeProgram, target: super::Target, checks: bool) -> super::lower::Lowered {
@@ -1090,15 +1165,23 @@ fn local_waves_of_programs_by_address_do_not_meet() {
 
 /// Local waves meet only where both host waves run as often: not inside a
 /// loop their lanes leave after different numbers of turns, not inside a
-/// branch on the slots each host wave reserved. The translation's group
-/// barriers are then met as often on every way through the program, and
-/// none sits between a loop's header and its back edge; the fork's
-/// meetings (`VICTORY_LOCAL_MEET_CHECKS=0`) failed both (checked here
-/// without the card: run there they could hang it).
+/// branch on the slots each host wave reserved, on a lane read of an
+/// accumulator of lane values or of a select by a constant mask, or on a
+/// flag loaded from memory the dispatch writes. The translation's group
+/// barriers are then met as often on every
+/// way through the program, and none sits between a loop's header and its
+/// back edge; the fork's meetings (`VICTORY_LOCAL_MEET_CHECKS=0`) failed
+/// them all (checked here without the card: run there they could hang it).
 #[test]
 fn local_waves_meet_only_where_both_host_waves_run_as_often() {
     let nvidia = super::Target { lanes_min: 32, lanes_max: 32, exact_views: false };
-    for (label, body) in [("a loop lanes leave apart", LDS_LOOP), ("a branch on the reserved base", LDS_BASE)] {
+    for (label, body) in [
+        ("a loop lanes leave apart", LDS_LOOP),
+        ("a branch on the reserved base", LDS_BASE),
+        ("a branch on a lane read of an accumulator", LDS_FMAC),
+        ("a branch on a lane read of a constant mask's select", LDS_MASK),
+        ("a branch on a flag of written memory", LDS_FLAG),
+    ] {
         let p = with_lds(body);
         let l = local_lowered(&p, nvidia, true);
         assert_eq!(l.barriers.0, 0, "{label}: no barrier inside a loop");
@@ -1117,7 +1200,7 @@ fn local_waves_meet_only_where_both_host_waves_run_as_often() {
     }
     // The loop's block is in its own region, the branch's body in its: no
     // block there is a meeting place.
-    for body in [LDS_LOOP, LDS_BASE] {
+    for body in [LDS_LOOP, LDS_BASE, LDS_FMAC, LDS_MASK, LDS_FLAG] {
         let l = local_lowered(&with_lds(body), nvidia, true);
         assert_eq!(l.all_lane, Some(vec![true, false, true]));
     }
@@ -1128,12 +1211,34 @@ fn local_waves_meet_only_where_both_host_waves_run_as_often() {
     }
 }
 
+/// The SCC each uniform branch of `p` reads, by block, and whether the host
+/// waves of local waves may hold it apart; `written` as
+/// [`super::local_waves::loads_of_written_memory`] gives it.
+fn branches_apart(p: &crate::ir::Program, written: &std::collections::HashSet<(usize, usize)>) -> Vec<(usize, bool)> {
+    use crate::structure::{Atom, LaneExit};
+    let st = crate::structure::structure(p).expect("structure");
+    let g = super::lower::LaneGraph::of(&st).expect("graph");
+    let varying = super::local_waves::host_wave_varying(p, &st, &g, written);
+    (0..st.exits.len())
+        .filter_map(|b| match st.exits[b] {
+            LaneExit::Branch { when, .. } => match st.bools.support(when)[..] {
+                [Atom::Uniform(scc)] => Some((b, varying[scc.0 as usize])),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
 /// What the two host waves of local waves may hold apart: a lane read of a
 /// lane's own value (a thread id) and the slots a first lane reserved are,
 /// a lane read of a scalar every lane holds is not; nor is a user SGPR.
+/// What an instruction reads beside its operands counts: an accumulator's
+/// old value (`v_fmac_f32`, `v_dot4c_i32_i8`), both registers of a swap,
+/// `v_div_fmas_f32`'s VCC; and a select by a constant mask of some lanes
+/// takes each lane's own bit.
 #[test]
 fn host_waves_hold_lane_reads_and_reserved_slots_apart() {
-    use crate::structure::{Atom, LaneExit};
     let words = [
         0x7E0A_0200, // v_mov_b32 v5, s0
         0x7E0C_0505, // v_readfirstlane_b32 s6, v5
@@ -1151,32 +1256,140 @@ fn host_waves_hold_lane_reads_and_reserved_slots_apart() {
     ];
     // The SCC each block's branch reads, and whether the host waves may
     // hold it apart.
-    let apart = |words: &[u32]| -> Vec<(usize, bool)> {
+    let apart = |words: &[u32]| -> Vec<bool> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = crate::ir::build(&code, true, 16).expect("IR");
-        let st = crate::structure::structure(&p).expect("structure");
-        let g = super::lower::LaneGraph::of(&st).expect("graph");
-        let varying = super::local_waves::host_wave_varying(&p, &st, &g);
-        (0..st.exits.len())
-            .filter_map(|b| match st.exits[b] {
-                LaneExit::Branch { when, .. } => match st.bools.support(when)[..] {
-                    [Atom::Uniform(scc)] => Some((b, varying[scc.0 as usize])),
-                    _ => None,
-                },
-                _ => None,
-            })
-            .collect()
+        branches_apart(&p, &Default::default()).into_iter().map(|f| f.1).collect()
     };
-    let found = apart(&words);
-    assert_eq!(found.iter().map(|f| f.1).collect::<Vec<_>>(), [false, true, false], "{found:?}");
+    assert_eq!(apart(&words), [false, true, false]);
     // The reserved base's bit: apart.
-    let found = apart(&LDS_BASE.iter().copied().chain([S_ENDPGM]).collect::<Vec<_>>());
-    assert_eq!(found.iter().map(|f| f.1).collect::<Vec<_>>(), [true], "{found:?}");
+    assert_eq!(apart(&LDS_BASE.iter().copied().chain([S_ENDPGM]).collect::<Vec<_>>()), [true]);
+    // An accumulator reads its destination: of a lane's own value, apart;
+    // of one every lane holds, not.
+    let accumulators = [
+        0x7E02_0D00, // v_cvt_f32_u32 v1, v0
+        0x7E0A_0200, // v_mov_b32 v5, s0
+        0x5602_0A00, // v_fmac_f32 v1, s0, v5
+        0x7E0C_0501, // v_readfirstlane_b32 s6, v1
+        0x7E04_0201, // v_mov_b32 v2, s1
+        0x5604_0A00, // v_fmac_f32 v2, s0, v5
+        0x7E0E_0502, // v_readfirstlane_b32 s7, v2
+        0x7E06_0300, // v_mov_b32 v3, v0
+        0x1A06_0A00, // v_dot4c_i32_i8 v3, s0, v5
+        0x7E10_0503, // v_readfirstlane_b32 s8, v3
+        0xBF06_8006, // s_cmp_eq_u32 s6, 0
+        0xBF85_0001, // s_cbranch_scc1 +1
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0xBF06_8007, // s_cmp_eq_u32 s7, 0
+        0xBF85_0001, // s_cbranch_scc1 +1
+        0x7E08_0281, // v_mov_b32 v4, 1
+        0xBF06_8008, // s_cmp_eq_u32 s8, 0
+        0xBF85_0001, // s_cbranch_scc1 +1
+        0x7E08_0282, // v_mov_b32 v4, 2
+        S_ENDPGM,
+    ];
+    assert_eq!(apart(&accumulators), [true, false, true]);
+    // A swap hands a lane's own value to its source register.
+    let swap = [
+        0x7E04_0200, // v_mov_b32 v2, s0
+        0x7E02_0300, // v_mov_b32 v1, v0
+        0x7E02_CB02, // v_swap_b32 v1, v2
+        0x7E0C_0502, // v_readfirstlane_b32 s6, v2
+        0xBF06_8006, // s_cmp_eq_u32 s6, 0
+        0xBF85_0001, // s_cbranch_scc1 +1
+        0x7E08_0280, // v_mov_b32 v4, 0
+        S_ENDPGM,
+    ];
+    assert_eq!(apart(&swap), [true]);
+    // `v_div_fmas_f32` reads VCC beside its operands: the carry of a scale
+    // of values every lane holds, or a compare of the lane's own id.
+    let fmas = [
+        0x7E0A_0200, // v_mov_b32 v5, s0
+        0xD56D_6A01,
+        0x0416_0B05, // v_div_scale_f32 v1, vcc, v5, v5, v5
+        0xD56F_0002,
+        0x0406_0301, // v_div_fmas_f32 v2, v1, v1, v1
+        0x7E0C_0502, // v_readfirstlane_b32 s6, v2
+        0x7D88_0085, // v_cmp_gt_u32 vcc, 5, v0
+        0xD56F_0003,
+        0x0416_0B05, // v_div_fmas_f32 v3, v5, v5, v5
+        0x7E0E_0503, // v_readfirstlane_b32 s7, v3
+        0xBF06_8006, // s_cmp_eq_u32 s6, 0
+        0xBF85_0001, // s_cbranch_scc1 +1
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0xBF06_8007, // s_cmp_eq_u32 s7, 0
+        0xBF85_0001, // s_cbranch_scc1 +1
+        0x7E08_0281, // v_mov_b32 v4, 1
+        S_ENDPGM,
+    ];
+    assert_eq!(apart(&fmas), [false, true]);
+    // A select by a mask of neither EXEC nor a compare: of a constant of
+    // some lanes, apart; of a uniform select (every lane's bit an SCC), not.
+    let selects = [
+        0xBE8A_0481, // s_mov_b64 s[10:11], 1
+        0xD501_0001,
+        0x0029_0280, // v_cndmask_b32 v1, 0, 1, s[10:11]
+        0x7E0C_0501, // v_readfirstlane_b32 s6, v1
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0x858C_80C1, // s_cselect_b64 s[12:13], -1, 0
+        0xD501_0002,
+        0x0031_0280, // v_cndmask_b32 v2, 0, 1, s[12:13]
+        0x7E0E_0502, // v_readfirstlane_b32 s7, v2
+        0xBF06_8006, // s_cmp_eq_u32 s6, 0
+        0xBF85_0001, // s_cbranch_scc1 +1
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0xBF06_8007, // s_cmp_eq_u32 s7, 0
+        0xBF85_0001, // s_cbranch_scc1 +1
+        0x7E08_0281, // v_mov_b32 v4, 1
+        S_ENDPGM,
+    ];
+    assert_eq!(apart(&selects), [true, false]);
 }
 
-/// [`LDS_LOOP`] and [`LDS_BASE`] on every host of 32-lane waves, as local
-/// waves and in the console flow: every lane of a group reads the LDS total
-/// its group made, and the idiom's slots are each lane's own.
+/// A uniform branch on a scalar load of memory the dispatch itself writes
+/// may part the two host waves (a write can land between their two loads):
+/// through the view the program stores to, or with `glc`; not through a
+/// view it only reads.
+#[test]
+fn host_waves_may_load_written_memory_apart() {
+    // s20 from `load`, then a branch on it.
+    let body = |load: &[u32]| -> Vec<u32> {
+        let mut words = load.to_vec();
+        words.extend_from_slice(&[
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBF06_8014, // s_cmp_eq_u32 s20, 0
+            0xBF85_0001, // s_cbranch_scc1 +1
+            0x7E04_0281, // v_mov_b32 v2, 1
+        ]);
+        words
+    };
+    let apart = |load: &[u32]| -> Vec<bool> {
+        let native = program(&body(load), 64);
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
+        let res = crate::resource::track_with(&p, &native.layout, native.stage, false).expect("resources");
+        let written = super::local_waves::loads_of_written_memory(&p, &res);
+        branches_apart(&p, &written).into_iter().map(|f| f.1).collect()
+    };
+    // s[4:7] is the view the program stores its results through.
+    assert_eq!(apart(&[0xF420_0502, 0xFA00_4000]), [true], "s_buffer_load_dword s20, s[4:7], 0x4000");
+    // Another table entry's view, which it only reads: with glc, apart.
+    let other = |glc: bool| {
+        [
+            0xF408_0301,
+            0xFA00_0010, // s_load_dwordx4 s[12:15], s[2:3], 0x10
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF420_0506 | u32::from(glc) << 16,
+            0xFA00_0000, // s_buffer_load_dword s20, s[12:15], 0 (glc)
+        ]
+    };
+    assert_eq!(apart(&other(false)), [false]);
+    assert_eq!(apart(&other(true)), [true]);
+}
+
+/// [`LDS_LOOP`], [`LDS_BASE`] and [`LDS_FMAC`] on every host of 32-lane
+/// waves, as local waves and in the console flow: every lane of a group
+/// reads the LDS total its group made, and the idiom's slots are each
+/// lane's own.
 #[test]
 fn local_waves_of_loops_and_reserved_branches_match_the_console() {
     let nvidia = super::Target { lanes_min: 32, lanes_max: 32, exact_views: false };
@@ -1184,8 +1397,8 @@ fn local_waves_of_loops_and_reserved_branches_match_the_console() {
     let console = |p: &crate::NativeProgram| {
         super::with_switch(super::Switch::LdsLocal, false, || emit_for(p, nvidia)).expect("console flow")
     };
-    let (looped, base) = (with_lds(LDS_LOOP), with_lds(LDS_BASE));
-    for p in [&looped, &base] {
+    let (looped, base, fmac) = (with_lds(LDS_LOOP), with_lds(LDS_BASE), with_lds(LDS_FMAC));
+    for p in [&looped, &base, &fmac] {
         let (l, c) = (local(p), console(p));
         assert_ne!(l.dxil, c.dxil, "local waves are not the console flow");
         // The barriers are checked before anything runs on the card.
@@ -1234,6 +1447,11 @@ fn local_waves_of_loops_and_reserved_branches_match_the_console() {
             let mut want: Vec<u32> = (0..groups).flat_map(|_| 0..64).collect();
             want.sort_unstable();
             assert_eq!(list, want, "{name}: {form}: the slots");
+            // The branch on the first lane's t: the whole wave on the
+            // console, the first host wave of each group as local waves.
+            let out = run_dwords(&host, &make(&fmac), 64, groups, 0).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let want = if form == "console" { 64 } else { 32 };
+            assert!(out.iter().all(|&x| x == want), "{name}: {form}: the accumulator's branch: {:?}", &out[..64]);
             eprintln!("{name}: loops and reserved branches of one-wave LDS groups exact ({form})");
         }
     }

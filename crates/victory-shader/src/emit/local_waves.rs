@@ -364,13 +364,17 @@ pub(crate) fn independent(p: &Program, st: &Structured) -> Result<(), (usize, &'
 /// host waves different ways, so it has a region too
 /// ([`super::lower::lane_regions`]); what that region leaves behind is
 /// found in turn, to a fixpoint. Vector loads are not taken to be alike in
-/// the lanes, whatever their address. By value (`Value.0`).
-/// shortcut: a scalar load of an address both host waves hold alike reads
-/// the same in both (nothing the group writes comes between them).
+/// the lanes, whatever their address; nor are the scalar loads in
+/// `written` ([`loads_of_written_memory`]) taken to read alike in the two
+/// host waves. By value (`Value.0`).
+/// shortcut: any other scalar load of an address both host waves hold
+/// alike reads the same in both (nothing writes there while the dispatch
+/// runs).
 pub(crate) fn host_wave_varying(
     p: &Program,
     st: &Structured,
     g: &super::lower::LaneGraph,
+    written: &HashSet<(usize, usize)>,
 ) -> Vec<bool> {
     let n = p.blocks.len().min(g.succ.len());
     // SSA values are numbered densely: sets of them are bit vectors.
@@ -392,6 +396,17 @@ pub(crate) fn host_wave_varying(
         }
     }
     let is_mask = |v: Value| masks.get(v.0 as usize).copied().unwrap_or(false);
+    // Masks of neither EXEC nor a VALU result whose bit may differ between
+    // lanes (a constant of some lanes, one loaded or built from scalars, a
+    // join): not those whose bit is a uniform SCC in every lane.
+    let mut lanes_apart = vec![false; values];
+    for (v, &m) in &st.others {
+        if !st.bools.support(m).iter().all(|a| matches!(a, Atom::Uniform(_)))
+            && let Some(x) = lanes_apart.get_mut(v.0 as usize)
+        {
+            *x = true;
+        }
+    }
     let has = |set: &[bool], v: Value| set.get(v.0 as usize).copied().unwrap_or(false);
     let exec = |r: Reg| matches!(r, Reg::S(c) if c == EXEC || c == EXEC + 1);
     let order = crate::ir::reverse_postorder(&p.blocks);
@@ -400,16 +415,24 @@ pub(crate) fn host_wave_varying(
     let mask_operand = |inst: &Inst, o: &Operand| match *o {
         Operand::Scalar { code, dwords } if code != NULL => (0..dwords).any(|k| {
             code.checked_add(k).is_none_or(|c| {
-                exec(Reg::S(c)) || inst.read(Reg::S(c)).is_some_and(is_mask)
+                exec(Reg::S(c))
+                    || inst.read(Reg::S(c)).is_some_and(|x| is_mask(x) || has(&lanes_apart, x))
             })
         }),
         // vccz, execz, lds_direct
         Operand::Const(c) => matches!(c, 251 | 252 | 254),
         _ => false,
     };
-    // VGPR values every lane holds alike: written, unguarded, by a lane's
-    // own operation on scalars, constants and such values (a partial write
-    // keeps the rest of the old value, which must be alike too).
+    // Values every lane holds alike: written, unguarded, by a lane's own
+    // operation on scalars, constants and such values. What it reads beside
+    // its operands counts as well: the old value of its destination where
+    // that is an operand (an accumulator: `v_fmac_f32`, `v_mac_f32`,
+    // `v_dot4c_i32_i8`; a swap) or partly kept (a partial write: SDWA, a
+    // 16-bit half, opsel's half of the destination), and a lane mask read
+    // beside the operands (`v_div_fmas_f32`'s VCC), which must be a compare
+    // or carry of such values. Only the old value under a whole write is
+    // not read: just lanes that never get there keep it. (Lane masks among
+    // the operands, read bit by bit, make the result not alike.)
     let mut alike = vec![false; values];
     for &b in &order {
         for (i, inst) in p.blocks[b].insts.iter().enumerate() {
@@ -433,15 +456,31 @@ pub(crate) fn host_wave_varying(
                 }),
                 _ => !mask_operand(inst, o),
             });
-            let partial = v.sdwa.is_some() || v.opsel & 8 != 0 || name.contains("16");
-            let kept = !partial
-                || inst
-                    .reads
-                    .iter()
-                    .filter(|r| matches!(r.0, Reg::V(_)) && inst.writes.iter().any(|w| w.0 == r.0))
-                    .all(|r| has(&alike, r.1));
-            if sources && kept {
-                for w in inst.writes.iter().filter(|w| matches!(w.0, Reg::V(_))) {
+            // A register the operands name (checked above).
+            let within = |x: u8, start: u8, count: u8| {
+                (u16::from(start)..u16::from(start) + u16::from(count)).contains(&u16::from(x))
+            };
+            let named = |r: Reg| {
+                v.src.iter().any(|o| match (*o, r) {
+                    (Operand::Vector { reg, dwords }, Reg::V(x)) => within(x, reg, dwords),
+                    (Operand::Scalar { code, dwords }, Reg::S(x)) => within(x, code, dwords),
+                    _ => false,
+                })
+            };
+            let whole = !(v.sdwa.is_some()
+                || v.opsel & 8 != 0
+                || name.contains("16")
+                || name.contains("mac")
+                || name.starts_with("v_dot") && name.contains("c_")
+                || name.starts_with("v_swap"));
+            let beside = inst.reads.iter().all(|&(r, x)| match r {
+                _ if named(r) => true,
+                Reg::V(_) => whole || has(&alike, x),
+                Reg::S(_) => exec(r) || has(&alike, x),
+                Reg::Scc => true,
+            });
+            if sources && beside {
+                for w in &inst.writes {
                     if let Some(a) = alike.get_mut(w.1.0 as usize) {
                         *a = true;
                     }
@@ -518,8 +557,8 @@ pub(crate) fn host_wave_varying(
                         changed |= put(phi.value, &mut varying);
                     }
                 }
-                for inst in &block.insts {
-                    if inside[b] || apart(inst, &varying) {
+                for (i, inst) in block.insts.iter().enumerate() {
+                    if inside[b] || written.contains(&(b, i)) || apart(inst, &varying) {
                         for &(r, w) in &inst.writes {
                             if !exec(r) && !is_mask(w) {
                                 changed |= put(w, &mut varying);
@@ -533,4 +572,111 @@ pub(crate) fn host_wave_varying(
             return varying;
         }
     }
+}
+
+/// Scalar loads (by block and instruction) of memory the dispatch itself
+/// may write while it runs, where each host wave of a console wave run as
+/// local waves may find another value ([`host_wave_varying`]): another
+/// group, or the other host wave of this one, can land a write between
+/// their two loads, which on the console are one. A load with `glc` (it
+/// asks past the scalar cache for what was written since), one through a
+/// descriptor or a root view the program also stores to or adds to (its
+/// table entry, or the root parameter it is built around), one by address
+/// of a root view written so; and every one in a program that writes memory
+/// no descriptor or root parameter leads to (`flat_*`).
+/// shortcut: views the program only reads are taken not to alias one it
+/// writes, nor two heap descriptors picked by different values to be one.
+pub(crate) fn loads_of_written_memory(
+    p: &Program,
+    res: &crate::resource::Resources,
+) -> HashSet<(usize, usize)> {
+    use crate::resource::{Address, CODE, Role, Source};
+    type Site = (usize, usize);
+    /// Where a descriptor comes from: its table entry (root parameter,
+    /// byte offset, the value it is picked by), the root view it is built
+    /// around, or itself.
+    #[derive(PartialEq)]
+    enum From<'a> {
+        Entry(usize, u32, Option<Value>, bool),
+        Root(usize),
+        Own(&'a Source),
+    }
+    fn from<'a>(at: &HashMap<Site, Address>, s: &'a Source) -> From<'a> {
+        match s {
+            Source::Loaded { load, first } => match at.get(load) {
+                Some(a) => From::Entry(
+                    a.param,
+                    a.offset.wrapping_add(4 * u32::from(*first)),
+                    a.dynamic,
+                    a.includes_base,
+                ),
+                None => From::Own(s),
+            },
+            Source::Built { address, .. } if address.param != CODE => From::Root(address.param),
+            _ => From::Own(s),
+        }
+    }
+    let at: HashMap<Site, Address> = res.scalar.iter().copied().collect();
+    let mut resources: HashMap<Site, Vec<&Source>> = HashMap::new();
+    for d in res.descriptors.iter().filter(|d| d.role == Role::Resource) {
+        resources.entry(d.site).or_default().extend(d.source.leaves());
+    }
+    let sites = || {
+        p.blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(b, block)| block.insts.iter().enumerate().map(move |(i, inst)| ((b, i), inst)))
+    };
+    // What the program writes through: descriptors and root parameters.
+    let (mut through, mut roots, mut unplaced) = (Vec::new(), HashSet::new(), false);
+    for (site, inst) in sites() {
+        let name = inst.name();
+        if matches!(inst.fields, Fields::Ds { .. }) || !(name.contains("_store") || name.contains("_atomic")) {
+            continue;
+        }
+        match (&inst.fields, resources.get(&site)) {
+            (Fields::Flat { .. }, _) if name.starts_with("scratch_") => {} // the lane's own
+            (Fields::Flat { .. }, _) | (Fields::Smem { .. }, None) => match at.get(&site) {
+                Some(a) if a.param != CODE => {
+                    roots.insert(a.param);
+                }
+                Some(_) => {}
+                None => unplaced = true,
+            },
+            (_, Some(leaves)) => {
+                for leaf in leaves {
+                    match from(&at, leaf) {
+                        From::Root(r) => {
+                            roots.insert(r);
+                        }
+                        f => through.push(f),
+                    }
+                }
+            }
+            (_, None) => unplaced = true,
+        }
+    }
+    let mut out = HashSet::new();
+    for (site, inst) in sites() {
+        let Fields::Smem { cache, .. } = &inst.fields else {
+            continue;
+        };
+        let name = inst.name();
+        let written = if name.starts_with("s_buffer_load_") {
+            resources.get(&site).is_some_and(|leaves| {
+                leaves.iter().any(|leaf| match from(&at, leaf) {
+                    From::Root(r) => roots.contains(&r),
+                    f => through.contains(&f),
+                })
+            })
+        } else if name.starts_with("s_load_") {
+            at.get(&site).is_some_and(|a| roots.contains(&a.param))
+        } else {
+            continue;
+        };
+        if written || cache.glc || unplaced {
+            out.insert(site);
+        }
+    }
+    out
 }

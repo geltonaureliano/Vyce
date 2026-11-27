@@ -204,7 +204,8 @@ pub enum Switch {
     /// group meet where the fork put their group barriers again: also in
     /// the blocks of a loop that lanes leave after different numbers of
     /// turns, inside branches on scalars the two host waves may hold apart
-    /// (the slots each reserved, a lane read), and in programs that reach
+    /// (the slots each reserved, a lane read, a scalar load of memory the
+    /// dispatch writes), and in programs that reach
     /// memory by address (their last group's threads past the dispatch
     /// return at once). Each can leave a host thread waiting at a barrier
     /// the others never reach: a hang (`lower::local_lds`).
@@ -755,7 +756,7 @@ fn emit_program(
                 found.is_ok()
             };
             let meetable = || {
-                let met = lower::lds_meetable(p, st, res.addresses);
+                let met = lower::lds_meetable(p, st, res);
                 if !met && std::env::var_os("VICTORY_WHY").is_some() {
                     eprintln!("local waves: LDS the two host waves cannot meet around");
                 }

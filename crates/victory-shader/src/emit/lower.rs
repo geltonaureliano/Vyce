@@ -917,23 +917,25 @@ fn lds_meetings(p: &Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool,
 /// A group barrier must be met by every thread as often. Lanes that leave
 /// a loop after different numbers of turns, and the two host waves on two
 /// sides of a branch on a scalar they hold apart (the slots each reserved,
-/// a lane read), would not: those blocks are lane-branch regions too. Nor
-/// would a program that reaches memory by address (`addresses`): the
-/// threads of its last group past the dispatch return at the entry, each
-/// alone, as the shared-wave and lockstep forms know
-/// (`VICTORY_LOCAL_MEET_CHECKS=0`: the fork's regions and no such check).
+/// a lane read, a scalar load of memory the dispatch writes), would not:
+/// those blocks are lane-branch regions too. Nor would a program that
+/// reaches memory by address ([`Resources::addresses`]): the threads of its
+/// last group past the dispatch return at the entry, each alone, as the
+/// shared-wave and lockstep forms know (`VICTORY_LOCAL_MEET_CHECKS=0`: the
+/// fork's regions and no such check).
 fn local_lds(
     p: &Program,
     st: &Structured,
-    addresses: bool,
+    res: &Resources,
 ) -> Option<(Vec<bool>, Vec<(bool, bool)>)> {
     let checks = super::Switch::LocalMeetChecks.on();
-    if addresses && checks {
+    if res.addresses && checks {
         return None;
     }
     let g = LaneGraph::of(st)?;
     let varying = if checks {
-        super::local_waves::host_wave_varying(p, st, &g)
+        let written = super::local_waves::loads_of_written_memory(p, res);
+        super::local_waves::host_wave_varying(p, st, &g, &written)
     } else {
         Vec::new()
     };
@@ -953,8 +955,8 @@ fn local_lds(
 
 /// Whether the LDS accesses of a one-wave group run as two local 32-lane
 /// waves can keep the console's order ([`local_lds`]).
-pub(super) fn lds_meetable(p: &Program, st: &Structured, addresses: bool) -> bool {
-    local_lds(p, st, addresses).is_some()
+pub(super) fn lds_meetable(p: &Program, st: &Structured, res: &Resources) -> bool {
+    local_lds(p, st, res).is_some()
 }
 
 /// Samples whose level comes from derivatives across each quad of lanes.
@@ -1578,7 +1580,7 @@ impl<'a> Lower<'a> {
                 // accesses of one wave: the two host waves meet around
                 // them (VIctory-7900XTX's local waves of one-wave groups).
                 if one_wave && s.lds_dwords > 0 {
-                    lds_meet = Some(local_lds(p, x.st, x.res.addresses));
+                    lds_meet = Some(local_lds(p, x.st, x.res));
                 }
             }
             if split || x.local {

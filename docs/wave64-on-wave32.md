@@ -171,16 +171,33 @@ back):
   apart reads a lane of its own host wave. Such scalars, what is made of
   them, lane masks read as numbers and what a lane branch's region leaves
   behind (`local_waves::host_wave_varying`) make a branch on them a region
-  too.
+  too. A value counts as held alike in the lanes only if everything its
+  instruction reads is: an accumulator's old value (`v_fmac_f32`,
+  `v_mac_f32`, `v_dot4c_i32_i8`), both registers of a swap and
+  `v_div_fmas_f32`'s VCC included. A select by a mask of some lanes that
+  is neither EXEC nor a compare (a constant, one loaded or built from
+  scalars) is not alike either; one by a uniform select (every lane's bit
+  an SCC) is.
+- So does a scalar load of memory the dispatch itself writes while it runs
+  (`local_waves::loads_of_written_memory`): one with `glc`, or through a
+  descriptor or root view the program also stores to or adds to. Another
+  group, or the other host wave, can land a write between the two host
+  waves' loads, which on the console are one load. Views the program only
+  reads are taken not to alias one it writes.
 - A program that reaches memory by address returns at its entry in the
   threads of the last group past the dispatch, each alone: no meetings
   (the shared-wave and lockstep forms knew it).
 
-The translation of both cases is checked on the module (no barrier between
-a loop's header and its back edge, as many barriers on every way to the
-end) before it runs on the card, against the console flow
+The translation of these cases (a loop, a branch on the reserved base, on a
+lane read of an accumulator or of a constant mask's select, on a flag
+loaded from memory the dispatch writes) is checked on the module (no
+barrier between a loop's header and its back edge, as many barriers on
+every way to the end); the first three then run on the card against the
+console flow
 (`split_tests::local_waves_meet_only_where_both_host_waves_run_as_often`,
-`local_waves_of_loops_and_reserved_branches_match_the_console`).
+`local_waves_of_loops_and_reserved_branches_match_the_console`,
+`host_waves_hold_lane_reads_and_reserved_slots_apart`,
+`host_waves_may_load_written_memory_apart`).
 
 ### Forms without early-outs or skips
 
